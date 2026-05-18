@@ -111,6 +111,14 @@
                   <option value="sam31_mlx">SAM 3.1 MLX</option>
                 </select>
               </label>
+              <label class="backend-select-label quality-select-label is-hidden" id="maskQualityLabel" for="maskQualitySelect">
+                <span>Mode</span>
+                <select id="maskQualitySelect">
+                  <option value="max">Highest quality</option>
+                  <option value="native" selected>1008</option>
+                  <option value="fast">224 fast</option>
+                </select>
+              </label>
               <button class="primary-button run-sam-button" id="runSamButton" type="button">
                 Run mask
               </button>

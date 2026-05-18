@@ -159,6 +159,7 @@ python -m pip install -e ".[sam31]"
 python scripts/run_sam31_mlx_mask.py \
   --candidate-id d6ee6cd75cd04b95 \
   --model mlx-community/sam3.1-bf16 \
+  --quality-mode native \
   --prompt "a runner" \
   --prompt "a person"
 ```
@@ -166,7 +167,8 @@ python scripts/run_sam31_mlx_mask.py \
 The SAM 3.1 MLX path keeps the same artifact contract as SAM 2. It uses text prompts to
 detect runners on each frame, then uses the saved prompt box/points to choose the target
 runner identity and write the mask videos. The first run downloads the MLX model from
-Hugging Face.
+Hugging Face. Quality modes are `max` (source-sized square resolution, capped for sanity),
+`native` (`1008`, the SAM 3.1 default), and `fast` (`224`).
 
 ## Next Pipeline Milestones
 

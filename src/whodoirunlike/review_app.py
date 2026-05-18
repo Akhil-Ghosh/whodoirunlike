@@ -55,6 +55,11 @@ MASK_BACKENDS = {
     "sam2": "SAM 2.1 local",
     "sam31_mlx": "SAM 3.1 MLX",
 }
+MASK_QUALITY_MODES = {
+    "max": "Highest quality",
+    "native": "1008",
+    "fast": "224",
+}
 MASK_JOBS: dict[str, dict[str, Any]] = {}
 MASK_JOBS_LOCK = threading.Lock()
 
@@ -531,6 +536,7 @@ def _mask_default_job(candidate_id: str) -> dict[str, Any]:
     return {
         "candidate_id": candidate_id,
         "backend": None,
+        "options": {},
         "status": "idle",
         "started_at": None,
         "completed_at": None,
@@ -580,7 +586,25 @@ def _set_mask_stage_status(
     _write_json(manifest_path, manifest)
 
 
-def _run_mask_job(config: ReviewAppConfig, candidate_id: str, backend: str) -> None:
+def _sanitize_mask_options(data: dict[str, Any]) -> dict[str, Any]:
+    quality_mode = str(data.get("quality_mode") or data.get("mode") or "native").strip().lower()
+    if quality_mode not in MASK_QUALITY_MODES:
+        valid = ", ".join(sorted(MASK_QUALITY_MODES))
+        raise ValueError(f"quality_mode must be one of: {valid}")
+
+    options: dict[str, Any] = {"quality_mode": quality_mode}
+    if data.get("resolution") not in (None, ""):
+        resolution = max(1, _as_int(data.get("resolution")))
+        options["resolution"] = resolution
+    return options
+
+
+def _run_mask_job(
+    config: ReviewAppConfig,
+    candidate_id: str,
+    backend: str,
+    options: dict[str, Any],
+) -> None:
     try:
         if backend == "sam2":
             from whodoirunlike.sam2_runner import run_sam2_mask
@@ -594,7 +618,11 @@ def _run_mask_job(config: ReviewAppConfig, candidate_id: str, backend: str) -> N
         elif backend == "sam31_mlx":
             from whodoirunlike.sam31_mlx_runner import run_sam31_mlx_mask
 
-            result = run_sam31_mlx_mask(run_dir=_cv_run_dir(config, candidate_id))
+            result = run_sam31_mlx_mask(
+                run_dir=_cv_run_dir(config, candidate_id),
+                quality_mode=str(options.get("quality_mode") or "native"),
+                resolution=options.get("resolution"),
+            )
         else:
             raise ValueError(f"Unsupported mask backend: {backend}")
 
@@ -626,8 +654,11 @@ def start_mask_job(
     candidate_id: str,
     *,
     backend: str = "sam2",
+    options: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     backend = _validate_mask_backend(backend)
+    options = options or {}
+    options = _sanitize_mask_options(options) if backend == "sam31_mlx" else {}
     candidate_id = _safe_candidate_id(candidate_id)
     run_dir = _cv_run_dir(config, candidate_id)
     if not (run_dir / "cv_run_manifest.json").exists():
@@ -647,6 +678,7 @@ def start_mask_job(
         {
             "candidate_id": candidate_id,
             "backend": backend,
+            "options": options,
             "status": "running",
             "started_at": utc_now_iso(),
             "completed_at": None,
@@ -656,7 +688,7 @@ def start_mask_job(
     )
     thread = threading.Thread(
         target=_run_mask_job,
-        args=(config, candidate_id, backend),
+        args=(config, candidate_id, backend, options),
         name=f"mask-{backend}-{candidate_id}",
         daemon=True,
     )
@@ -787,7 +819,13 @@ class ReviewRequestHandler(BaseHTTPRequestHandler):
             run_dir = _cv_run_dir(self.config, candidate_id)
             if not (run_dir / "cv_run_manifest.json").exists():
                 raise FileNotFoundError(f"CV run not found: {candidate_id}")
-            self._send_json({"job": mask_job_status(candidate_id), "backends": MASK_BACKENDS})
+            self._send_json(
+                {
+                    "job": mask_job_status(candidate_id),
+                    "backends": MASK_BACKENDS,
+                    "quality_modes": MASK_QUALITY_MODES,
+                }
+            )
         except (FileNotFoundError, ValueError) as exc:
             self._send_json({"error": str(exc)}, status=HTTPStatus.NOT_FOUND)
 
@@ -797,10 +835,17 @@ class ReviewRequestHandler(BaseHTTPRequestHandler):
             length = min(int(self.headers.get("Content-Length", "0")), 64_000)
             data = json.loads(self.rfile.read(length).decode("utf-8")) if length else {}
             backend = str(data.get("backend") or "sam2")
+            options = _sanitize_mask_options(data) if backend == "sam31_mlx" else {}
             self._send_json(
                 {
-                    "job": start_mask_job(self.config, candidate_id, backend=backend),
+                    "job": start_mask_job(
+                        self.config,
+                        candidate_id,
+                        backend=backend,
+                        options=options,
+                    ),
                     "backends": MASK_BACKENDS,
+                    "quality_modes": MASK_QUALITY_MODES,
                 }
             )
         except json.JSONDecodeError as exc:

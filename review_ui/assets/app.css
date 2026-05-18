@@ -756,6 +756,10 @@ textarea {
   min-width: 118px;
 }
 
+.backend-select-label.is-hidden {
+  display: none;
+}
+
 .backend-select-label span {
   margin: 0;
   padding-left: 3px;

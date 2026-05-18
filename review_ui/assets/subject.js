@@ -3,6 +3,7 @@ const state = {
   current: null,
   samJob: null,
   maskBackend: "sam2",
+  maskQualityMode: "native",
   selection: { type: "unset", positive_points: [], negative_points: [], box: null, mask_path: null },
   promptMode: "positive",
   boxStart: null,
@@ -37,6 +38,8 @@ const els = {
   promptState: document.querySelector("#promptState"),
   samJobState: document.querySelector("#samJobState"),
   maskBackendSelect: document.querySelector("#maskBackendSelect"),
+  maskQualityLabel: document.querySelector("#maskQualityLabel"),
+  maskQualitySelect: document.querySelector("#maskQualitySelect"),
   runSamButton: document.querySelector("#runSamButton"),
   stageList: document.querySelector("#stageList"),
   artifactGrid: document.querySelector("#artifactGrid"),
@@ -183,6 +186,12 @@ function backendLabel(backend = state.maskBackend) {
   return "SAM 2.1";
 }
 
+function qualityLabel(mode = state.maskQualityMode) {
+  if (mode === "max") return "max";
+  if (mode === "fast") return "224";
+  return "1008";
+}
+
 function renderSamJobStatus(job = state.samJob) {
   state.samJob = job || { status: "idle" };
   const status = state.samJob.status || "idle";
@@ -197,6 +206,7 @@ function renderSamJobStatus(job = state.samJob) {
   if (status === "running" && state.samJob.backend) {
     statusLabel = `${backendLabel(state.samJob.backend)} running`;
   }
+  els.maskQualityLabel.classList.toggle("is-hidden", state.maskBackend !== "sam31_mlx");
 
   els.samJobState.textContent = statusLabel;
   els.samJobState.className = `rank-pill sam-job-state ${
@@ -208,9 +218,11 @@ function renderSamJobStatus(job = state.samJob) {
   els.runSamButton.textContent = isRunning
     ? "Running..."
     : artifactsReady || status === "completed"
-      ? `Run ${backendLabel()} Again`
-      : `Run ${backendLabel()}`;
-  els.runSamButton.title = hasPrompt ? `Run ${backendLabel()} on the saved subject prompt` : "Select the runner first";
+      ? `Run ${backendLabel()}${state.maskBackend === "sam31_mlx" ? ` ${qualityLabel()}` : ""} Again`
+      : `Run ${backendLabel()}${state.maskBackend === "sam31_mlx" ? ` ${qualityLabel()}` : ""}`;
+  els.runSamButton.title = hasPrompt
+    ? `Run ${backendLabel()}${state.maskBackend === "sam31_mlx" ? ` ${qualityLabel()} mode` : ""} on the saved subject prompt`
+    : "Select the runner first";
 }
 
 function renderRunList() {
@@ -493,7 +505,7 @@ async function startSamRun() {
     const payload = await fetchJson(`/api/cv-runs/${candidateId}/mask`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ backend: state.maskBackend }),
+      body: JSON.stringify({ backend: state.maskBackend, quality_mode: state.maskQualityMode }),
     });
     renderSamJobStatus(payload.job);
     setSaveState(`${backendLabel()} running`, "is-saving");
@@ -559,6 +571,10 @@ els.clearButton.addEventListener("click", clearSelection);
 els.savePromptButton.addEventListener("click", savePrompt);
 els.maskBackendSelect.addEventListener("change", () => {
   state.maskBackend = els.maskBackendSelect.value;
+  renderSamJobStatus();
+});
+els.maskQualitySelect.addEventListener("change", () => {
+  state.maskQualityMode = els.maskQualitySelect.value;
   renderSamJobStatus();
 });
 els.runSamButton.addEventListener("click", startSamRun);

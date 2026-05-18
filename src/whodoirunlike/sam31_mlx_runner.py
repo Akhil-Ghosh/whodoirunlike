@@ -20,6 +20,41 @@ from whodoirunlike.sam2_runner import (
 
 DEFAULT_SAM31_MLX_MODEL = "mlx-community/sam3.1-bf16"
 DEFAULT_SAM31_PROMPTS = ("a runner", "a person")
+SAM31_MLX_QUALITY_MODES = {
+    "max": "Highest quality",
+    "native": "1008",
+    "fast": "224",
+}
+SAM31_PATCH_SIZE = 14
+SAM31_MAX_AUTO_RESOLUTION = 2016
+
+
+def resolve_sam31_resolution(
+    *,
+    mode: str = "native",
+    video_meta: dict[str, Any] | None = None,
+    resolution: int | None = None,
+) -> int:
+    if resolution is not None:
+        return max(SAM31_PATCH_SIZE, int(resolution))
+
+    mode = mode.strip().lower()
+    if mode == "fast":
+        return 224
+    if mode == "native":
+        return 1008
+    if mode != "max":
+        valid = ", ".join(sorted(SAM31_MLX_QUALITY_MODES))
+        raise ValueError(f"SAM 3.1 quality mode must be one of: {valid}")
+
+    if not video_meta:
+        return 1008
+    long_edge = max(int(video_meta.get("width") or 0), int(video_meta.get("height") or 0))
+    if long_edge <= 0:
+        return 1008
+    capped = min(long_edge, SAM31_MAX_AUTO_RESOLUTION)
+    rounded = (capped // SAM31_PATCH_SIZE) * SAM31_PATCH_SIZE
+    return max(224, rounded)
 
 
 def box_iou(box_a: np.ndarray | None, box_b: np.ndarray | None) -> float:
@@ -157,6 +192,8 @@ def update_manifest_after_sam31_mlx(
     *,
     model_path: str,
     prompts: Sequence[str],
+    quality_mode: str,
+    resolution: int,
     elapsed_seconds: float,
 ) -> None:
     manifest = read_json(manifest_path)
@@ -167,6 +204,8 @@ def update_manifest_after_sam31_mlx(
     whole_runner_mask["backend"] = "sam31_mlx"
     whole_runner_mask["model"] = model_path
     whole_runner_mask["prompts"] = list(prompts)
+    whole_runner_mask["quality_mode"] = quality_mode
+    whole_runner_mask["resolution"] = resolution
     whole_runner_mask["elapsed_seconds"] = round(elapsed_seconds, 3)
     whole_runner_mask["metadata"] = str(metadata_path)
     stages.setdefault("renders", {})["status"] = "partial_complete"
@@ -179,8 +218,9 @@ def run_sam31_mlx_mask(
     run_dir: Path,
     model_path: str = DEFAULT_SAM31_MLX_MODEL,
     prompts: Sequence[str] = DEFAULT_SAM31_PROMPTS,
+    quality_mode: str = "native",
     threshold: float = 0.18,
-    resolution: int = 1008,
+    resolution: int | None = None,
     force_frames: bool = False,
 ) -> dict[str, Any]:
     try:
@@ -206,6 +246,11 @@ def run_sam31_mlx_mask(
     frame_dir = run_dir / "sam31_mlx_frames"
 
     video_meta = inspect_video(source_segment)
+    resolved_resolution = resolve_sam31_resolution(
+        mode=quality_mode,
+        video_meta=video_meta,
+        resolution=resolution,
+    )
     frame_paths = extract_video_frames(source_segment, frame_dir, force=force_frames)
     prompt = load_prompt(prompt_path, video_meta["width"], video_meta["height"])
     prompt_frame = max(0, min(prompt["frame_index"], len(frame_paths) - 1))
@@ -215,8 +260,8 @@ def run_sam31_mlx_mask(
     resolved_model_path = get_model_path(model_path)
     model = load_model(resolved_model_path)
     processor = Sam31Processor.from_pretrained(str(resolved_model_path))
-    if resolution != 1008:
-        processor.image_size = resolution
+    if resolved_resolution != 1008:
+        processor.image_size = resolved_resolution
     predictor = Sam3Predictor(model, processor, score_threshold=threshold)
 
     masks_by_frame: dict[int, np.ndarray] = {}
@@ -274,6 +319,8 @@ def run_sam31_mlx_mask(
         metadata_path,
         model_path=model_path,
         prompts=prompts,
+        quality_mode=quality_mode,
+        resolution=resolved_resolution,
         elapsed_seconds=elapsed_seconds,
     )
     return {
@@ -281,8 +328,9 @@ def run_sam31_mlx_mask(
         "backend": "sam31_mlx",
         "model": model_path,
         "prompts": list(prompts),
+        "quality_mode": quality_mode,
         "threshold": threshold,
-        "resolution": resolution,
+        "resolution": resolved_resolution,
         "frame_count": len(frame_paths),
         "prompt_frame": prompt_frame,
         "detected_frames": len(masks_by_frame),

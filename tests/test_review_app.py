@@ -278,6 +278,7 @@ def test_mask_job_status_defaults_to_idle() -> None:
 
     assert status["status"] == "idle"
     assert status["backend"] is None
+    assert status["options"] == {}
     assert status["candidate_id"] == "clip-002"
 
 
@@ -307,3 +308,17 @@ def test_start_mask_job_rejects_unknown_backend(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="backend"):
         start_mask_job(config, "clip-001", backend="sam9")
+
+
+def test_start_mask_job_rejects_unknown_quality_mode(tmp_path: Path) -> None:
+    write_cv_run(tmp_path)
+    config = ReviewAppConfig(
+        source_path=tmp_path / "source.json",
+        annotations_path=tmp_path / "annotations.json",
+        static_dir=tmp_path,
+        repo_root=tmp_path,
+        limit=2,
+    )
+
+    with pytest.raises(ValueError, match="quality_mode"):
+        start_mask_job(config, "clip-001", backend="sam31_mlx", options={"quality_mode": "ultra"})

@@ -2,7 +2,12 @@ from __future__ import annotations
 
 import numpy as np
 
-from whodoirunlike.sam31_mlx_runner import box_iou, choose_detection_index, mask_box
+from whodoirunlike.sam31_mlx_runner import (
+    box_iou,
+    choose_detection_index,
+    mask_box,
+    resolve_sam31_resolution,
+)
 
 
 def test_box_iou_handles_overlap_and_empty_union() -> None:
@@ -29,3 +34,11 @@ def test_choose_detection_prefers_prompt_overlap_over_raw_score() -> None:
     )
 
     assert selected == 0
+
+
+def test_resolve_sam31_resolution_modes() -> None:
+    assert resolve_sam31_resolution(mode="fast") == 224
+    assert resolve_sam31_resolution(mode="native") == 1008
+    assert resolve_sam31_resolution(mode="max", video_meta={"width": 1920, "height": 1080}) == 1918
+    assert resolve_sam31_resolution(mode="max", video_meta={"width": 3840, "height": 2160}) == 2016
+    assert resolve_sam31_resolution(mode="native", resolution=336) == 336

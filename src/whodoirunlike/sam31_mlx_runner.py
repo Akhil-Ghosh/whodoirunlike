@@ -163,6 +163,7 @@ def update_manifest_after_sam31_mlx(
     stages = manifest.setdefault("stages", {})
     whole_runner_mask = stages.setdefault("whole_runner_mask", {})
     whole_runner_mask["status"] = "complete"
+    whole_runner_mask["recommended_tool"] = "SAM 3.1 MLX via mlx-vlm"
     whole_runner_mask["backend"] = "sam31_mlx"
     whole_runner_mask["model"] = model_path
     whole_runner_mask["prompts"] = list(prompts)

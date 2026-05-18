@@ -170,7 +170,71 @@ runner identity and write the mask videos. The first run downloads the MLX model
 Hugging Face. Quality modes are `max` (source-sized square resolution, capped for sanity),
 `native` (`1008`, the SAM 3.1 default), and `fast` (`224`).
 
+Run MediaPipe pose extraction after a mask pass:
+
+```bash
+python scripts/run_pose_landmarks.py \
+  --candidate-id d6ee6cd75cd04b95 \
+  --model-variant heavy
+```
+
+This prefers `masked_runner.mp4` when present, writes `pose_landmarks.jsonl`,
+`skeleton_render.mp4`, `features.json`, and refreshes `qa_overlay.mp4` with the runner mask
+plus skeleton.
+
+DensePose is optional and stays off the critical path. The local default uses the official
+Detectron2 DensePose R50-FPN config and weights under `models/densepose/` when present:
+
+```text
+models/densepose/detectron2/projects/DensePose/configs/densepose_rcnn_R_50_FPN_s1x.yaml
+models/densepose/weights/densepose_rcnn_R_50_FPN_s1x_model_final_162be9.pkl
+```
+
+Manual setup:
+
+```bash
+PIP_NO_BUILD_ISOLATION=1 CC=clang CXX=clang++ \
+  python -m pip install --no-build-isolation \
+  'git+https://github.com/facebookresearch/detectron2.git'
+
+PIP_NO_BUILD_ISOLATION=1 CC=clang CXX=clang++ \
+  python -m pip install --no-build-isolation \
+  'git+https://github.com/facebookresearch/detectron2@main#subdirectory=projects/DensePose'
+
+mkdir -p models/densepose/weights
+git clone --depth 1 https://github.com/facebookresearch/detectron2.git models/densepose/detectron2
+curl -L -o models/densepose/weights/densepose_rcnn_R_50_FPN_s1x_model_final_162be9.pkl \
+  https://dl.fbaipublicfiles.com/densepose/densepose_rcnn_R_50_FPN_s1x/165712039/model_final_162be9.pkl
+```
+
+Run:
+
+```bash
+python scripts/run_densepose.py \
+  --candidate-id d6ee6cd75cd04b95 \
+  --config models/densepose/detectron2/projects/DensePose/configs/densepose_rcnn_R_50_FPN_s1x.yaml \
+  --weights models/densepose/weights/densepose_rcnn_R_50_FPN_s1x_model_final_162be9.pkl \
+  --device cpu
+```
+
+The local review UI also uses those default files automatically. CPU inference is slow:
+expect roughly a few minutes for an 8-10 second 1080p clip.
+
+Fuse pose, mask, and DensePose into the confidence-weighted form artifact:
+
+```bash
+python scripts/run_fused_form.py \
+  --candidate-id d6ee6cd75cd04b95
+```
+
+This writes `fused_form.jsonl` and `fused_overlay.mp4`. Matching should still use the
+pose sequence as the motion truth; the fused output supplies per-frame/per-joint weights,
+DensePose body-region coverage, occlusion/identity-risk states, and the alpha QA overlay.
+
 ## Next Pipeline Milestones
+
+The detailed similarity-search tracker lives in
+[`docs/similarity-search-implementation-plan.md`](docs/similarity-search-implementation-plan.md).
 
 Prepare one reviewed clip for the single-clip CV loop:
 
@@ -183,7 +247,8 @@ This creates `artifacts/cv_runs/<candidate_id>/source_segment.mp4`, a prompt fra
 1. Upgrade candidate CV scoring from uniform sampling to best contiguous pose-window detection.
 2. Add the prompt-frame selection UI for `person_prompt.json`.
 3. Add SAM 2.1 whole-runner mask generation.
-4. Add pose extraction over approved segments.
+4. Scale pose extraction over approved segments.
 5. Add Detectron2 DensePose as a secondary body-surface layer after target tracking is stable.
-6. Generate canonical skeleton/body-map render videos.
-7. Compute pose-sequence similarities and Gemini render embeddings.
+6. Generate fused confidence-weighted form artifacts.
+7. Generate canonical body-map render videos.
+8. Compute pose-sequence similarities and Gemini render embeddings.

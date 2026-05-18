@@ -34,6 +34,17 @@
             <span class="limit-pill" id="runCount">0 runs</span>
           </div>
           <div class="queue-list subject-run-list" id="runList"></div>
+
+          <div class="prep-section">
+            <div class="panel-heading compact">
+              <div>
+                <p class="eyebrow">Reviewed clips</p>
+                <h2>Prepare runs</h2>
+              </div>
+              <span class="limit-pill" id="prepCount">0 clips</span>
+            </div>
+            <div class="prep-list" id="prepList"></div>
+          </div>
         </aside>
 
         <section class="stage-panel subject-stage-panel" aria-label="Subject selection">
@@ -106,6 +117,10 @@
             <div class="output-actions">
               <span class="rank-pill" id="promptState">Unset</span>
               <span class="rank-pill sam-job-state" id="samJobState">Idle</span>
+              <span class="rank-pill cv-job-state" id="poseJobState">Pose idle</span>
+              <span class="rank-pill cv-job-state" id="denseposeJobState">DensePose idle</span>
+              <span class="rank-pill cv-job-state" id="fusionJobState">Fusion idle</span>
+              <span class="rank-pill cv-job-state" id="featuresJobState">Features idle</span>
               <label class="backend-select-label" for="maskBackendSelect">
                 <span>Backend</span>
                 <select id="maskBackendSelect">
@@ -124,6 +139,18 @@
               <button class="primary-button run-sam-button" id="runSamButton" type="button">
                 Run mask
               </button>
+              <button class="ghost-button run-cv-button" id="runPoseButton" type="button">
+                Run Pose
+              </button>
+              <button class="ghost-button run-cv-button" id="runDenseposeButton" type="button">
+                Run DensePose
+              </button>
+              <button class="ghost-button run-cv-button" id="runFusionButton" type="button">
+                Run Fusion
+              </button>
+              <button class="ghost-button run-cv-button" id="runFeaturesButton" type="button">
+                Run Features
+              </button>
             </div>
           </div>
 
@@ -136,6 +163,50 @@
               <span id="maskProgressBar"></span>
             </div>
             <div class="mask-progress-meta" id="maskProgressMeta">Waiting for frames</div>
+          </div>
+
+          <div class="mask-progress cv-progress is-hidden" id="poseProgress">
+            <div class="mask-progress-top">
+              <span id="poseProgressLabel">Preparing pose run</span>
+              <strong id="poseProgressEta">ETA --</strong>
+            </div>
+            <div class="mask-progress-track" aria-hidden="true">
+              <span id="poseProgressBar"></span>
+            </div>
+            <div class="mask-progress-meta" id="poseProgressMeta">Waiting for frames</div>
+          </div>
+
+          <div class="mask-progress cv-progress is-hidden" id="denseposeProgress">
+            <div class="mask-progress-top">
+              <span id="denseposeProgressLabel">Preparing DensePose run</span>
+              <strong id="denseposeProgressEta">ETA --</strong>
+            </div>
+            <div class="mask-progress-track" aria-hidden="true">
+              <span id="denseposeProgressBar"></span>
+            </div>
+            <div class="mask-progress-meta" id="denseposeProgressMeta">Waiting for frames</div>
+          </div>
+
+          <div class="mask-progress cv-progress is-hidden" id="fusionProgress">
+            <div class="mask-progress-top">
+              <span id="fusionProgressLabel">Preparing fusion run</span>
+              <strong id="fusionProgressEta">ETA --</strong>
+            </div>
+            <div class="mask-progress-track" aria-hidden="true">
+              <span id="fusionProgressBar"></span>
+            </div>
+            <div class="mask-progress-meta" id="fusionProgressMeta">Waiting for frames</div>
+          </div>
+
+          <div class="mask-progress cv-progress is-hidden" id="featuresProgress">
+            <div class="mask-progress-top">
+              <span id="featuresProgressLabel">Preparing feature run</span>
+              <strong id="featuresProgressEta">ETA --</strong>
+            </div>
+            <div class="mask-progress-track" aria-hidden="true">
+              <span id="featuresProgressBar"></span>
+            </div>
+            <div class="mask-progress-meta" id="featuresProgressMeta">Waiting for frames</div>
           </div>
 
           <div class="stage-list" id="stageList"></div>

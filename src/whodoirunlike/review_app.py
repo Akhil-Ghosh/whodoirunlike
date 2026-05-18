@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import csv
+import importlib.util
 import json
 import mimetypes
+import os
 import re
 import socket
 import tempfile
@@ -44,10 +46,14 @@ CV_ARTIFACT_LABELS = {
     "pose_landmarks": "Pose landmarks",
     "runner_mask": "Runner mask",
     "densepose": "DensePose",
+    "fused_form": "Fused form",
     "skeleton_render": "Skeleton render",
     "masked_runner": "Masked runner",
     "qa_overlay": "QA overlay",
+    "fused_overlay": "Fused overlay",
     "features": "Features",
+    "form_features": "Form features",
+    "form_feature_arrays": "Feature arrays",
 }
 SAM2_CHECKPOINT = Path("models/sam2/sam2.1_hiera_tiny.pt")
 SAM2_MODEL_CFG = "configs/sam2.1/sam2.1_hiera_t.yaml"
@@ -62,6 +68,18 @@ MASK_QUALITY_MODES = {
 }
 MASK_JOBS: dict[str, dict[str, Any]] = {}
 MASK_JOBS_LOCK = threading.Lock()
+CV_STAGE_JOBS: dict[str, dict[str, Any]] = {}
+CV_STAGE_JOBS_LOCK = threading.Lock()
+CV_STAGE_VALUES = {"pose", "densepose", "fusion", "features"}
+DENSEPOSE_CONFIG_ENV = "DENSEPOSE_CONFIG"
+DENSEPOSE_WEIGHTS_ENV = "DENSEPOSE_WEIGHTS"
+DENSEPOSE_DEVICE_ENV = "DENSEPOSE_DEVICE"
+DENSEPOSE_DEFAULT_CONFIG = (
+    REPO_ROOT / "models/densepose/detectron2/projects/DensePose/configs/densepose_rcnn_R_50_FPN_s1x.yaml"
+)
+DENSEPOSE_DEFAULT_WEIGHTS = (
+    REPO_ROOT / "models/densepose/weights/densepose_rcnn_R_50_FPN_s1x_model_final_162be9.pkl"
+)
 
 
 @dataclass(frozen=True)
@@ -109,6 +127,74 @@ def _resolve_repo_path(path: str | Path, repo_root: Path) -> Path:
     if raw_path.is_absolute():
         return raw_path.resolve()
     return (repo_root / raw_path).resolve()
+
+
+def _is_url(value: str) -> bool:
+    return value.startswith(("http://", "https://"))
+
+
+def densepose_setup_status(config: ReviewAppConfig) -> dict[str, Any]:
+    config_value = os.environ.get(DENSEPOSE_CONFIG_ENV, "").strip()
+    weights_value = os.environ.get(DENSEPOSE_WEIGHTS_ENV, "").strip()
+    device = os.environ.get(DENSEPOSE_DEVICE_ENV, "cpu").strip() or "cpu"
+    reasons: list[str] = []
+
+    config_path: Path | None = None
+    if config_value:
+        config_path = _resolve_repo_path(config_value, config.repo_root)
+        if not config_path.exists():
+            reasons.append(f"{DENSEPOSE_CONFIG_ENV} does not exist: {config_path}")
+    elif DENSEPOSE_DEFAULT_CONFIG.exists():
+        config_path = DENSEPOSE_DEFAULT_CONFIG
+    else:
+        reasons.append(
+            f"Set {DENSEPOSE_CONFIG_ENV} or download the default config to {DENSEPOSE_DEFAULT_CONFIG}"
+        )
+
+    weights_for_runner: str | None = None
+    if weights_value:
+        if _is_url(weights_value):
+            weights_for_runner = weights_value
+        else:
+            weights_path = _resolve_repo_path(weights_value, config.repo_root)
+            weights_for_runner = str(weights_path)
+            if not weights_path.exists():
+                reasons.append(f"{DENSEPOSE_WEIGHTS_ENV} does not exist: {weights_path}")
+    elif DENSEPOSE_DEFAULT_WEIGHTS.exists():
+        weights_for_runner = str(DENSEPOSE_DEFAULT_WEIGHTS)
+    else:
+        reasons.append(
+            f"Set {DENSEPOSE_WEIGHTS_ENV} or download default weights to {DENSEPOSE_DEFAULT_WEIGHTS}"
+        )
+
+    dependencies = {
+        "detectron2": importlib.util.find_spec("detectron2") is not None,
+        "densepose": importlib.util.find_spec("densepose") is not None,
+    }
+    missing_dependencies = [name for name, available in dependencies.items() if not available]
+    if missing_dependencies:
+        reasons.append(
+            "Install optional DensePose dependencies in this venv: "
+            + ", ".join(missing_dependencies)
+        )
+
+    return {
+        "ready": not reasons,
+        "reasons": reasons,
+        "config_path": str(config_path) if config_path else None,
+        "weights": weights_for_runner,
+        "device": device,
+        "using_defaults": {
+            "config": not bool(config_value) and config_path == DENSEPOSE_DEFAULT_CONFIG,
+            "weights": not bool(weights_value) and weights_for_runner == str(DENSEPOSE_DEFAULT_WEIGHTS),
+        },
+        "env": {
+            "config": DENSEPOSE_CONFIG_ENV,
+            "weights": DENSEPOSE_WEIGHTS_ENV,
+            "device": DENSEPOSE_DEVICE_ENV,
+        },
+        "dependencies": dependencies,
+    }
 
 
 def _candidate_priority(row: dict[str, Any], source_index: int) -> tuple[float, float, int, int]:
@@ -293,6 +379,76 @@ def build_clips_payload(config: ReviewAppConfig) -> dict[str, Any]:
         "source_path": str(config.source_path),
         "annotations_path": str(config.annotations_path),
     }
+
+
+def build_cv_run_candidates_payload(config: ReviewAppConfig) -> dict[str, Any]:
+    clips = load_review_clips(config)
+    annotations = load_annotations(config.annotations_path).get("annotations", {})
+    prepared_ids = {run["candidate_id"] for run in list_cv_runs(config)}
+    hydrated: list[dict[str, Any]] = []
+
+    for clip in clips:
+        candidate_id = str(clip["candidate_id"])
+        annotation = annotations.get(candidate_id, {})
+        quality = str(annotation.get("quality") or "unreviewed")
+        start_seconds = annotation.get("start_seconds")
+        end_seconds = annotation.get("end_seconds")
+        has_interval = start_seconds not in (None, "") and end_seconds not in (None, "")
+        if has_interval:
+            has_interval = _as_float(end_seconds) > _as_float(start_seconds)
+        can_prepare = quality in {"good", "mid", "bad"} and bool(has_interval)
+        hydrated.append(
+            {
+                "candidate_id": candidate_id,
+                "runner_name": clip["runner_name"],
+                "title": clip["title"],
+                "primary_bucket": clip["primary_bucket"],
+                "source_url": clip["url"],
+                "review_quality": quality,
+                "camera_angle": annotation.get("camera_angle")
+                or clip.get("camera_angle_proxy")
+                or "unknown",
+                "start_seconds": start_seconds,
+                "end_seconds": end_seconds,
+                "duration_seconds": round(_as_float(end_seconds) - _as_float(start_seconds), 2)
+                if has_interval
+                else None,
+                "notes": annotation.get("notes") or "",
+                "cv_run_prepared": candidate_id in prepared_ids,
+                "can_prepare": can_prepare,
+                "blocked_reason": None if can_prepare else "Review quality and interval first",
+            }
+        )
+
+    return {
+        "clips": hydrated,
+        "prepared": sum(1 for clip in hydrated if clip["cv_run_prepared"]),
+        "preparable": sum(1 for clip in hydrated if clip["can_prepare"]),
+        "total": len(hydrated),
+    }
+
+
+def prepare_cv_run_from_review(
+    config: ReviewAppConfig,
+    candidate_id: str,
+    *,
+    force: bool = False,
+) -> dict[str, Any]:
+    candidate_id = _safe_candidate_id(candidate_id)
+    run_dir = _cv_run_dir(config, candidate_id)
+    if (run_dir / "cv_run_manifest.json").exists() and not force:
+        return load_cv_run_payload(config, candidate_id)
+
+    from whodoirunlike.cv_flow import prepare_single_clip_cv_run
+
+    prepare_single_clip_cv_run(
+        candidate_id=candidate_id,
+        manifest_path=config.source_path,
+        annotations_path=config.annotations_path,
+        output_root=_cv_run_root(config),
+        force=force,
+    )
+    return load_cv_run_payload(config, candidate_id)
 
 
 def _json_bytes(payload: Any) -> bytes:
@@ -578,6 +734,119 @@ def sam2_job_status(candidate_id: str) -> dict[str, Any]:
     return mask_job_status(candidate_id)
 
 
+def _stage_job_key(stage: str, candidate_id: str) -> str:
+    return f"{stage}:{candidate_id}"
+
+
+def _validate_cv_stage(stage: str) -> str:
+    stage = stage.strip().lower()
+    if stage not in CV_STAGE_VALUES:
+        valid = ", ".join(sorted(CV_STAGE_VALUES))
+        raise ValueError(f"stage must be one of: {valid}")
+    return stage
+
+
+def _manifest_stage_key(stage: str) -> str:
+    if stage == "fusion":
+        return "fused_form"
+    if stage == "features":
+        return "form_features"
+    return stage
+
+
+def _cv_stage_backend(stage: str) -> str:
+    if stage == "pose":
+        return "mediapipe_pose"
+    if stage == "densepose":
+        return "detectron2_densepose"
+    if stage == "features":
+        return "form_feature_compiler"
+    return "form_fusion"
+
+
+def _stage_default_job(stage: str, candidate_id: str) -> dict[str, Any]:
+    return {
+        "candidate_id": candidate_id,
+        "stage": stage,
+        "backend": None,
+        "status": "idle",
+        "started_at": None,
+        "completed_at": None,
+        "error": None,
+        "result": None,
+        "progress": None,
+    }
+
+
+def cv_stage_job_status(stage: str, candidate_id: str) -> dict[str, Any]:
+    stage = _validate_cv_stage(stage)
+    candidate_id = _safe_candidate_id(candidate_id)
+    with CV_STAGE_JOBS_LOCK:
+        return dict(
+            CV_STAGE_JOBS.get(_stage_job_key(stage, candidate_id), _stage_default_job(stage, candidate_id))
+        )
+
+
+def _set_cv_stage_job(stage: str, candidate_id: str, updates: dict[str, Any]) -> dict[str, Any]:
+    stage = _validate_cv_stage(stage)
+    key = _stage_job_key(stage, candidate_id)
+    with CV_STAGE_JOBS_LOCK:
+        current = CV_STAGE_JOBS.get(key, _stage_default_job(stage, candidate_id))
+        CV_STAGE_JOBS[key] = {**current, **updates}
+        return dict(CV_STAGE_JOBS[key])
+
+
+def _set_cv_stage_status(
+    config: ReviewAppConfig,
+    candidate_id: str,
+    stage: str,
+    status: str,
+    *,
+    backend: str | None = None,
+    error: str | None = None,
+) -> None:
+    stage = _validate_cv_stage(stage)
+    run_dir = _cv_run_dir(config, candidate_id)
+    manifest_path = run_dir / "cv_run_manifest.json"
+    manifest = _read_json(manifest_path, {})
+    stages = manifest.setdefault("stages", {})
+    stage_payload = stages.setdefault(_manifest_stage_key(stage), {})
+    stage_payload["status"] = status
+    if backend:
+        stage_payload["backend"] = backend
+    if error:
+        stage_payload["error"] = error
+    elif "error" in stage_payload:
+        del stage_payload["error"]
+    manifest["updated_at"] = utc_now_iso()
+    _write_json(manifest_path, manifest)
+
+
+def _initial_cv_stage_progress(stage: str) -> dict[str, Any]:
+    return {
+        "phase": "queued",
+        "processed_frames": 0,
+        "total_frames": 0,
+        "percent": 0.0,
+        "elapsed_seconds": 0.0,
+        "eta_seconds": None,
+        "stage": stage,
+    }
+
+
+def _completed_cv_stage_progress(result: dict[str, Any]) -> dict[str, Any]:
+    frame_count = max(0, _as_int(result.get("frame_count")))
+    elapsed = result.get("elapsed_seconds")
+    return {
+        "phase": "completed",
+        "processed_frames": frame_count,
+        "total_frames": frame_count,
+        "percent": 1.0 if frame_count else 0.0,
+        "elapsed_seconds": round(_as_float(elapsed), 1) if elapsed not in (None, "") else None,
+        "eta_seconds": 0.0,
+    }
+
+
 def _set_mask_job(candidate_id: str, updates: dict[str, Any]) -> dict[str, Any]:
     with MASK_JOBS_LOCK:
         current = MASK_JOBS.get(candidate_id, _mask_default_job(candidate_id))
@@ -763,6 +1032,169 @@ def start_sam2_job(config: ReviewAppConfig, candidate_id: str) -> dict[str, Any]
     return start_mask_job(config, candidate_id, backend="sam2")
 
 
+def _run_cv_stage_job(config: ReviewAppConfig, candidate_id: str, stage: str) -> None:
+    stage = _validate_cv_stage(stage)
+
+    def publish_progress(progress: dict[str, Any]) -> None:
+        _set_cv_stage_job(stage, candidate_id, {"progress": {**progress, "stage": stage}})
+
+    backend = _cv_stage_backend(stage)
+    try:
+        if stage == "pose":
+            from whodoirunlike.pose_runner import run_pose_landmarks
+
+            result = run_pose_landmarks(
+                run_dir=_cv_run_dir(config, candidate_id),
+                model_variant="heavy",
+                input_mode="auto",
+                progress_callback=publish_progress,
+            )
+        elif stage == "densepose":
+            from whodoirunlike.densepose_runner import run_densepose
+
+            setup = densepose_setup_status(config)
+            if not setup["ready"]:
+                raise RuntimeError("DensePose is not configured: " + "; ".join(setup["reasons"]))
+            result = run_densepose(
+                run_dir=_cv_run_dir(config, candidate_id),
+                config_path=Path(str(setup["config_path"])),
+                weights_path=str(setup["weights"]),
+                device=str(setup["device"]),
+                progress_callback=publish_progress,
+            )
+            if result.get("status") == "failed":
+                raise RuntimeError(str(result.get("error") or "DensePose failed"))
+        elif stage == "features":
+            from whodoirunlike.form_features import compile_form_features
+
+            result = compile_form_features(
+                run_dir=_cv_run_dir(config, candidate_id),
+                progress_callback=publish_progress,
+            )
+        else:
+            from whodoirunlike.fusion_runner import run_fused_form
+
+            result = run_fused_form(
+                run_dir=_cv_run_dir(config, candidate_id),
+                progress_callback=publish_progress,
+            )
+        result["backend"] = backend
+        _set_cv_stage_job(
+            stage,
+            candidate_id,
+            {
+                "status": "completed",
+                "completed_at": utc_now_iso(),
+                "error": None,
+                "result": result,
+                "backend": backend,
+                "progress": _completed_cv_stage_progress(result),
+            },
+        )
+    except Exception as exc:  # noqa: BLE001 - surfaced to the local review UI.
+        error = str(exc)
+        progress = cv_stage_job_status(stage, candidate_id).get("progress") or {}
+        _set_cv_stage_status(config, candidate_id, stage, "failed", backend=backend, error=error)
+        _set_cv_stage_job(
+            stage,
+            candidate_id,
+            {
+                "status": "failed",
+                "completed_at": utc_now_iso(),
+                "error": error,
+                "result": None,
+                "backend": backend,
+                "progress": {**progress, "phase": "failed", "eta_seconds": None, "stage": stage},
+            },
+        )
+
+
+def start_cv_stage_job(config: ReviewAppConfig, candidate_id: str, stage: str) -> dict[str, Any]:
+    stage = _validate_cv_stage(stage)
+    candidate_id = _safe_candidate_id(candidate_id)
+    run_dir = _cv_run_dir(config, candidate_id)
+    if not (run_dir / "cv_run_manifest.json").exists():
+        raise FileNotFoundError(f"CV run not found: {candidate_id}")
+    if stage == "densepose" and not (run_dir / "runner_mask.mp4").exists():
+        raise FileNotFoundError("Runner mask not found; run a mask backend before DensePose")
+    if stage == "fusion":
+        if not (run_dir / "pose_landmarks.jsonl").exists():
+            raise FileNotFoundError("Pose landmarks not found; run Pose before Fusion")
+        if not (run_dir / "densepose.jsonl").exists():
+            raise FileNotFoundError("DensePose not found; run DensePose before Fusion")
+    if stage == "features":
+        if not (run_dir / "pose_landmarks.jsonl").exists():
+            raise FileNotFoundError("Pose landmarks not found; run Pose before Features")
+        if not (run_dir / "fused_form.jsonl").exists():
+            raise FileNotFoundError("Fused form not found; run Fusion before Features")
+    if stage == "densepose":
+        setup = densepose_setup_status(config)
+        if not setup["ready"]:
+            raise ValueError("DensePose is not configured: " + "; ".join(setup["reasons"]))
+
+    existing = cv_stage_job_status(stage, candidate_id)
+    if existing["status"] == "running":
+        return existing
+
+    backend = _cv_stage_backend(stage)
+    _set_cv_stage_status(config, candidate_id, stage, "running", backend=backend)
+    _set_cv_stage_job(
+        stage,
+        candidate_id,
+        {
+            "candidate_id": candidate_id,
+            "stage": stage,
+            "backend": backend,
+            "status": "running",
+            "started_at": utc_now_iso(),
+            "completed_at": None,
+            "error": None,
+            "result": None,
+            "progress": _initial_cv_stage_progress(stage),
+        },
+    )
+    thread = threading.Thread(
+        target=_run_cv_stage_job,
+        args=(config, candidate_id, stage),
+        name=f"{stage}-{candidate_id}",
+        daemon=True,
+    )
+    thread.start()
+    return cv_stage_job_status(stage, candidate_id)
+
+
+def pose_job_status(candidate_id: str) -> dict[str, Any]:
+    return cv_stage_job_status("pose", candidate_id)
+
+
+def densepose_job_status(candidate_id: str) -> dict[str, Any]:
+    return cv_stage_job_status("densepose", candidate_id)
+
+
+def fusion_job_status(candidate_id: str) -> dict[str, Any]:
+    return cv_stage_job_status("fusion", candidate_id)
+
+
+def features_job_status(candidate_id: str) -> dict[str, Any]:
+    return cv_stage_job_status("features", candidate_id)
+
+
+def start_pose_job(config: ReviewAppConfig, candidate_id: str) -> dict[str, Any]:
+    return start_cv_stage_job(config, candidate_id, "pose")
+
+
+def start_densepose_job(config: ReviewAppConfig, candidate_id: str) -> dict[str, Any]:
+    return start_cv_stage_job(config, candidate_id, "densepose")
+
+
+def start_fusion_job(config: ReviewAppConfig, candidate_id: str) -> dict[str, Any]:
+    return start_cv_stage_job(config, candidate_id, "fusion")
+
+
+def start_features_job(config: ReviewAppConfig, candidate_id: str) -> dict[str, Any]:
+    return start_cv_stage_job(config, candidate_id, "features")
+
+
 def _subject_candidates_path(run_dir: Path, quality_mode: str) -> Path:
     return run_dir / f"subject_candidates.sam31_mlx.{quality_mode}.json"
 
@@ -832,6 +1264,9 @@ class ReviewRequestHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/cv-runs":
             self._send_json({"runs": list_cv_runs(self.config)})
             return
+        if parsed.path == "/api/cv-run-candidates":
+            self._send_json(build_cv_run_candidates_payload(self.config))
+            return
         if parsed.path.startswith("/api/cv-runs/") and parsed.path.endswith("/mask"):
             self._handle_get_mask_job(parsed.path)
             return
@@ -840,6 +1275,18 @@ class ReviewRequestHandler(BaseHTTPRequestHandler):
             return
         if parsed.path.startswith("/api/cv-runs/") and parsed.path.endswith("/subject-candidates"):
             self._handle_get_subject_candidates(parsed)
+            return
+        if parsed.path.startswith("/api/cv-runs/") and parsed.path.endswith("/pose"):
+            self._handle_get_pose_job(parsed.path)
+            return
+        if parsed.path.startswith("/api/cv-runs/") and parsed.path.endswith("/densepose"):
+            self._handle_get_densepose_job(parsed.path)
+            return
+        if parsed.path.startswith("/api/cv-runs/") and parsed.path.endswith("/fusion"):
+            self._handle_get_fusion_job(parsed.path)
+            return
+        if parsed.path.startswith("/api/cv-runs/") and parsed.path.endswith("/features"):
+            self._handle_get_features_job(parsed.path)
             return
         if parsed.path.startswith("/api/cv-runs/"):
             self._handle_get_cv_run(parsed.path)
@@ -865,6 +1312,21 @@ class ReviewRequestHandler(BaseHTTPRequestHandler):
             return
         if parsed.path.startswith("/api/cv-runs/") and parsed.path.endswith("/subject-candidates"):
             self._handle_detect_subject_candidates(parsed.path)
+            return
+        if parsed.path.startswith("/api/cv-runs/") and parsed.path.endswith("/pose"):
+            self._handle_start_pose_job(parsed.path)
+            return
+        if parsed.path.startswith("/api/cv-runs/") and parsed.path.endswith("/densepose"):
+            self._handle_start_densepose_job(parsed.path)
+            return
+        if parsed.path.startswith("/api/cv-runs/") and parsed.path.endswith("/fusion"):
+            self._handle_start_fusion_job(parsed.path)
+            return
+        if parsed.path.startswith("/api/cv-runs/") and parsed.path.endswith("/features"):
+            self._handle_start_features_job(parsed.path)
+            return
+        if parsed.path.startswith("/api/cv-runs/") and parsed.path.endswith("/prepare"):
+            self._handle_prepare_cv_run(parsed.path)
             return
 
         if parsed.path != "/api/annotations":
@@ -951,6 +1413,121 @@ class ReviewRequestHandler(BaseHTTPRequestHandler):
                 {
                     "subject_candidates": detect_subject_candidates(self.config, candidate_id, data),
                     "quality_modes": MASK_QUALITY_MODES,
+                }
+            )
+        except json.JSONDecodeError as exc:
+            self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+        except FileNotFoundError as exc:
+            self._send_json({"error": str(exc)}, status=HTTPStatus.NOT_FOUND)
+        except ValueError as exc:
+            self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+
+    def _handle_get_pose_job(self, path: str) -> None:
+        candidate_id = unquote(path.removeprefix("/api/cv-runs/").removesuffix("/pose")).strip("/")
+        try:
+            run_dir = _cv_run_dir(self.config, candidate_id)
+            if not (run_dir / "cv_run_manifest.json").exists():
+                raise FileNotFoundError(f"CV run not found: {candidate_id}")
+            self._send_json({"job": pose_job_status(candidate_id)})
+        except (FileNotFoundError, ValueError) as exc:
+            self._send_json({"error": str(exc)}, status=HTTPStatus.NOT_FOUND)
+
+    def _handle_start_pose_job(self, path: str) -> None:
+        candidate_id = unquote(path.removeprefix("/api/cv-runs/").removesuffix("/pose")).strip("/")
+        try:
+            self._send_json({"job": start_pose_job(self.config, candidate_id)})
+        except FileNotFoundError as exc:
+            self._send_json({"error": str(exc)}, status=HTTPStatus.NOT_FOUND)
+        except ValueError as exc:
+            self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+
+    def _handle_get_densepose_job(self, path: str) -> None:
+        candidate_id = unquote(
+            path.removeprefix("/api/cv-runs/").removesuffix("/densepose")
+        ).strip("/")
+        try:
+            run_dir = _cv_run_dir(self.config, candidate_id)
+            if not (run_dir / "cv_run_manifest.json").exists():
+                raise FileNotFoundError(f"CV run not found: {candidate_id}")
+            self._send_json(
+                {
+                    "job": densepose_job_status(candidate_id),
+                    "setup": densepose_setup_status(self.config),
+                }
+            )
+        except (FileNotFoundError, ValueError) as exc:
+            self._send_json({"error": str(exc)}, status=HTTPStatus.NOT_FOUND)
+
+    def _handle_start_densepose_job(self, path: str) -> None:
+        candidate_id = unquote(
+            path.removeprefix("/api/cv-runs/").removesuffix("/densepose")
+        ).strip("/")
+        try:
+            self._send_json(
+                {
+                    "job": start_densepose_job(self.config, candidate_id),
+                    "setup": densepose_setup_status(self.config),
+                }
+            )
+        except FileNotFoundError as exc:
+            self._send_json({"error": str(exc)}, status=HTTPStatus.NOT_FOUND)
+        except ValueError as exc:
+            self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+
+    def _handle_get_fusion_job(self, path: str) -> None:
+        candidate_id = unquote(path.removeprefix("/api/cv-runs/").removesuffix("/fusion")).strip("/")
+        try:
+            run_dir = _cv_run_dir(self.config, candidate_id)
+            if not (run_dir / "cv_run_manifest.json").exists():
+                raise FileNotFoundError(f"CV run not found: {candidate_id}")
+            self._send_json({"job": fusion_job_status(candidate_id)})
+        except (FileNotFoundError, ValueError) as exc:
+            self._send_json({"error": str(exc)}, status=HTTPStatus.NOT_FOUND)
+
+    def _handle_start_fusion_job(self, path: str) -> None:
+        candidate_id = unquote(path.removeprefix("/api/cv-runs/").removesuffix("/fusion")).strip("/")
+        try:
+            self._send_json({"job": start_fusion_job(self.config, candidate_id)})
+        except FileNotFoundError as exc:
+            self._send_json({"error": str(exc)}, status=HTTPStatus.NOT_FOUND)
+        except ValueError as exc:
+            self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+
+    def _handle_get_features_job(self, path: str) -> None:
+        candidate_id = unquote(
+            path.removeprefix("/api/cv-runs/").removesuffix("/features")
+        ).strip("/")
+        try:
+            run_dir = _cv_run_dir(self.config, candidate_id)
+            if not (run_dir / "cv_run_manifest.json").exists():
+                raise FileNotFoundError(f"CV run not found: {candidate_id}")
+            self._send_json({"job": features_job_status(candidate_id)})
+        except (FileNotFoundError, ValueError) as exc:
+            self._send_json({"error": str(exc)}, status=HTTPStatus.NOT_FOUND)
+
+    def _handle_start_features_job(self, path: str) -> None:
+        candidate_id = unquote(
+            path.removeprefix("/api/cv-runs/").removesuffix("/features")
+        ).strip("/")
+        try:
+            self._send_json({"job": start_features_job(self.config, candidate_id)})
+        except FileNotFoundError as exc:
+            self._send_json({"error": str(exc)}, status=HTTPStatus.NOT_FOUND)
+        except ValueError as exc:
+            self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+
+    def _handle_prepare_cv_run(self, path: str) -> None:
+        candidate_id = unquote(path.removeprefix("/api/cv-runs/").removesuffix("/prepare")).strip("/")
+        try:
+            length = min(int(self.headers.get("Content-Length", "0")), 64_000)
+            data = json.loads(self.rfile.read(length).decode("utf-8")) if length else {}
+            self._send_json(
+                {
+                    "run": prepare_cv_run_from_review(
+                        self.config,
+                        candidate_id,
+                        force=bool(data.get("force")),
+                    )
                 }
             )
         except json.JSONDecodeError as exc:

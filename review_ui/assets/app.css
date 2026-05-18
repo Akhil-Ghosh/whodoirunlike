@@ -633,7 +633,68 @@ textarea {
 }
 
 .subject-run-list {
-  max-height: calc(100dvh - 234px);
+  max-height: min(40dvh, 420px);
+}
+
+.prep-section {
+  margin-top: 18px;
+  border-top: 1px solid var(--line);
+  padding-top: 16px;
+}
+
+.prep-section h2 {
+  font-size: 1.12rem;
+}
+
+.prep-list {
+  display: grid;
+  gap: 8px;
+  max-height: min(38dvh, 360px);
+  overflow: auto;
+  padding-right: 4px;
+}
+
+.prep-item {
+  width: 100%;
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  padding: 11px;
+  color: var(--ink);
+  background: rgba(255, 255, 255, 0.34);
+  text-align: left;
+}
+
+.prep-item:hover:not(:disabled) {
+  border-color: rgba(167, 124, 78, 0.36);
+  background: rgba(255, 255, 255, 0.58);
+}
+
+.prep-item:disabled {
+  cursor: not-allowed;
+  opacity: 0.52;
+}
+
+.prep-item.is-prepared {
+  border-color: rgba(82, 116, 94, 0.3);
+}
+
+.prep-title {
+  display: -webkit-box;
+  margin: 7px 0 9px;
+  overflow: hidden;
+  font-weight: 650;
+  line-height: 1.2;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+}
+
+.prep-meta,
+.prep-kicker {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  color: var(--muted);
+  font-size: 0.72rem;
 }
 
 .prompt-toolbar {
@@ -804,20 +865,28 @@ textarea {
   font-size: 0.82rem;
 }
 
-.sam-job-state.is-running {
+.sam-job-state.is-running,
+.cv-job-state.is-running {
   color: var(--accent);
 }
 
-.sam-job-state.is-complete {
+.sam-job-state.is-complete,
+.cv-job-state.is-complete {
   color: var(--good);
 }
 
-.sam-job-state.is-error {
+.sam-job-state.is-error,
+.cv-job-state.is-error {
   color: var(--bad);
 }
 
-.run-sam-button {
+.run-sam-button,
+.run-cv-button {
   white-space: nowrap;
+}
+
+.run-cv-button {
+  padding-inline: 13px;
 }
 
 .mask-progress {
@@ -826,6 +895,10 @@ textarea {
   border-top: 1px solid var(--line);
   border-bottom: 1px solid var(--line);
   padding: 14px 0;
+}
+
+.cv-progress {
+  padding: 10px 0;
 }
 
 .mask-progress.is-hidden {

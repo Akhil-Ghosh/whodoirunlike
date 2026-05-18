@@ -223,10 +223,14 @@ def build_cv_run_manifest(clip: ReviewedClip, run_dir: Path) -> dict[str, Any]:
         "pose_landmarks": str(run_dir / "pose_landmarks.jsonl"),
         "runner_mask": str(run_dir / "runner_mask.mp4"),
         "densepose": str(run_dir / "densepose.jsonl"),
+        "fused_form": str(run_dir / "fused_form.jsonl"),
         "skeleton_render": str(run_dir / "skeleton_render.mp4"),
         "masked_runner": str(run_dir / "masked_runner.mp4"),
         "qa_overlay": str(run_dir / "qa_overlay.mp4"),
+        "fused_overlay": str(run_dir / "fused_overlay.mp4"),
         "features": str(run_dir / "features.json"),
+        "form_features": str(run_dir / "form_features.json"),
+        "form_feature_arrays": str(run_dir / "form_features.npz"),
     }
     return {
         "version": 1,
@@ -270,15 +274,28 @@ def build_cv_run_manifest(clip: ReviewedClip, run_dir: Path) -> dict[str, Any]:
                 "recommended_tool": "Detectron2 projects/DensePose",
                 "output": paths["densepose"],
             },
+            "fused_form": {
+                "status": "pending_pose_and_densepose",
+                "recommended_tool": "MediaPipe + SAM mask + DensePose fusion",
+                "output": paths["fused_form"],
+                "overlay": paths["fused_overlay"],
+            },
             "renders": {
                 "status": "pending",
                 "outputs": [
                     paths["skeleton_render"],
                     paths["masked_runner"],
                     paths["qa_overlay"],
+                    paths["fused_overlay"],
                 ],
             },
             "features": {"status": "pending", "output": paths["features"]},
+            "form_features": {
+                "status": "pending_fused_form",
+                "recommended_tool": "Pose sequence + fused confidence feature compiler",
+                "output": paths["form_features"],
+                "arrays": paths["form_feature_arrays"],
+            },
         },
         "occlusion_policy": {
             "drop_frame_when": [

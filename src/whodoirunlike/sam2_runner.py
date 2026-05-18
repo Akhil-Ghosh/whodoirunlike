@@ -9,6 +9,7 @@ import cv2
 import numpy as np
 
 from whodoirunlike.cv_flow import utc_now_iso
+from whodoirunlike.video_io import make_browser_playable_mp4s
 
 
 def read_json(path: Path) -> Any:
@@ -210,8 +211,8 @@ def write_mask_outputs(
             reason = "centroid_jump_identity_risk"
 
         mask_writer.write(cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR))
-        dim = (frame * 0.26).astype("uint8")
-        masked = np.where(mask_bool[:, :, None], frame, dim)
+        masked = np.zeros_like(frame)
+        masked[mask_bool] = frame[mask_bool]
         masked_writer.write(masked)
         qa_writer.write(contour_overlay(frame, mask))
         metadata_rows.append(
@@ -228,6 +229,7 @@ def write_mask_outputs(
     mask_writer.release()
     masked_writer.release()
     qa_writer.release()
+    make_browser_playable_mp4s([runner_mask_path, masked_runner_path, qa_overlay_path])
     with metadata_path.open("w", encoding="utf-8") as f:
         for row in metadata_rows:
             f.write(json.dumps(row) + "\n")

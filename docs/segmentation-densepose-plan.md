@@ -5,7 +5,8 @@ This pipeline separates four jobs that are easy to blur together:
 1. Target selection: identify which person in the clip is the runner we care about.
 2. Whole-runner tracking: follow that selected runner through the reviewed segment.
 3. Pose/form features: extract landmarks over time for matching.
-4. Body-surface/detail layer: add DensePose or body-part outputs when the runner mask and pose are already trustworthy.
+4. Body-surface/detail layer: add DensePose body-region outputs when the runner mask and pose are already trustworthy.
+5. Fused form signal: combine pose, mask, and DensePose evidence into confidence-weighted form QA.
 
 ## Recommended Stack
 
@@ -27,6 +28,8 @@ Outputs:
 
 Use MediaPipe Pose Landmarker first because it is fast and already in the repo. The matching feature should be pose-sequence based, not mask-pixel based.
 
+When `runner_mask.mp4` exists, pose extraction should treat it as a hard target constraint: black out non-runner pixels before MediaPipe inference, then prefer or reject pose candidates by overlap with the mask. This prevents crowded race footage from snapping to a clearer neighboring runner.
+
 Outputs:
 
 - `pose_landmarks.jsonl`
@@ -40,9 +43,33 @@ Use Detectron2 `projects/DensePose` as the first real DensePose layer. DensePose
 Outputs:
 
 - `densepose.jsonl`
+- per-frame part coverage, part pixels, UV summary stats, detection confidence, and mask overlap
 - optional part/surface overlay inside `qa_overlay.mp4`
 
 Do not make DensePose a hard dependency for MVP matching. Treat it as an enhancement layer because install/runtime requirements are heavier than the pose-first path.
+
+### Fused Form Signal
+
+Use MediaPipe as the motion truth and DensePose as the body-region confidence layer.
+The fused stage should not replace pose-sequence matching; it should produce frame and
+joint weights that tell the matcher which pose samples to trust.
+
+Inputs:
+
+- `pose_landmarks.jsonl`
+- `runner_mask.mp4`
+- `densepose.jsonl`
+- source or DensePose overlay video for rendering
+
+Outputs:
+
+- `fused_form.jsonl`
+- `fused_overlay.mp4`
+
+The fused JSON should include per-frame confidence, frame state, DensePose body-region
+coverage, per-joint weights, and questionable joints. The fused overlay should show the
+runner mask edge, DensePose body-region rendering when available, MediaPipe skeleton,
+red/yellow questionable joints, and a confidence badge.
 
 ## Single-Clip Sequence
 
@@ -57,8 +84,9 @@ Do not make DensePose a hard dependency for MVP matching. Treat it as an enhance
 4. Run SAM 2.1 over `source_segment.mp4` to produce `runner_mask.mp4`.
 5. Run pose extraction on the segment, constrained by the runner mask when possible.
 6. Run DensePose on masked/cropped frames.
-7. Render `qa_overlay.mp4`.
-8. Inspect the overlay before adding the clip to the scaled corpus.
+7. Run the fused form stage.
+8. Render `fused_overlay.mp4`.
+9. Inspect the overlay before adding the clip to the scaled corpus.
 
 ## Prompt Selection
 
@@ -98,6 +126,7 @@ Signals to monitor:
 - mask area jumps
 - mask centroid velocity spikes
 - DensePose part coverage disappearing
+- fused form confidence dropping below the acceptance threshold
 - scene cuts from PySceneDetect
 
 Matching should use confidence-weighted frame aggregation. A clip can still be good if 80 percent of the selected segment is clean and the bad frames are marked.
@@ -110,4 +139,4 @@ Do not process all reviewed clips until one segment can repeatedly produce:
 - pose landmarks through at least one full stride cycle
 - clear dropped-frame reasons
 - skeleton render that looks like the runner
-- QA overlay that makes failures obvious
+- fused overlay that makes failures obvious

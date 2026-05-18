@@ -2,6 +2,13 @@ const state = {
   runs: [],
   current: null,
   samJob: null,
+  poseJob: null,
+  denseposeJob: null,
+  fusionJob: null,
+  featuresJob: null,
+  denseposeSetup: null,
+  prepCandidates: [],
+  prepStatus: "idle",
   maskBackend: "sam2",
   maskQualityMode: "native",
   subjectCandidates: [],
@@ -19,6 +26,10 @@ const state = {
   draftBox: null,
   saveTimer: 0,
   samPollTimer: 0,
+  posePollTimer: 0,
+  denseposePollTimer: 0,
+  fusionPollTimer: 0,
+  featuresPollTimer: 0,
 };
 
 const svgNS = "http://www.w3.org/2000/svg";
@@ -27,6 +38,8 @@ const els = {
   saveState: document.querySelector("#saveState"),
   runCount: document.querySelector("#runCount"),
   runList: document.querySelector("#runList"),
+  prepCount: document.querySelector("#prepCount"),
+  prepList: document.querySelector("#prepList"),
   runBucket: document.querySelector("#runBucket"),
   runTitle: document.querySelector("#runTitle"),
   runMeta: document.querySelector("#runMeta"),
@@ -48,15 +61,43 @@ const els = {
   segmentEmpty: document.querySelector("#segmentEmpty"),
   promptState: document.querySelector("#promptState"),
   samJobState: document.querySelector("#samJobState"),
+  poseJobState: document.querySelector("#poseJobState"),
+  denseposeJobState: document.querySelector("#denseposeJobState"),
+  fusionJobState: document.querySelector("#fusionJobState"),
+  featuresJobState: document.querySelector("#featuresJobState"),
   maskBackendSelect: document.querySelector("#maskBackendSelect"),
   maskQualityLabel: document.querySelector("#maskQualityLabel"),
   maskQualitySelect: document.querySelector("#maskQualitySelect"),
   runSamButton: document.querySelector("#runSamButton"),
+  runPoseButton: document.querySelector("#runPoseButton"),
+  runDenseposeButton: document.querySelector("#runDenseposeButton"),
+  runFusionButton: document.querySelector("#runFusionButton"),
+  runFeaturesButton: document.querySelector("#runFeaturesButton"),
   maskProgress: document.querySelector("#maskProgress"),
   maskProgressLabel: document.querySelector("#maskProgressLabel"),
   maskProgressEta: document.querySelector("#maskProgressEta"),
   maskProgressBar: document.querySelector("#maskProgressBar"),
   maskProgressMeta: document.querySelector("#maskProgressMeta"),
+  poseProgress: document.querySelector("#poseProgress"),
+  poseProgressLabel: document.querySelector("#poseProgressLabel"),
+  poseProgressEta: document.querySelector("#poseProgressEta"),
+  poseProgressBar: document.querySelector("#poseProgressBar"),
+  poseProgressMeta: document.querySelector("#poseProgressMeta"),
+  denseposeProgress: document.querySelector("#denseposeProgress"),
+  denseposeProgressLabel: document.querySelector("#denseposeProgressLabel"),
+  denseposeProgressEta: document.querySelector("#denseposeProgressEta"),
+  denseposeProgressBar: document.querySelector("#denseposeProgressBar"),
+  denseposeProgressMeta: document.querySelector("#denseposeProgressMeta"),
+  fusionProgress: document.querySelector("#fusionProgress"),
+  fusionProgressLabel: document.querySelector("#fusionProgressLabel"),
+  fusionProgressEta: document.querySelector("#fusionProgressEta"),
+  fusionProgressBar: document.querySelector("#fusionProgressBar"),
+  fusionProgressMeta: document.querySelector("#fusionProgressMeta"),
+  featuresProgress: document.querySelector("#featuresProgress"),
+  featuresProgressLabel: document.querySelector("#featuresProgressLabel"),
+  featuresProgressEta: document.querySelector("#featuresProgressEta"),
+  featuresProgressBar: document.querySelector("#featuresProgressBar"),
+  featuresProgressMeta: document.querySelector("#featuresProgressMeta"),
   stageList: document.querySelector("#stageList"),
   artifactGrid: document.querySelector("#artifactGrid"),
   promptJson: document.querySelector("#promptJson"),
@@ -227,10 +268,31 @@ function clearSamPoll() {
   state.samPollTimer = 0;
 }
 
+function clearCvPoll(kind) {
+  const timerKey = `${kind}PollTimer`;
+  window.clearTimeout(state[timerKey]);
+  state[timerKey] = 0;
+}
+
+function clearAllCvPolls() {
+  clearSamPoll();
+  clearCvPoll("pose");
+  clearCvPoll("densepose");
+  clearCvPoll("fusion");
+  clearCvPoll("features");
+}
+
 function scheduleSamPoll() {
   clearSamPoll();
   state.samPollTimer = window.setTimeout(() => {
     refreshSamJobStatus({ reloadOnComplete: true });
+  }, 2000);
+}
+
+function scheduleCvPoll(kind) {
+  clearCvPoll(kind);
+  state[`${kind}PollTimer`] = window.setTimeout(() => {
+    refreshCvJobStatus(kind, { reloadOnComplete: true });
   }, 2000);
 }
 
@@ -255,6 +317,14 @@ function qualityLabel(mode = state.maskQualityMode) {
 function phaseLabel(phase = "") {
   if (phase === "loading_model") return "Loading model";
   if (phase === "detecting") return "Detecting runner masks";
+  if (phase === "detecting_pose") return "Estimating pose";
+  if (phase === "estimating_pose") return "Estimating pose";
+  if (phase === "running_pose") return "Estimating pose";
+  if (phase === "running_densepose") return "Running DensePose";
+  if (phase === "fusing_form") return "Fusing form";
+  if (phase === "reading_inputs") return "Reading inputs";
+  if (phase === "compiling_features") return "Compiling features";
+  if (phase === "summarizing_features") return "Summarizing features";
   if (phase === "writing_outputs") return "Writing outputs";
   if (phase === "completed") return "Complete";
   if (phase === "failed") return "Failed";
@@ -271,6 +341,14 @@ function progressPercent(progress = {}) {
     return Math.max(0, Math.min(1, processed / total));
   }
   return 0;
+}
+
+function artifactExists(key) {
+  return Boolean(state.current?.artifacts?.[key]?.exists);
+}
+
+function hasDenseposeInputs() {
+  return artifactExists("runner_mask") || artifactExists("qa_overlay");
 }
 
 function renderMaskProgress(job = state.samJob) {
@@ -304,14 +382,39 @@ function renderMaskProgress(job = state.samJob) {
       : `elapsed ${elapsed}${resolution}`;
 }
 
+function renderCvProgress(kind, job) {
+  const progress = job?.progress;
+  const isRunning = job?.status === "running";
+  const progressEl = els[`${kind}Progress`];
+  const barEl = els[`${kind}ProgressBar`];
+  if (!isRunning || !progress) {
+    progressEl.classList.add("is-hidden");
+    barEl.style.width = "0%";
+    return;
+  }
+
+  const processed = Number(progress.processed_frames) || 0;
+  const total = Number(progress.total_frames) || 0;
+  const percent = progressPercent(progress);
+  const percentLabel = `${Math.round(percent * 100)}%`;
+  const eta = progress.eta_seconds == null ? "--" : formatTime(progress.eta_seconds);
+  const elapsed = progress.elapsed_seconds == null ? "--" : formatTime(progress.elapsed_seconds);
+  const phase = phaseLabel(progress.phase);
+
+  progressEl.classList.remove("is-hidden");
+  els[`${kind}ProgressLabel`].textContent = `${phase} · ${percentLabel}`;
+  els[`${kind}ProgressEta`].textContent = `ETA ${eta}`;
+  barEl.style.width = `${Math.round(percent * 100)}%`;
+  els[`${kind}ProgressMeta`].textContent =
+    total > 0 ? `${processed}/${total} frames · elapsed ${elapsed}` : `elapsed ${elapsed}`;
+}
+
 function renderSamJobStatus(job = state.samJob) {
   state.samJob = job || { status: "idle" };
   const status = state.samJob.status || "idle";
   const selection = normalizedSelection();
   const hasPrompt = selection.type !== "unset";
-  const artifactsReady = Boolean(
-    state.current?.artifacts?.runner_mask?.exists || state.current?.artifacts?.qa_overlay?.exists
-  );
+  const artifactsReady = hasDenseposeInputs();
 
   let statusLabel = samStatusLabel(status);
   if (status === "idle" && artifactsReady) statusLabel = "Artifacts ready";
@@ -341,6 +444,86 @@ function renderSamJobStatus(job = state.samJob) {
     : "Select the runner first";
 }
 
+function cvJobConfig(kind) {
+  if (kind === "densepose") {
+    const setupReady = state.denseposeSetup ? Boolean(state.denseposeSetup.ready) : true;
+    const setupReason = state.denseposeSetup?.reasons?.[0] || "DensePose is not configured";
+    return {
+      label: "DensePose",
+      stateKey: "denseposeJob",
+      stateEl: els.denseposeJobState,
+      buttonEl: els.runDenseposeButton,
+      ready: artifactExists("densepose"),
+      canRun: Boolean(state.current) && hasDenseposeInputs() && setupReady,
+      blockedTitle: !hasDenseposeInputs() ? "Run mask first" : setupReason,
+    };
+  }
+  if (kind === "fusion") {
+    const hasPose = artifactExists("pose_landmarks");
+    const hasDensepose = artifactExists("densepose");
+    return {
+      label: "Fusion",
+      stateKey: "fusionJob",
+      stateEl: els.fusionJobState,
+      buttonEl: els.runFusionButton,
+      ready: artifactExists("fused_form") || artifactExists("fused_overlay"),
+      canRun: Boolean(state.current) && hasPose && hasDensepose,
+      blockedTitle: !hasPose ? "Run Pose first" : !hasDensepose ? "Run DensePose first" : "Load a CV run first",
+    };
+  }
+  if (kind === "features") {
+    const hasPose = artifactExists("pose_landmarks");
+    const hasFused = artifactExists("fused_form");
+    return {
+      label: "Features",
+      stateKey: "featuresJob",
+      stateEl: els.featuresJobState,
+      buttonEl: els.runFeaturesButton,
+      ready: artifactExists("form_features") || artifactExists("form_feature_arrays"),
+      canRun: Boolean(state.current) && hasPose && hasFused,
+      blockedTitle: !hasPose ? "Run Pose first" : !hasFused ? "Run Fusion first" : "Load a CV run first",
+    };
+  }
+  return {
+    label: "Pose",
+    stateKey: "poseJob",
+    stateEl: els.poseJobState,
+    buttonEl: els.runPoseButton,
+    ready: artifactExists("pose_landmarks") || artifactExists("skeleton_render"),
+    canRun: Boolean(state.current),
+    blockedTitle: "Load a CV run first",
+  };
+}
+
+function renderCvJobStatus(kind, job = state[cvJobConfig(kind).stateKey]) {
+  const config = cvJobConfig(kind);
+  state[config.stateKey] = job || { status: "idle" };
+  const currentJob = state[config.stateKey];
+  const status = currentJob.status || "idle";
+  const isRunning = status === "running";
+  const setupBlocked = kind === "densepose" && state.denseposeSetup && !state.denseposeSetup.ready;
+  const percent = currentJob.progress ? Math.round(progressPercent(currentJob.progress) * 100) : null;
+  let label = `${config.label} ${samStatusLabel(status).toLowerCase()}`;
+
+  if (setupBlocked) label = `${config.label} setup`;
+  if (status === "idle" && config.ready) label = `${config.label} ready`;
+  if (isRunning) label = percent == null ? `${config.label} running` : `${config.label} ${percent}%`;
+
+  renderCvProgress(kind, currentJob);
+  config.stateEl.textContent = label;
+  config.stateEl.className = `rank-pill cv-job-state ${
+    isRunning ? "is-running" : status === "completed" || config.ready ? "is-complete" : ""
+  } ${status === "failed" || setupBlocked ? "is-error" : ""}`.trim();
+
+  config.buttonEl.disabled = !config.canRun || isRunning;
+  config.buttonEl.textContent = isRunning
+    ? "Running..."
+    : config.ready || status === "completed"
+      ? `Run ${config.label} Again`
+      : `Run ${config.label}`;
+  config.buttonEl.title = config.canRun ? `Run ${config.label} on the current CV run` : config.blockedTitle;
+}
+
 function renderRunList() {
   els.runList.innerHTML = "";
   els.runCount.textContent = `${state.runs.length} run${state.runs.length === 1 ? "" : "s"}`;
@@ -363,6 +546,46 @@ function renderRunList() {
     `;
     button.addEventListener("click", () => loadRun(run.candidate_id));
     els.runList.appendChild(button);
+  });
+}
+
+function renderPrepList() {
+  els.prepList.innerHTML = "";
+  if (state.prepStatus === "loading") {
+    els.prepCount.textContent = "Loading";
+    els.prepList.innerHTML = `<div class="artifact-empty">Loading reviewed clips</div>`;
+    return;
+  }
+  els.prepCount.textContent = `${state.prepCandidates.length} clip${
+    state.prepCandidates.length === 1 ? "" : "s"
+  }`;
+  state.prepCandidates.forEach((clip) => {
+    const prepared = Boolean(clip.cv_run_prepared);
+    const canPrepare = Boolean(clip.can_prepare);
+    const button = document.createElement("button");
+    button.className = `prep-item ${prepared ? "is-prepared" : ""}`.trim();
+    button.type = "button";
+    button.disabled = !prepared && !canPrepare;
+    const quality = clip.review_quality || "unreviewed";
+    button.innerHTML = `
+      <div class="prep-kicker">
+        <span>${clip.runner_name || "Unknown runner"}</span>
+        <span class="quality-dot ${quality}">${prepared ? "ready" : quality}</span>
+      </div>
+      <div class="prep-title">${clip.title || "Untitled clip"}</div>
+      <div class="prep-meta">
+        <span>${clip.camera_angle || "unknown"}</span>
+        <span>${prepared ? "Open" : canPrepare ? "Prepare" : "Needs review"}</span>
+      </div>
+    `;
+    button.addEventListener("click", () => {
+      if (prepared) {
+        loadRun(clip.candidate_id);
+      } else if (canPrepare) {
+        prepareCvRun(clip.candidate_id);
+      }
+    });
+    els.prepList.appendChild(button);
   });
 }
 
@@ -407,10 +630,14 @@ function renderArtifacts(artifacts) {
     "runner_mask",
     "pose_landmarks",
     "densepose",
+    "fused_form",
     "skeleton_render",
     "masked_runner",
     "qa_overlay",
+    "fused_overlay",
     "features",
+    "form_features",
+    "form_feature_arrays",
   ];
   els.artifactGrid.innerHTML = preferredOrder
     .filter((key) => artifacts?.[key])
@@ -483,19 +710,33 @@ function renderRun() {
   renderArtifacts(run.artifacts);
   renderRunList();
   renderSamJobStatus();
+  renderCvJobStatus("pose");
+  renderCvJobStatus("densepose");
+  renderCvJobStatus("fusion");
+  renderCvJobStatus("features");
   setSaveState("Ready");
 }
 
 async function loadRun(candidateId, options = {}) {
-  const { refreshJob = true } = options;
+  const { refreshJob = true, preservePolls = false } = options;
   try {
-    clearSamPoll();
+    if (!preservePolls) clearAllCvPolls();
     setSaveState("Loading", "is-saving");
-    state.samJob = null;
+    if (!preservePolls) {
+      state.samJob = null;
+      state.poseJob = null;
+      state.denseposeJob = null;
+      state.fusionJob = null;
+      state.featuresJob = null;
+    }
     state.current = await fetchJson(`/api/cv-runs/${candidateId}`);
     renderRun();
     if (refreshJob) {
       await refreshSamJobStatus();
+      await refreshCvJobStatus("pose");
+      await refreshCvJobStatus("densepose");
+      await refreshCvJobStatus("fusion");
+      await refreshCvJobStatus("features");
     }
     await loadSubjectCandidateCache(candidateId);
   } catch (error) {
@@ -659,7 +900,7 @@ async function refreshSamJobStatus(options = {}) {
     } else {
       clearSamPoll();
       if (reloadOnComplete && job.status === "completed" && state.current?.candidate_id === candidateId) {
-        await loadRun(candidateId, { refreshJob: false });
+        await loadRun(candidateId, { refreshJob: false, preservePolls: true });
         renderSamJobStatus(job);
         setSaveState(`${backendLabel(job.backend)} complete`);
       }
@@ -672,6 +913,41 @@ async function refreshSamJobStatus(options = {}) {
     clearSamPoll();
     els.samJobState.textContent = "Unavailable";
     els.samJobState.className = "rank-pill sam-job-state is-error";
+    els.runMeta.textContent = String(error);
+    return null;
+  }
+}
+
+async function refreshCvJobStatus(kind, options = {}) {
+  const { reloadOnComplete = false } = options;
+  if (!state.current) return null;
+  const candidateId = state.current.candidate_id;
+  const config = cvJobConfig(kind);
+  try {
+    const payload = await fetchJson(`/api/cv-runs/${candidateId}/${kind}`);
+    const job = payload.job || { status: "idle" };
+    if (kind === "densepose" && payload.setup) {
+      state.denseposeSetup = payload.setup;
+    }
+    renderCvJobStatus(kind, job);
+    if (job.status === "running") {
+      scheduleCvPoll(kind);
+    } else {
+      clearCvPoll(kind);
+      if (reloadOnComplete && job.status === "completed" && state.current?.candidate_id === candidateId) {
+        await loadRun(candidateId, { refreshJob: false, preservePolls: true });
+        renderCvJobStatus(kind, job);
+        setSaveState(`${config.label} complete`);
+      }
+      if (job.status === "failed") {
+        setSaveState(`${config.label} failed`, "is-error");
+      }
+    }
+    return job;
+  } catch (error) {
+    clearCvPoll(kind);
+    config.stateEl.textContent = `${config.label} unavailable`;
+    config.stateEl.className = "rank-pill cv-job-state is-error";
     els.runMeta.textContent = String(error);
     return null;
   }
@@ -706,17 +982,83 @@ async function startSamRun() {
   }
 }
 
+async function startCvRun(kind) {
+  if (!state.current) return;
+  const candidateId = state.current.candidate_id;
+  const config = cvJobConfig(kind);
+  if (!config.canRun) {
+    setSaveState(config.blockedTitle, "is-error");
+    renderCvJobStatus(kind);
+    return;
+  }
+
+  try {
+    setSaveState(`Starting ${config.label}`, "is-saving");
+    const payload = await fetchJson(`/api/cv-runs/${candidateId}/${kind}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+    });
+    if (kind === "densepose" && payload.setup) {
+      state.denseposeSetup = payload.setup;
+    }
+    renderCvJobStatus(kind, payload.job);
+    setSaveState(`${config.label} running`, "is-saving");
+    scheduleCvPoll(kind);
+  } catch (error) {
+    setSaveState("Start failed", "is-error");
+    els.runMeta.textContent = String(error);
+    await refreshCvJobStatus(kind);
+  }
+}
+
+async function loadRuns() {
+  const payload = await fetchJson("/api/cv-runs");
+  state.runs = payload.runs || [];
+  renderRunList();
+}
+
+async function loadPrepCandidates() {
+  try {
+    state.prepStatus = "loading";
+    renderPrepList();
+    const payload = await fetchJson("/api/cv-run-candidates");
+    state.prepCandidates = payload.clips || [];
+    state.prepStatus = "ready";
+    renderPrepList();
+  } catch (error) {
+    state.prepStatus = "error";
+    els.prepCount.textContent = "Unavailable";
+    els.prepList.innerHTML = `<div class="artifact-empty">${String(error)}</div>`;
+  }
+}
+
+async function prepareCvRun(candidateId) {
+  try {
+    setSaveState("Preparing clip", "is-saving");
+    await fetchJson(`/api/cv-runs/${candidateId}/prepare`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ force: false }),
+    });
+    await loadRuns();
+    await loadPrepCandidates();
+    await loadRun(candidateId);
+    setSaveState("CV run ready");
+  } catch (error) {
+    setSaveState("Prepare failed", "is-error");
+    els.runMeta.textContent = String(error);
+  }
+}
+
 async function init() {
   try {
-    const payload = await fetchJson("/api/cv-runs");
-    state.runs = payload.runs || [];
-    renderRunList();
+    await Promise.all([loadRuns(), loadPrepCandidates()]);
     if (state.runs.length) {
       await loadRun(state.runs[0].candidate_id);
     } else {
-      setSaveState("No runs", "is-error");
+      setSaveState("No prepared runs");
       els.runTitle.textContent = "No prepared CV runs";
-      els.runMeta.textContent = "Run scripts/prepare_single_clip_cv_run.py first.";
+      els.runMeta.textContent = "Pick a reviewed clip from the left rail to prepare one.";
     }
   } catch (error) {
     setSaveState("Load failed", "is-error");
@@ -768,6 +1110,10 @@ els.maskQualitySelect.addEventListener("change", () => {
   renderSamJobStatus();
 });
 els.runSamButton.addEventListener("click", startSamRun);
+els.runPoseButton.addEventListener("click", () => startCvRun("pose"));
+els.runDenseposeButton.addEventListener("click", () => startCvRun("densepose"));
+els.runFusionButton.addEventListener("click", () => startCvRun("fusion"));
+els.runFeaturesButton.addEventListener("click", () => startCvRun("features"));
 els.copyPromptButton.addEventListener("click", async () => {
   await navigator.clipboard.writeText(els.promptJson.textContent);
   setSaveState("Copied");

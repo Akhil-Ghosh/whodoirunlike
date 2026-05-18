@@ -2,6 +2,7 @@ const state = {
   runs: [],
   current: null,
   samJob: null,
+  maskBackend: "sam2",
   selection: { type: "unset", positive_points: [], negative_points: [], box: null, mask_path: null },
   promptMode: "positive",
   boxStart: null,
@@ -35,6 +36,7 @@ const els = {
   segmentEmpty: document.querySelector("#segmentEmpty"),
   promptState: document.querySelector("#promptState"),
   samJobState: document.querySelector("#samJobState"),
+  maskBackendSelect: document.querySelector("#maskBackendSelect"),
   runSamButton: document.querySelector("#runSamButton"),
   stageList: document.querySelector("#stageList"),
   artifactGrid: document.querySelector("#artifactGrid"),
@@ -176,6 +178,11 @@ function samStatusLabel(status) {
   return "Idle";
 }
 
+function backendLabel(backend = state.maskBackend) {
+  if (backend === "sam31_mlx") return "SAM 3.1 MLX";
+  return "SAM 2.1";
+}
+
 function renderSamJobStatus(job = state.samJob) {
   state.samJob = job || { status: "idle" };
   const status = state.samJob.status || "idle";
@@ -187,6 +194,9 @@ function renderSamJobStatus(job = state.samJob) {
 
   let statusLabel = samStatusLabel(status);
   if (status === "idle" && artifactsReady) statusLabel = "Artifacts ready";
+  if (status === "running" && state.samJob.backend) {
+    statusLabel = `${backendLabel(state.samJob.backend)} running`;
+  }
 
   els.samJobState.textContent = statusLabel;
   els.samJobState.className = `rank-pill sam-job-state ${
@@ -198,9 +208,9 @@ function renderSamJobStatus(job = state.samJob) {
   els.runSamButton.textContent = isRunning
     ? "Running..."
     : artifactsReady || status === "completed"
-      ? "Run SAM 2 Again"
-      : "Run SAM 2";
-  els.runSamButton.title = hasPrompt ? "Run SAM 2 on the saved subject prompt" : "Select the runner first";
+      ? `Run ${backendLabel()} Again`
+      : `Run ${backendLabel()}`;
+  els.runSamButton.title = hasPrompt ? `Run ${backendLabel()} on the saved subject prompt` : "Select the runner first";
 }
 
 function renderRunList() {
@@ -440,7 +450,7 @@ async function refreshSamJobStatus(options = {}) {
   if (!state.current) return null;
   const candidateId = state.current.candidate_id;
   try {
-    const payload = await fetchJson(`/api/cv-runs/${candidateId}/sam2`);
+    const payload = await fetchJson(`/api/cv-runs/${candidateId}/mask`);
     const job = payload.job || { status: "idle" };
     renderSamJobStatus(job);
     if (job.status === "running") {
@@ -450,10 +460,10 @@ async function refreshSamJobStatus(options = {}) {
       if (reloadOnComplete && job.status === "completed" && state.current?.candidate_id === candidateId) {
         await loadRun(candidateId, { refreshJob: false });
         renderSamJobStatus(job);
-        setSaveState("SAM 2 complete");
+        setSaveState(`${backendLabel(job.backend)} complete`);
       }
       if (job.status === "failed") {
-        setSaveState("SAM 2 failed", "is-error");
+        setSaveState(`${backendLabel(job.backend)} failed`, "is-error");
       }
     }
     return job;
@@ -479,10 +489,14 @@ async function startSamRun() {
   if (!savedRun || state.current?.candidate_id !== candidateId) return;
 
   try {
-    setSaveState("Starting SAM 2", "is-saving");
-    const payload = await fetchJson(`/api/cv-runs/${candidateId}/sam2`, { method: "POST" });
+    setSaveState(`Starting ${backendLabel()}`, "is-saving");
+    const payload = await fetchJson(`/api/cv-runs/${candidateId}/mask`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ backend: state.maskBackend }),
+    });
     renderSamJobStatus(payload.job);
-    setSaveState("SAM 2 running", "is-saving");
+    setSaveState(`${backendLabel()} running`, "is-saving");
     scheduleSamPoll();
   } catch (error) {
     setSaveState("Start failed", "is-error");
@@ -543,6 +557,10 @@ els.promptOverlay.addEventListener("pointerup", (event) => {
 els.undoButton.addEventListener("click", undoSelection);
 els.clearButton.addEventListener("click", clearSelection);
 els.savePromptButton.addEventListener("click", savePrompt);
+els.maskBackendSelect.addEventListener("change", () => {
+  state.maskBackend = els.maskBackendSelect.value;
+  renderSamJobStatus();
+});
 els.runSamButton.addEventListener("click", startSamRun);
 els.copyPromptButton.addEventListener("click", async () => {
   await navigator.clipboard.writeText(els.promptJson.textContent);

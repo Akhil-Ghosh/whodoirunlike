@@ -51,8 +51,12 @@ CV_ARTIFACT_LABELS = {
 }
 SAM2_CHECKPOINT = Path("models/sam2/sam2.1_hiera_tiny.pt")
 SAM2_MODEL_CFG = "configs/sam2.1/sam2.1_hiera_t.yaml"
-SAM2_JOBS: dict[str, dict[str, Any]] = {}
-SAM2_JOBS_LOCK = threading.Lock()
+MASK_BACKENDS = {
+    "sam2": "SAM 2.1 local",
+    "sam31_mlx": "SAM 3.1 MLX",
+}
+MASK_JOBS: dict[str, dict[str, Any]] = {}
+MASK_JOBS_LOCK = threading.Lock()
 
 
 @dataclass(frozen=True)
@@ -515,9 +519,18 @@ def _sam2_checkpoint(config: ReviewAppConfig) -> Path:
     return (config.repo_root / SAM2_CHECKPOINT).resolve()
 
 
-def _sam2_default_job(candidate_id: str) -> dict[str, Any]:
+def _validate_mask_backend(backend: str) -> str:
+    backend = backend.strip().lower()
+    if backend not in MASK_BACKENDS:
+        valid = ", ".join(sorted(MASK_BACKENDS))
+        raise ValueError(f"Mask backend must be one of: {valid}")
+    return backend
+
+
+def _mask_default_job(candidate_id: str) -> dict[str, Any]:
     return {
         "candidate_id": candidate_id,
+        "backend": None,
         "status": "idle",
         "started_at": None,
         "completed_at": None,
@@ -526,17 +539,21 @@ def _sam2_default_job(candidate_id: str) -> dict[str, Any]:
     }
 
 
-def sam2_job_status(candidate_id: str) -> dict[str, Any]:
+def mask_job_status(candidate_id: str) -> dict[str, Any]:
     candidate_id = _safe_candidate_id(candidate_id)
-    with SAM2_JOBS_LOCK:
-        return dict(SAM2_JOBS.get(candidate_id, _sam2_default_job(candidate_id)))
+    with MASK_JOBS_LOCK:
+        return dict(MASK_JOBS.get(candidate_id, _mask_default_job(candidate_id)))
 
 
-def _set_sam2_job(candidate_id: str, updates: dict[str, Any]) -> dict[str, Any]:
-    with SAM2_JOBS_LOCK:
-        current = SAM2_JOBS.get(candidate_id, _sam2_default_job(candidate_id))
-        SAM2_JOBS[candidate_id] = {**current, **updates}
-        return dict(SAM2_JOBS[candidate_id])
+def sam2_job_status(candidate_id: str) -> dict[str, Any]:
+    return mask_job_status(candidate_id)
+
+
+def _set_mask_job(candidate_id: str, updates: dict[str, Any]) -> dict[str, Any]:
+    with MASK_JOBS_LOCK:
+        current = MASK_JOBS.get(candidate_id, _mask_default_job(candidate_id))
+        MASK_JOBS[candidate_id] = {**current, **updates}
+        return dict(MASK_JOBS[candidate_id])
 
 
 def _set_mask_stage_status(
@@ -544,6 +561,7 @@ def _set_mask_stage_status(
     candidate_id: str,
     status: str,
     *,
+    backend: str | None = None,
     error: str | None = None,
 ) -> None:
     run_dir = _cv_run_dir(config, candidate_id)
@@ -552,6 +570,8 @@ def _set_mask_stage_status(
     stages = manifest.setdefault("stages", {})
     whole_runner_mask = stages.setdefault("whole_runner_mask", {})
     whole_runner_mask["status"] = status
+    if backend:
+        whole_runner_mask["backend"] = backend
     if error:
         whole_runner_mask["error"] = error
     elif "error" in whole_runner_mask:
@@ -560,16 +580,25 @@ def _set_mask_stage_status(
     _write_json(manifest_path, manifest)
 
 
-def _run_sam2_job(config: ReviewAppConfig, candidate_id: str) -> None:
+def _run_mask_job(config: ReviewAppConfig, candidate_id: str, backend: str) -> None:
     try:
-        from whodoirunlike.sam2_runner import run_sam2_mask
+        if backend == "sam2":
+            from whodoirunlike.sam2_runner import run_sam2_mask
 
-        result = run_sam2_mask(
-            run_dir=_cv_run_dir(config, candidate_id),
-            checkpoint=_sam2_checkpoint(config),
-            model_cfg=SAM2_MODEL_CFG,
-        )
-        _set_sam2_job(
+            result = run_sam2_mask(
+                run_dir=_cv_run_dir(config, candidate_id),
+                checkpoint=_sam2_checkpoint(config),
+                model_cfg=SAM2_MODEL_CFG,
+            )
+            result["backend"] = "sam2"
+        elif backend == "sam31_mlx":
+            from whodoirunlike.sam31_mlx_runner import run_sam31_mlx_mask
+
+            result = run_sam31_mlx_mask(run_dir=_cv_run_dir(config, candidate_id))
+        else:
+            raise ValueError(f"Unsupported mask backend: {backend}")
+
+        _set_mask_job(
             candidate_id,
             {
                 "status": "completed",
@@ -580,8 +609,8 @@ def _run_sam2_job(config: ReviewAppConfig, candidate_id: str) -> None:
         )
     except Exception as exc:  # noqa: BLE001 - surfaced to the local review UI.
         error = str(exc)
-        _set_mask_stage_status(config, candidate_id, "failed", error=error)
-        _set_sam2_job(
+        _set_mask_stage_status(config, candidate_id, "failed", backend=backend, error=error)
+        _set_mask_job(
             candidate_id,
             {
                 "status": "failed",
@@ -592,24 +621,32 @@ def _run_sam2_job(config: ReviewAppConfig, candidate_id: str) -> None:
         )
 
 
-def start_sam2_job(config: ReviewAppConfig, candidate_id: str) -> dict[str, Any]:
+def start_mask_job(
+    config: ReviewAppConfig,
+    candidate_id: str,
+    *,
+    backend: str = "sam2",
+) -> dict[str, Any]:
+    backend = _validate_mask_backend(backend)
     candidate_id = _safe_candidate_id(candidate_id)
     run_dir = _cv_run_dir(config, candidate_id)
     if not (run_dir / "cv_run_manifest.json").exists():
         raise FileNotFoundError(f"CV run not found: {candidate_id}")
-    checkpoint = _sam2_checkpoint(config)
-    if not checkpoint.exists():
-        raise FileNotFoundError(f"SAM 2 checkpoint not found: {checkpoint}")
+    if backend == "sam2":
+        checkpoint = _sam2_checkpoint(config)
+        if not checkpoint.exists():
+            raise FileNotFoundError(f"SAM 2 checkpoint not found: {checkpoint}")
 
-    existing = sam2_job_status(candidate_id)
+    existing = mask_job_status(candidate_id)
     if existing["status"] == "running":
         return existing
 
-    _set_mask_stage_status(config, candidate_id, "running")
-    _set_sam2_job(
+    _set_mask_stage_status(config, candidate_id, "running", backend=backend)
+    _set_mask_job(
         candidate_id,
         {
             "candidate_id": candidate_id,
+            "backend": backend,
             "status": "running",
             "started_at": utc_now_iso(),
             "completed_at": None,
@@ -618,13 +655,17 @@ def start_sam2_job(config: ReviewAppConfig, candidate_id: str) -> dict[str, Any]
         },
     )
     thread = threading.Thread(
-        target=_run_sam2_job,
-        args=(config, candidate_id),
-        name=f"sam2-{candidate_id}",
+        target=_run_mask_job,
+        args=(config, candidate_id, backend),
+        name=f"mask-{backend}-{candidate_id}",
         daemon=True,
     )
     thread.start()
-    return sam2_job_status(candidate_id)
+    return mask_job_status(candidate_id)
+
+
+def start_sam2_job(config: ReviewAppConfig, candidate_id: str) -> dict[str, Any]:
+    return start_mask_job(config, candidate_id, backend="sam2")
 
 
 class ReviewRequestHandler(BaseHTTPRequestHandler):
@@ -638,6 +679,9 @@ class ReviewRequestHandler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/api/cv-runs":
             self._send_json({"runs": list_cv_runs(self.config)})
+            return
+        if parsed.path.startswith("/api/cv-runs/") and parsed.path.endswith("/mask"):
+            self._handle_get_mask_job(parsed.path)
             return
         if parsed.path.startswith("/api/cv-runs/") and parsed.path.endswith("/sam2"):
             self._handle_get_sam2_job(parsed.path)
@@ -655,6 +699,9 @@ class ReviewRequestHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         parsed = urlparse(self.path)
+        if parsed.path.startswith("/api/cv-runs/") and parsed.path.endswith("/mask"):
+            self._handle_start_mask_job(parsed.path)
+            return
         if parsed.path.startswith("/api/cv-runs/") and parsed.path.endswith("/sam2"):
             self._handle_start_sam2_job(parsed.path)
             return
@@ -721,7 +768,7 @@ class ReviewRequestHandler(BaseHTTPRequestHandler):
             run_dir = _cv_run_dir(self.config, candidate_id)
             if not (run_dir / "cv_run_manifest.json").exists():
                 raise FileNotFoundError(f"CV run not found: {candidate_id}")
-            self._send_json({"job": sam2_job_status(candidate_id)})
+            self._send_json({"job": mask_job_status(candidate_id)})
         except (FileNotFoundError, ValueError) as exc:
             self._send_json({"error": str(exc)}, status=HTTPStatus.NOT_FOUND)
 
@@ -729,6 +776,35 @@ class ReviewRequestHandler(BaseHTTPRequestHandler):
         candidate_id = unquote(path.removeprefix("/api/cv-runs/").removesuffix("/sam2")).strip("/")
         try:
             self._send_json({"job": start_sam2_job(self.config, candidate_id)})
+        except FileNotFoundError as exc:
+            self._send_json({"error": str(exc)}, status=HTTPStatus.NOT_FOUND)
+        except ValueError as exc:
+            self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+
+    def _handle_get_mask_job(self, path: str) -> None:
+        candidate_id = unquote(path.removeprefix("/api/cv-runs/").removesuffix("/mask")).strip("/")
+        try:
+            run_dir = _cv_run_dir(self.config, candidate_id)
+            if not (run_dir / "cv_run_manifest.json").exists():
+                raise FileNotFoundError(f"CV run not found: {candidate_id}")
+            self._send_json({"job": mask_job_status(candidate_id), "backends": MASK_BACKENDS})
+        except (FileNotFoundError, ValueError) as exc:
+            self._send_json({"error": str(exc)}, status=HTTPStatus.NOT_FOUND)
+
+    def _handle_start_mask_job(self, path: str) -> None:
+        candidate_id = unquote(path.removeprefix("/api/cv-runs/").removesuffix("/mask")).strip("/")
+        try:
+            length = min(int(self.headers.get("Content-Length", "0")), 64_000)
+            data = json.loads(self.rfile.read(length).decode("utf-8")) if length else {}
+            backend = str(data.get("backend") or "sam2")
+            self._send_json(
+                {
+                    "job": start_mask_job(self.config, candidate_id, backend=backend),
+                    "backends": MASK_BACKENDS,
+                }
+            )
+        except json.JSONDecodeError as exc:
+            self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
         except FileNotFoundError as exc:
             self._send_json({"error": str(exc)}, status=HTTPStatus.NOT_FOUND)
         except ValueError as exc:

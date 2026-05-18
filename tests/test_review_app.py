@@ -10,9 +10,11 @@ from whodoirunlike.review_app import (
     list_cv_runs,
     load_cv_run_payload,
     load_review_clips,
+    mask_job_status,
     save_annotation,
     save_cv_prompt,
     sam2_job_status,
+    start_mask_job,
     start_sam2_job,
 )
 
@@ -271,6 +273,14 @@ def test_sam2_job_status_defaults_to_idle() -> None:
     assert status["candidate_id"] == "clip-001"
 
 
+def test_mask_job_status_defaults_to_idle() -> None:
+    status = mask_job_status("clip-002")
+
+    assert status["status"] == "idle"
+    assert status["backend"] is None
+    assert status["candidate_id"] == "clip-002"
+
+
 def test_start_sam2_job_requires_checkpoint(tmp_path: Path) -> None:
     write_cv_run(tmp_path)
     config = ReviewAppConfig(
@@ -283,3 +293,17 @@ def test_start_sam2_job_requires_checkpoint(tmp_path: Path) -> None:
 
     with pytest.raises(FileNotFoundError, match="checkpoint"):
         start_sam2_job(config, "clip-001")
+
+
+def test_start_mask_job_rejects_unknown_backend(tmp_path: Path) -> None:
+    write_cv_run(tmp_path)
+    config = ReviewAppConfig(
+        source_path=tmp_path / "source.json",
+        annotations_path=tmp_path / "annotations.json",
+        static_dir=tmp_path,
+        repo_root=tmp_path,
+        limit=2,
+    )
+
+    with pytest.raises(ValueError, match="backend"):
+        start_mask_job(config, "clip-001", backend="sam9")

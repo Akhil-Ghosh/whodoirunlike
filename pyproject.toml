@@ -28,6 +28,9 @@ dev = [
   "pytest>=8.2",
   "ruff>=0.5",
 ]
+sam31 = [
+  "mlx-vlm>=0.4.3",
+]
 
 [tool.setuptools.packages.find]
 where = ["src"]

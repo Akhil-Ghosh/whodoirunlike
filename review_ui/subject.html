@@ -104,8 +104,15 @@
             <div class="output-actions">
               <span class="rank-pill" id="promptState">Unset</span>
               <span class="rank-pill sam-job-state" id="samJobState">Idle</span>
+              <label class="backend-select-label" for="maskBackendSelect">
+                <span>Backend</span>
+                <select id="maskBackendSelect">
+                  <option value="sam2">SAM 2.1</option>
+                  <option value="sam31_mlx">SAM 3.1 MLX</option>
+                </select>
+              </label>
               <button class="primary-button run-sam-button" id="runSamButton" type="button">
-                Run SAM 2
+                Run mask
               </button>
             </div>
           </div>

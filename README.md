@@ -151,6 +151,23 @@ python scripts/run_sam2_mask.py \
 
 This writes `runner_mask.mp4`, `masked_runner.mp4`, `qa_overlay.mp4`, and `runner_mask_metadata.jsonl` inside the CV run folder.
 
+Experimental SAM 3.1 on Apple Silicon via MLX:
+
+```bash
+python -m pip install -e ".[sam31]"
+
+python scripts/run_sam31_mlx_mask.py \
+  --candidate-id d6ee6cd75cd04b95 \
+  --model mlx-community/sam3.1-bf16 \
+  --prompt "a runner" \
+  --prompt "a person"
+```
+
+The SAM 3.1 MLX path keeps the same artifact contract as SAM 2. It uses text prompts to
+detect runners on each frame, then uses the saved prompt box/points to choose the target
+runner identity and write the mask videos. The first run downloads the MLX model from
+Hugging Face.
+
 ## Next Pipeline Milestones
 
 Prepare one reviewed clip for the single-clip CV loop:

@@ -1,0 +1,53 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://whodoirunlike.com/schemas/approved_segment.schema.json",
+  "title": "Approved Reference Segment",
+  "type": "object",
+  "required": ["segment_id", "runner_slug", "source", "timestamps", "labels", "review"],
+  "properties": {
+    "segment_id": { "type": "string" },
+    "runner_slug": { "type": "string" },
+    "source": {
+      "type": "object",
+      "required": ["platform", "url"],
+      "properties": {
+        "platform": { "enum": ["youtube", "tiktok", "local"] },
+        "url": { "type": "string" },
+        "video_id": { "type": ["string", "null"] },
+        "title": { "type": ["string", "null"] },
+        "channel": { "type": ["string", "null"] }
+      }
+    },
+    "timestamps": {
+      "type": "object",
+      "required": ["start_seconds", "end_seconds"],
+      "properties": {
+        "start_seconds": { "type": "number", "minimum": 0 },
+        "end_seconds": { "type": "number", "minimum": 0 }
+      }
+    },
+    "labels": {
+      "type": "object",
+      "required": ["mode", "primary_bucket", "intensity", "camera_angle", "clip_type", "quality"],
+      "properties": {
+        "mode": { "enum": ["running", "sprinting"] },
+        "primary_bucket": { "enum": ["800_1500", "5k_10k", "marathon"] },
+        "intensity": { "enum": ["easy", "workout", "race", "unknown"] },
+        "camera_angle": { "enum": ["side", "diagonal", "front", "rear", "mixed", "unknown"] },
+        "clip_type": { "enum": ["race", "training", "easy_run", "workout", "unknown"] },
+        "visibility": { "enum": ["full_body", "partial_body", "unknown"] },
+        "occlusion": { "enum": ["low", "medium", "high", "unknown"] },
+        "quality": { "enum": ["approved", "needs_review", "rejected"] }
+      }
+    },
+    "review": {
+      "type": "object",
+      "required": ["reviewer", "reviewed_at"],
+      "properties": {
+        "reviewer": { "type": "string" },
+        "reviewed_at": { "type": "string", "format": "date" },
+        "notes": { "type": ["string", "null"] }
+      }
+    }
+  }
+}

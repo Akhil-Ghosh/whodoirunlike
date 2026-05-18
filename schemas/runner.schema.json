@@ -1,0 +1,48 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://whodoirunlike.com/schemas/runner.schema.json",
+  "title": "Runner Seed Data",
+  "type": "object",
+  "required": ["version", "mode", "target_clips_per_runner", "runner_buckets", "runners"],
+  "properties": {
+    "version": { "type": "integer", "minimum": 1 },
+    "mode": { "const": "running" },
+    "target_clips_per_runner": {
+      "type": "object",
+      "required": ["min", "ideal"],
+      "properties": {
+        "min": { "type": "integer", "minimum": 1 },
+        "ideal": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "runner_buckets": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "label", "target_runners"],
+        "properties": {
+          "id": { "enum": ["800_1500", "5k_10k", "marathon"] },
+          "label": { "type": "string" },
+          "target_runners": { "type": "integer", "minimum": 1 }
+        }
+      }
+    },
+    "runners": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["slug", "name", "country", "primary_bucket", "event_tags", "profile", "search_terms"],
+        "properties": {
+          "slug": { "type": "string", "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$" },
+          "name": { "type": "string" },
+          "country": { "type": "string", "minLength": 3, "maxLength": 3 },
+          "primary_bucket": { "enum": ["800_1500", "5k_10k", "marathon"] },
+          "event_tags": { "type": "array", "items": { "type": "string" }, "minItems": 1 },
+          "profile": { "type": "string" },
+          "search_terms": { "type": "array", "items": { "type": "string" }, "minItems": 1 }
+        }
+      }
+    }
+  }
+}
+

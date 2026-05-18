@@ -1,0 +1,21 @@
+.DS_Store
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.venv/
+venv/
+
+# Generated / local media artifacts
+artifacts/**
+clips/**
+models/**
+!artifacts/.gitkeep
+!clips/.gitkeep
+!models/.gitkeep
+
+# Local secrets
+.env
+.env.*

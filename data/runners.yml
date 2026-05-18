@@ -1,0 +1,258 @@
+# Opinionated seed corpus for distance-running MVP.
+# Each runner has one primary bucket for corpus balance and multiple tags for matching/search.
+version: 1
+mode: running
+target_clips_per_runner:
+  min: 3
+  ideal: 5
+runner_buckets:
+  - id: "800_1500"
+    label: 800m / 1500m
+    target_runners: 10
+  - id: "5k_10k"
+    label: 5k / 10k
+    target_runners: 10
+  - id: "marathon"
+    label: Marathon / road
+    target_runners: 10
+runners:
+  - slug: faith-kipyegon
+    name: Faith Kipyegon
+    country: KEN
+    primary_bucket: "800_1500"
+    event_tags: [1500m, mile, 5000m]
+    profile: smooth dominant middle-distance stride with strong late-race speed
+    search_terms: [running form, 1500m, 5000m, training, slow motion]
+
+  - slug: jakob-ingebrigtsen
+    name: Jakob Ingebrigtsen
+    country: NOR
+    primary_bucket: "800_1500"
+    event_tags: [1500m, mile, 3000m, 5000m]
+    profile: tall economical track form with high cadence and relaxed carriage
+    search_terms: [running form, 1500m, 5000m, training, slow motion]
+
+  - slug: josh-kerr
+    name: Josh Kerr
+    country: GBR
+    primary_bucket: "800_1500"
+    event_tags: [1500m, mile]
+    profile: powerful championship miler with compact upper-body control
+    search_terms: [running form, 1500m, mile, training, race]
+
+  - slug: yared-nuguse
+    name: Yared Nuguse
+    country: USA
+    primary_bucket: "800_1500"
+    event_tags: [1500m, mile]
+    profile: long relaxed stride and fluid arm rhythm
+    search_terms: [running form, 1500m, mile, training, race]
+
+  - slug: timothy-cheruiyot
+    name: Timothy Cheruiyot
+    country: KEN
+    primary_bucket: "800_1500"
+    event_tags: [1500m, mile]
+    profile: front-running 1500m form with aggressive rhythm
+    search_terms: [running form, 1500m, mile, race, slow motion]
+
+  - slug: cole-hocker
+    name: Cole Hocker
+    country: USA
+    primary_bucket: "800_1500"
+    event_tags: [1500m, mile]
+    profile: compact high-turnover miler with strong closing mechanics
+    search_terms: [running form, 1500m, mile, training, race]
+
+  - slug: emmanuel-wanyonyi
+    name: Emmanuel Wanyonyi
+    country: KEN
+    primary_bucket: "800_1500"
+    event_tags: [800m]
+    profile: elastic 800m form with large range of motion
+    search_terms: [running form, 800m, training, race, slow motion]
+
+  - slug: marco-arop
+    name: Marco Arop
+    country: CAN
+    primary_bucket: "800_1500"
+    event_tags: [800m]
+    profile: tall powerful 800m stride with upright posture
+    search_terms: [running form, 800m, training, race, slow motion]
+
+  - slug: keely-hodgkinson
+    name: Keely Hodgkinson
+    country: GBR
+    primary_bucket: "800_1500"
+    event_tags: [800m]
+    profile: smooth controlled 800m form with efficient arm carriage
+    search_terms: [running form, 800m, training, race, slow motion]
+
+  - slug: mary-moraa
+    name: Mary Moraa
+    country: KEN
+    primary_bucket: "800_1500"
+    event_tags: [800m]
+    profile: distinctive powerful 800m rhythm and visible cadence changes
+    search_terms: [running form, 800m, training, race, slow motion]
+
+  - slug: joshua-cheptegei
+    name: Joshua Cheptegei
+    country: UGA
+    primary_bucket: "5k_10k"
+    event_tags: [5000m, 10000m, cross-country]
+    profile: efficient long-distance track form with steady torso control
+    search_terms: [running form, 5000m, 10000m, training, race]
+
+  - slug: beatrice-chebet
+    name: Beatrice Chebet
+    country: KEN
+    primary_bucket: "5k_10k"
+    event_tags: [5000m, 10000m, cross-country]
+    profile: smooth track-distance form with strong late-race mechanics
+    search_terms: [running form, 5000m, 10000m, training, race]
+
+  - slug: letesenbet-gidey
+    name: Letesenbet Gidey
+    country: ETH
+    primary_bucket: "5k_10k"
+    event_tags: [5000m, 10000m, half-marathon]
+    profile: metronomic distance rhythm with compact posture
+    search_terms: [running form, 5000m, 10000m, training, race]
+
+  - slug: gudaf-tsegay
+    name: Gudaf Tsegay
+    country: ETH
+    primary_bucket: "5k_10k"
+    event_tags: [1500m, 5000m]
+    profile: versatile track form with aggressive knee drive
+    search_terms: [running form, 1500m, 5000m, training, race]
+
+  - slug: hagos-gebrhiwet
+    name: Hagos Gebrhiwet
+    country: ETH
+    primary_bucket: "5k_10k"
+    event_tags: [3000m, 5000m]
+    profile: compact high-cadence distance track form
+    search_terms: [running form, 3000m, 5000m, training, race]
+
+  - slug: selemon-barega
+    name: Selemon Barega
+    country: ETH
+    primary_bucket: "5k_10k"
+    event_tags: [3000m, 5000m, 10000m]
+    profile: efficient distance form with quick turnover
+    search_terms: [running form, 5000m, 10000m, training, race]
+
+  - slug: grant-fisher
+    name: Grant Fisher
+    country: USA
+    primary_bucket: "5k_10k"
+    event_tags: [3000m, 5000m, 10000m]
+    profile: relaxed American distance form with stable upper body
+    search_terms: [running form, 5000m, 10000m, training, race]
+
+  - slug: berihu-aregawi
+    name: Berihu Aregawi
+    country: ETH
+    primary_bucket: "5k_10k"
+    event_tags: [5000m, 10000m, cross-country]
+    profile: aggressive distance form with fast rhythm and forward intent
+    search_terms: [running form, 5000m, 10000m, training, race]
+
+  - slug: yomif-kejelcha
+    name: Yomif Kejelcha
+    country: ETH
+    primary_bucket: "5k_10k"
+    event_tags: [3000m, 5000m, 10000m]
+    profile: tall distance track form with long economical stride
+    search_terms: [running form, 3000m, 5000m, 10000m, race]
+
+  - slug: agnes-ngetich
+    name: Agnes Ngetich
+    country: KEN
+    primary_bucket: "5k_10k"
+    event_tags: [5000m, 10000m, road-10k]
+    profile: road and track 10k form with efficient cadence
+    search_terms: [running form, 5000m, 10000m, road 10k, race]
+
+  - slug: eliud-kipchoge
+    name: Eliud Kipchoge
+    country: KEN
+    primary_bucket: "marathon"
+    event_tags: [marathon, road, 5000m]
+    profile: iconic economical marathon form with minimal wasted motion
+    search_terms: [running form, marathon, training, easy run, race]
+
+  - slug: sifan-hassan
+    name: Sifan Hassan
+    country: NED
+    primary_bucket: "marathon"
+    event_tags: [1500m, 5000m, 10000m, marathon]
+    profile: versatile endurance form across track and marathon
+    search_terms: [running form, marathon, 10000m, training, race]
+
+  - slug: tigst-assefa
+    name: Tigst Assefa
+    country: ETH
+    primary_bucket: "marathon"
+    event_tags: [marathon, road]
+    profile: fast modern marathon form with long efficient stride
+    search_terms: [running form, marathon, training, race]
+
+  - slug: kelvin-kiptum
+    name: Kelvin Kiptum
+    country: KEN
+    primary_bucket: "marathon"
+    event_tags: [marathon, road]
+    profile: powerful recent marathon form with aggressive late-race stride
+    search_terms: [running form, marathon, race, slow motion]
+
+  - slug: tamirat-tola
+    name: Tamirat Tola
+    country: ETH
+    primary_bucket: "marathon"
+    event_tags: [marathon, road, 10000m]
+    profile: strong marathon mechanics with steady forward lean
+    search_terms: [running form, marathon, training, race]
+
+  - slug: kenenisa-bekele
+    name: Kenenisa Bekele
+    country: ETH
+    primary_bucket: "marathon"
+    event_tags: [5000m, 10000m, marathon]
+    profile: historical elite track-to-marathon form with compact power
+    search_terms: [running form, marathon, 10000m, 5000m, race]
+
+  - slug: benson-kipruto
+    name: Benson Kipruto
+    country: KEN
+    primary_bucket: "marathon"
+    event_tags: [marathon, road]
+    profile: controlled marathon form with patient rhythm
+    search_terms: [running form, marathon, training, race]
+
+  - slug: peres-jepchirchir
+    name: Peres Jepchirchir
+    country: KEN
+    primary_bucket: "marathon"
+    event_tags: [marathon, half-marathon, road]
+    profile: efficient road form with strong championship finishing mechanics
+    search_terms: [running form, marathon, half marathon, training, race]
+
+  - slug: brigid-kosgei
+    name: Brigid Kosgei
+    country: KEN
+    primary_bucket: "marathon"
+    event_tags: [marathon, road]
+    profile: high-level marathon form with steady rhythm and low waste
+    search_terms: [running form, marathon, training, race]
+
+  - slug: ruth-chepngetich
+    name: Ruth Chepngetich
+    country: KEN
+    primary_bucket: "marathon"
+    event_tags: [marathon, road]
+    profile: fast road-marathon form with assertive cadence
+    search_terms: [running form, marathon, training, race]
+

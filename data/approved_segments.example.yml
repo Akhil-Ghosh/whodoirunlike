@@ -1,0 +1,27 @@
+version: 1
+segments:
+  - segment_id: eliud-kipchoge-berlin-2022-example-001
+    runner_slug: eliud-kipchoge
+    source:
+      platform: youtube
+      url: https://www.youtube.com/watch?v=REPLACE_ME
+      video_id: REPLACE_ME
+      title: Example approved source video
+      channel: Example Channel
+    timestamps:
+      start_seconds: 83.5
+      end_seconds: 90.0
+    labels:
+      mode: running
+      primary_bucket: "marathon"
+      intensity: race
+      camera_angle: side
+      clip_type: race
+      visibility: full_body
+      occlusion: low
+      quality: approved
+    review:
+      reviewer: akhil
+      reviewed_at: 2026-05-16
+      notes: Replace with a real reviewed segment.
+

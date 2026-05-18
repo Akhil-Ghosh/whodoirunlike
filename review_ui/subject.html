@@ -1,0 +1,129 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Who Do I Run Like | Target Selection</title>
+    <link rel="stylesheet" href="/assets/app.css" />
+  </head>
+  <body>
+    <div class="app-frame subject-frame">
+      <header class="topbar">
+        <a class="brand" href="/">
+          <span class="brand-mark">W</span>
+          <span>WHO DO I RUN LIKE</span>
+        </a>
+        <nav class="nav-links" aria-label="Review sections">
+          <a href="/">Clip Review</a>
+          <span>Target Selection</span>
+          <span>CV Run</span>
+        </nav>
+        <div class="topbar-actions">
+          <span class="save-state" id="saveState">Loading</span>
+          <a class="source-link" href="/">Review</a>
+        </div>
+      </header>
+
+      <main class="subject-layout">
+        <aside class="queue-panel subject-run-panel" aria-label="CV runs">
+          <div class="panel-heading">
+            <div>
+              <p class="eyebrow">Subject</p>
+              <h1>Target pass</h1>
+            </div>
+            <span class="limit-pill" id="runCount">0 runs</span>
+          </div>
+          <div class="queue-list subject-run-list" id="runList"></div>
+        </aside>
+
+        <section class="stage-panel subject-stage-panel" aria-label="Subject selection">
+          <div class="clip-heading">
+            <div>
+              <p class="eyebrow" id="runBucket">CV run</p>
+              <h2 id="runTitle">Loading target workspace</h2>
+              <p class="subline" id="runMeta"></p>
+            </div>
+            <a class="source-link" id="manifestLink" href="#" target="_blank" rel="noreferrer">Manifest</a>
+          </div>
+
+          <div class="prompt-toolbar">
+            <div class="toggle-buttons" aria-label="Prompt mode">
+              <button class="is-active" type="button" data-prompt-mode="positive">Positive</button>
+              <button type="button" data-prompt-mode="negative">Negative</button>
+              <button type="button" data-prompt-mode="box">Box</button>
+            </div>
+            <div class="step-actions">
+              <button class="ghost-button" id="undoButton" type="button">Undo</button>
+              <button class="ghost-button" id="clearButton" type="button">Clear</button>
+              <button class="primary-button" id="savePromptButton" type="button">Save Prompt</button>
+            </div>
+          </div>
+
+          <div class="prompt-shell" id="promptShell">
+            <img id="promptImage" alt="Prompt frame" />
+            <svg id="promptOverlay" viewBox="0 0 1 1" preserveAspectRatio="none" aria-label="Prompt overlay"></svg>
+            <div class="video-empty" id="promptEmpty">No prompt frame</div>
+          </div>
+
+          <div class="prompt-readout">
+            <div>
+              <span>Selection</span>
+              <strong id="selectionSummary">Unset</strong>
+            </div>
+            <div>
+              <span>Frame</span>
+              <strong id="frameSummary">--</strong>
+            </div>
+            <div>
+              <span>Angle</span>
+              <strong id="angleSummary">unknown</strong>
+            </div>
+          </div>
+
+          <div class="segment-preview">
+            <div class="panel-heading compact">
+              <div>
+                <p class="eyebrow">Segment</p>
+                <h2>Reviewed interval</h2>
+              </div>
+              <span class="rank-pill" id="durationPill">--</span>
+            </div>
+            <div class="video-shell mini-video-shell">
+              <video id="segmentVideo" controls playsinline preload="metadata"></video>
+              <div class="video-empty" id="segmentEmpty">No source segment</div>
+            </div>
+          </div>
+        </section>
+
+        <aside class="inspector-panel subject-output-panel" aria-label="CV outputs">
+          <div class="panel-heading compact">
+            <div>
+              <p class="eyebrow">Outputs</p>
+              <h2>Run artifacts</h2>
+            </div>
+            <div class="output-actions">
+              <span class="rank-pill" id="promptState">Unset</span>
+              <span class="rank-pill sam-job-state" id="samJobState">Idle</span>
+              <button class="primary-button run-sam-button" id="runSamButton" type="button">
+                Run SAM 2
+              </button>
+            </div>
+          </div>
+
+          <div class="stage-list" id="stageList"></div>
+          <div class="artifact-grid" id="artifactGrid"></div>
+
+          <div class="prompt-json-wrap">
+            <div class="panel-heading compact">
+              <p class="eyebrow">Prompt JSON</p>
+              <button class="ghost-button" id="copyPromptButton" type="button">Copy</button>
+            </div>
+            <pre id="promptJson">{}</pre>
+          </div>
+        </aside>
+      </main>
+    </div>
+
+    <script src="/assets/subject.js" defer></script>
+  </body>
+</html>

@@ -1,0 +1,38 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://whodoirunlike.com/schemas/youtube_candidate.schema.json",
+  "title": "YouTube Candidate Video",
+  "type": "object",
+  "required": [
+    "candidate_id",
+    "runner_slug",
+    "runner_name",
+    "primary_bucket",
+    "query",
+    "source",
+    "url",
+    "video_id",
+    "title",
+    "discovered_at"
+  ],
+  "properties": {
+    "candidate_id": { "type": "string" },
+    "runner_slug": { "type": "string" },
+    "runner_name": { "type": "string" },
+    "primary_bucket": { "enum": ["800_1500", "5k_10k", "marathon"] },
+    "query": { "type": "string" },
+    "source": { "const": "youtube" },
+    "url": { "type": "string", "format": "uri" },
+    "video_id": { "type": "string" },
+    "title": { "type": "string" },
+    "channel": { "type": ["string", "null"] },
+    "duration_seconds": { "type": ["number", "null"] },
+    "view_count": { "type": ["integer", "null"] },
+    "upload_date": { "type": ["string", "null"] },
+    "thumbnail": { "type": ["string", "null"] },
+    "discovered_at": { "type": "string", "format": "date-time" },
+    "review_status": { "enum": ["unreviewed", "approved", "rejected"], "default": "unreviewed" },
+    "review_notes": { "type": ["string", "null"] }
+  }
+}
+

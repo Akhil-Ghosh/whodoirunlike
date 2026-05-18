@@ -1,0 +1,147 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Who Do I Run Like | Clip Review</title>
+    <link rel="stylesheet" href="/assets/app.css" />
+  </head>
+  <body>
+    <div class="app-frame">
+      <header class="topbar">
+        <a class="brand" href="/">
+          <span class="brand-mark">W</span>
+          <span>WHO DO I RUN LIKE</span>
+        </a>
+        <nav class="nav-links" aria-label="Review sections">
+          <span>Clip Review</span>
+          <a href="/subject.html">Target Selection</a>
+          <span>Private Alpha</span>
+        </nav>
+        <div class="topbar-actions">
+          <span class="save-state" id="saveState">Ready</span>
+          <span class="limit-pill" id="limitPill">20 clips</span>
+        </div>
+      </header>
+
+      <main class="review-layout">
+        <aside class="queue-panel" aria-label="Clip queue">
+          <div class="panel-heading">
+            <div>
+              <p class="eyebrow">Data Quality</p>
+              <h1>Human pass</h1>
+            </div>
+            <div class="review-count">
+              <strong id="reviewedCount">0</strong>
+              <span id="totalCount">/ 20</span>
+            </div>
+          </div>
+
+          <div class="quality-summary" aria-label="Review summary">
+            <div><span id="goodCount">0</span><small>Good</small></div>
+            <div><span id="midCount">0</span><small>Mid</small></div>
+            <div><span id="badCount">0</span><small>Bad</small></div>
+          </div>
+
+          <div class="queue-list" id="queueList"></div>
+        </aside>
+
+        <section class="stage-panel" aria-label="Selected clip">
+          <div class="clip-heading">
+            <div>
+              <p class="eyebrow" id="bucketLabel">Running</p>
+              <h2 id="clipTitle">Loading review queue</h2>
+              <p class="subline" id="clipMeta"></p>
+            </div>
+            <a class="source-link" id="sourceLink" href="#" target="_blank" rel="noreferrer">Source</a>
+          </div>
+
+          <div class="video-shell">
+            <video id="videoPlayer" controls playsinline preload="metadata"></video>
+            <div class="video-empty" id="videoEmpty">No clip selected</div>
+          </div>
+
+          <div class="scrub-panel">
+            <div class="view-toggle" aria-label="Playback range">
+              <div class="toggle-buttons">
+                <button class="is-active" type="button" data-view-mode="full">Full video</button>
+                <button type="button" data-view-mode="segment">Saved segment</button>
+              </div>
+              <span id="segmentStatus">Set start and end to preview a segment.</span>
+            </div>
+            <div class="time-row">
+              <span id="currentTime">0:00</span>
+              <input id="seekRange" type="range" min="0" max="1" step="0.01" value="0" />
+              <span id="durationTime">0:00</span>
+            </div>
+            <div class="segment-line" id="segmentLine">
+              <span class="segment-fill"></span>
+            </div>
+            <div class="segment-actions">
+              <button class="ghost-button" id="setStartButton" type="button">Set Start</button>
+              <button class="ghost-button" id="setEndButton" type="button">Set End</button>
+              <button class="ghost-button" id="jumpStartButton" type="button">Jump Start</button>
+              <button class="ghost-button" id="jumpEndButton" type="button">Jump End</button>
+            </div>
+          </div>
+        </section>
+
+        <aside class="inspector-panel" aria-label="Clip annotation">
+          <div class="panel-heading compact">
+            <div>
+              <p class="eyebrow">Evaluation</p>
+              <h2 id="runnerName">Runner</h2>
+            </div>
+            <span class="rank-pill" id="rankPill">#</span>
+          </div>
+
+          <div class="quality-buttons" aria-label="Quality label">
+            <button type="button" data-quality="good">Good</button>
+            <button type="button" data-quality="mid">Mid</button>
+            <button type="button" data-quality="bad">Bad</button>
+          </div>
+
+          <label class="angle-field">
+            <span>Camera angle</span>
+            <select id="angleSelect">
+              <option value="unknown">Unknown</option>
+              <option value="side">Side</option>
+              <option value="diagonal">Diagonal</option>
+              <option value="front">Front</option>
+              <option value="rear">Rear</option>
+              <option value="mixed">Mixed / cutaway</option>
+            </select>
+          </label>
+
+          <div class="field-grid">
+            <label>
+              <span>Start</span>
+              <input id="startInput" type="number" min="0" step="0.01" placeholder="0.00" />
+            </label>
+            <label>
+              <span>End</span>
+              <input id="endInput" type="number" min="0" step="0.01" placeholder="0.00" />
+            </label>
+          </div>
+
+          <label class="notes-field">
+            <span>Notes</span>
+            <textarea id="notesInput" rows="5" placeholder="Angle, crop, runner identity, usable moment"></textarea>
+          </label>
+
+          <div class="metric-stack" id="metricStack"></div>
+
+          <div class="inspector-actions">
+            <button class="primary-button" id="saveNextButton" type="button">Save + Next</button>
+            <div class="step-actions">
+              <button class="ghost-button" id="prevButton" type="button">Prev</button>
+              <button class="ghost-button" id="nextButton" type="button">Next</button>
+            </div>
+          </div>
+        </aside>
+      </main>
+    </div>
+
+    <script src="/assets/app.js" defer></script>
+  </body>
+</html>

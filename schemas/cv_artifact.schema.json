@@ -1,0 +1,44 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://whodoirunlike.com/schemas/cv_artifact.schema.json",
+  "title": "CV Artifact Contract",
+  "type": "object",
+  "required": ["artifact_id", "segment_id", "runner_slug", "mode", "paths", "quality", "features"],
+  "properties": {
+    "artifact_id": { "type": "string" },
+    "segment_id": { "type": "string" },
+    "runner_slug": { "type": "string" },
+    "mode": { "enum": ["running", "sprinting"] },
+    "paths": {
+      "type": "object",
+      "required": ["source_segment", "pose_json", "canonical_pose_render"],
+      "properties": {
+        "source_segment": { "type": "string" },
+        "pose_json": { "type": "string" },
+        "mask_video": { "type": ["string", "null"] },
+        "canonical_pose_render": { "type": "string" },
+        "masked_runner_render": { "type": ["string", "null"] },
+        "feature_vector": { "type": ["string", "null"] }
+      }
+    },
+    "quality": {
+      "type": "object",
+      "properties": {
+        "pose_confidence_mean": { "type": ["number", "null"], "minimum": 0, "maximum": 1 },
+        "stride_cycles_detected": { "type": ["number", "null"] },
+        "camera_angle": { "enum": ["side", "diagonal", "front", "rear", "mixed", "unknown"] },
+        "usable_for_matching": { "type": "boolean" },
+        "notes": { "type": ["string", "null"] }
+      }
+    },
+    "features": {
+      "type": "object",
+      "properties": {
+        "pose_sequence_embedding": { "type": ["string", "null"] },
+        "gemini_pose_render_embedding": { "type": ["string", "null"] },
+        "gemini_masked_runner_embedding": { "type": ["string", "null"] },
+        "explainability_metrics": { "type": "object" }
+      }
+    }
+  }
+}

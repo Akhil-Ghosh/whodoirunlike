@@ -15,6 +15,7 @@
   --bad: #9a584b;
   --radius-lg: 24px;
   --radius-md: 16px;
+  --mono: "SFMono-Regular", "Roboto Mono", Consolas, monospace;
   font-family: "Avenir Next", "Geist", "Helvetica Neue", Arial, sans-serif;
 }
 
@@ -789,6 +790,60 @@ textarea {
 
 .run-sam-button {
   white-space: nowrap;
+}
+
+.mask-progress {
+  display: grid;
+  gap: 8px;
+  border-top: 1px solid var(--line);
+  border-bottom: 1px solid var(--line);
+  padding: 14px 0;
+}
+
+.mask-progress.is-hidden {
+  display: none;
+}
+
+.mask-progress-top,
+.mask-progress-meta {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.mask-progress-top span,
+.mask-progress-top strong,
+.mask-progress-meta {
+  font-size: 0.72rem;
+}
+
+.mask-progress-top span,
+.mask-progress-meta {
+  color: var(--muted);
+}
+
+.mask-progress-top strong {
+  color: var(--ink);
+  font-family: var(--mono);
+  font-weight: 800;
+}
+
+.mask-progress-track {
+  overflow: hidden;
+  height: 7px;
+  border: 1px solid rgba(166, 124, 82, 0.2);
+  border-radius: 999px;
+  background: rgba(23, 24, 24, 0.08);
+}
+
+.mask-progress-track span {
+  display: block;
+  width: 0%;
+  height: 100%;
+  border-radius: inherit;
+  background: var(--accent);
+  transition: width 0.28s ease;
 }
 
 .stage-row {

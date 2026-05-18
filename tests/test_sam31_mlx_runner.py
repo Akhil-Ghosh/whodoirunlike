@@ -4,6 +4,7 @@ import numpy as np
 
 from whodoirunlike.sam31_mlx_runner import (
     box_iou,
+    build_sam31_progress,
     choose_detection_index,
     mask_box,
     resolve_sam31_resolution,
@@ -42,3 +43,25 @@ def test_resolve_sam31_resolution_modes() -> None:
     assert resolve_sam31_resolution(mode="max", video_meta={"width": 1920, "height": 1080}) == 1918
     assert resolve_sam31_resolution(mode="max", video_meta={"width": 3840, "height": 2160}) == 2016
     assert resolve_sam31_resolution(mode="native", resolution=336) == 336
+
+
+def test_build_sam31_progress_estimates_eta() -> None:
+    progress = build_sam31_progress(
+        phase="detecting",
+        processed_frames=25,
+        total_frames=100,
+        elapsed_seconds=50,
+        frame_index=24,
+        direction="forward",
+        detection_count=3,
+        selected=True,
+        resolution=1008,
+    )
+
+    assert progress["percent"] == 0.25
+    assert progress["eta_seconds"] == 150.0
+    assert progress["frame_index"] == 24
+    assert progress["direction"] == "forward"
+    assert progress["detection_count"] == 3
+    assert progress["selected"] is True
+    assert progress["resolution"] == 1008

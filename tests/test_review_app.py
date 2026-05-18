@@ -279,6 +279,7 @@ def test_mask_job_status_defaults_to_idle() -> None:
     assert status["status"] == "idle"
     assert status["backend"] is None
     assert status["options"] == {}
+    assert status["progress"] is None
     assert status["candidate_id"] == "clip-002"
 
 

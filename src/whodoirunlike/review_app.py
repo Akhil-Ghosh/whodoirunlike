@@ -537,6 +537,7 @@ def _mask_default_job(candidate_id: str) -> dict[str, Any]:
         "candidate_id": candidate_id,
         "backend": None,
         "options": {},
+        "progress": None,
         "status": "idle",
         "started_at": None,
         "completed_at": None,
@@ -599,12 +600,47 @@ def _sanitize_mask_options(data: dict[str, Any]) -> dict[str, Any]:
     return options
 
 
+def _initial_mask_progress(backend: str, options: dict[str, Any]) -> dict[str, Any] | None:
+    if backend != "sam31_mlx":
+        return None
+    progress: dict[str, Any] = {
+        "phase": "queued",
+        "processed_frames": 0,
+        "total_frames": 0,
+        "percent": 0.0,
+        "elapsed_seconds": 0.0,
+        "eta_seconds": None,
+        "quality_mode": options.get("quality_mode") or "native",
+    }
+    return progress
+
+
+def _completed_mask_progress(result: dict[str, Any]) -> dict[str, Any]:
+    frame_count = max(0, _as_int(result.get("frame_count")))
+    elapsed = result.get("elapsed_seconds")
+    progress: dict[str, Any] = {
+        "phase": "completed",
+        "processed_frames": frame_count,
+        "total_frames": frame_count,
+        "percent": 1.0 if frame_count else 0.0,
+        "elapsed_seconds": round(_as_float(elapsed), 1) if elapsed not in (None, "") else None,
+        "eta_seconds": 0.0,
+    }
+    for key in ("quality_mode", "resolution"):
+        if result.get(key) not in (None, ""):
+            progress[key] = result[key]
+    return progress
+
+
 def _run_mask_job(
     config: ReviewAppConfig,
     candidate_id: str,
     backend: str,
     options: dict[str, Any],
 ) -> None:
+    def publish_progress(progress: dict[str, Any]) -> None:
+        _set_mask_job(candidate_id, {"progress": progress})
+
     try:
         if backend == "sam2":
             from whodoirunlike.sam2_runner import run_sam2_mask
@@ -622,6 +658,7 @@ def _run_mask_job(
                 run_dir=_cv_run_dir(config, candidate_id),
                 quality_mode=str(options.get("quality_mode") or "native"),
                 resolution=options.get("resolution"),
+                progress_callback=publish_progress,
             )
         else:
             raise ValueError(f"Unsupported mask backend: {backend}")
@@ -633,10 +670,12 @@ def _run_mask_job(
                 "completed_at": utc_now_iso(),
                 "error": None,
                 "result": result,
+                "progress": _completed_mask_progress(result),
             },
         )
     except Exception as exc:  # noqa: BLE001 - surfaced to the local review UI.
         error = str(exc)
+        progress = mask_job_status(candidate_id).get("progress") or {}
         _set_mask_stage_status(config, candidate_id, "failed", backend=backend, error=error)
         _set_mask_job(
             candidate_id,
@@ -645,6 +684,7 @@ def _run_mask_job(
                 "completed_at": utc_now_iso(),
                 "error": error,
                 "result": None,
+                "progress": {**progress, "phase": "failed", "eta_seconds": None},
             },
         )
 
@@ -679,6 +719,7 @@ def start_mask_job(
             "candidate_id": candidate_id,
             "backend": backend,
             "options": options,
+            "progress": _initial_mask_progress(backend, options),
             "status": "running",
             "started_at": utc_now_iso(),
             "completed_at": None,

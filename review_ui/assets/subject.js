@@ -41,6 +41,11 @@ const els = {
   maskQualityLabel: document.querySelector("#maskQualityLabel"),
   maskQualitySelect: document.querySelector("#maskQualitySelect"),
   runSamButton: document.querySelector("#runSamButton"),
+  maskProgress: document.querySelector("#maskProgress"),
+  maskProgressLabel: document.querySelector("#maskProgressLabel"),
+  maskProgressEta: document.querySelector("#maskProgressEta"),
+  maskProgressBar: document.querySelector("#maskProgressBar"),
+  maskProgressMeta: document.querySelector("#maskProgressMeta"),
   stageList: document.querySelector("#stageList"),
   artifactGrid: document.querySelector("#artifactGrid"),
   promptJson: document.querySelector("#promptJson"),
@@ -192,6 +197,58 @@ function qualityLabel(mode = state.maskQualityMode) {
   return "1008";
 }
 
+function phaseLabel(phase = "") {
+  if (phase === "loading_model") return "Loading model";
+  if (phase === "detecting") return "Detecting runner masks";
+  if (phase === "writing_outputs") return "Writing outputs";
+  if (phase === "completed") return "Complete";
+  if (phase === "failed") return "Failed";
+  if (phase === "queued") return "Queued";
+  return "Preparing mask run";
+}
+
+function progressPercent(progress = {}) {
+  const percent = Number(progress.percent);
+  if (Number.isFinite(percent)) return Math.max(0, Math.min(1, percent));
+  const processed = Number(progress.processed_frames);
+  const total = Number(progress.total_frames);
+  if (Number.isFinite(processed) && Number.isFinite(total) && total > 0) {
+    return Math.max(0, Math.min(1, processed / total));
+  }
+  return 0;
+}
+
+function renderMaskProgress(job = state.samJob) {
+  const progress = job?.progress;
+  const isRunning = job?.status === "running";
+  if (!isRunning || !progress) {
+    els.maskProgress.classList.add("is-hidden");
+    els.maskProgressBar.style.width = "0%";
+    return;
+  }
+
+  const processed = Number(progress.processed_frames) || 0;
+  const total = Number(progress.total_frames) || 0;
+  const percent = progressPercent(progress);
+  const percentLabel = `${Math.round(percent * 100)}%`;
+  const eta = progress.eta_seconds == null ? "--" : formatTime(progress.eta_seconds);
+  const elapsed = progress.elapsed_seconds == null ? "--" : formatTime(progress.elapsed_seconds);
+  const frame =
+    progress.frame_index == null ? "frame --" : `frame ${Number(progress.frame_index) + 1}`;
+  const detection =
+    progress.detection_count == null ? "" : ` · ${progress.detection_count} detections`;
+  const resolution = progress.resolution ? ` · ${progress.resolution}px` : "";
+
+  els.maskProgress.classList.remove("is-hidden");
+  els.maskProgressLabel.textContent = `${phaseLabel(progress.phase)} · ${percentLabel}`;
+  els.maskProgressEta.textContent = `ETA ${eta}`;
+  els.maskProgressBar.style.width = `${Math.round(percent * 100)}%`;
+  els.maskProgressMeta.textContent =
+    total > 0
+      ? `${processed}/${total} frames · elapsed ${elapsed} · ${frame}${detection}${resolution}`
+      : `elapsed ${elapsed}${resolution}`;
+}
+
 function renderSamJobStatus(job = state.samJob) {
   state.samJob = job || { status: "idle" };
   const status = state.samJob.status || "idle";
@@ -204,9 +261,13 @@ function renderSamJobStatus(job = state.samJob) {
   let statusLabel = samStatusLabel(status);
   if (status === "idle" && artifactsReady) statusLabel = "Artifacts ready";
   if (status === "running" && state.samJob.backend) {
-    statusLabel = `${backendLabel(state.samJob.backend)} running`;
+    const progress = state.samJob.progress;
+    statusLabel = progress
+      ? `${backendLabel(state.samJob.backend)} ${Math.round(progressPercent(progress) * 100)}%`
+      : `${backendLabel(state.samJob.backend)} running`;
   }
   els.maskQualityLabel.classList.toggle("is-hidden", state.maskBackend !== "sam31_mlx");
+  renderMaskProgress(state.samJob);
 
   els.samJobState.textContent = statusLabel;
   els.samJobState.className = `rank-pill sam-job-state ${

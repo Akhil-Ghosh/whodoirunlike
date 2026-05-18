@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import time
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Callable, Sequence
 
 import cv2
 import numpy as np
@@ -27,6 +27,53 @@ SAM31_MLX_QUALITY_MODES = {
 }
 SAM31_PATCH_SIZE = 14
 SAM31_MAX_AUTO_RESOLUTION = 2016
+Sam31ProgressCallback = Callable[[dict[str, Any]], None]
+
+
+def build_sam31_progress(
+    *,
+    phase: str,
+    processed_frames: int,
+    total_frames: int,
+    elapsed_seconds: float,
+    frame_index: int | None = None,
+    direction: str | None = None,
+    detection_count: int | None = None,
+    selected: bool | None = None,
+    resolution: int | None = None,
+) -> dict[str, Any]:
+    total_frames = max(0, int(total_frames))
+    processed_frames = max(0, min(int(processed_frames), total_frames or int(processed_frames)))
+    elapsed_seconds = max(0.0, float(elapsed_seconds))
+    percent = float(processed_frames / total_frames) if total_frames else 0.0
+    if processed_frames > 0 and total_frames > processed_frames and elapsed_seconds > 0:
+        eta_seconds: float | None = (elapsed_seconds / processed_frames) * (
+            total_frames - processed_frames
+        )
+    elif total_frames and processed_frames >= total_frames:
+        eta_seconds = 0.0
+    else:
+        eta_seconds = None
+
+    payload: dict[str, Any] = {
+        "phase": phase,
+        "processed_frames": processed_frames,
+        "total_frames": total_frames,
+        "percent": round(percent, 4),
+        "elapsed_seconds": round(elapsed_seconds, 1),
+        "eta_seconds": round(eta_seconds, 1) if eta_seconds is not None else None,
+    }
+    if frame_index is not None:
+        payload["frame_index"] = int(frame_index)
+    if direction:
+        payload["direction"] = direction
+    if detection_count is not None:
+        payload["detection_count"] = int(detection_count)
+    if selected is not None:
+        payload["selected"] = bool(selected)
+    if resolution is not None:
+        payload["resolution"] = int(resolution)
+    return payload
 
 
 def resolve_sam31_resolution(
@@ -222,6 +269,7 @@ def run_sam31_mlx_mask(
     threshold: float = 0.18,
     resolution: int | None = None,
     force_frames: bool = False,
+    progress_callback: Sam31ProgressCallback | None = None,
 ) -> dict[str, Any]:
     try:
         from mlx_vlm.generate import wired_limit
@@ -256,7 +304,34 @@ def run_sam31_mlx_mask(
     prompt_frame = max(0, min(prompt["frame_index"], len(frame_paths) - 1))
     prompt_box = prompt.get("box")
     prompt_anchor = normalized_prompt_anchor(prompt, video_meta["width"], video_meta["height"])
+    total_frames = len(frame_paths)
 
+    def emit_progress(
+        phase: str,
+        processed_frames: int,
+        *,
+        frame_index: int | None = None,
+        direction: str | None = None,
+        detection_count: int | None = None,
+        selected: bool | None = None,
+    ) -> None:
+        if progress_callback is None:
+            return
+        progress_callback(
+            build_sam31_progress(
+                phase=phase,
+                processed_frames=processed_frames,
+                total_frames=total_frames,
+                elapsed_seconds=time.perf_counter() - start,
+                frame_index=frame_index,
+                direction=direction,
+                detection_count=detection_count,
+                selected=selected,
+                resolution=resolved_resolution,
+            )
+        )
+
+    emit_progress("loading_model", 0)
     resolved_model_path = get_model_path(model_path)
     model = load_model(resolved_model_path)
     processor = Sam31Processor.from_pretrained(str(resolved_model_path))
@@ -267,8 +342,15 @@ def run_sam31_mlx_mask(
     masks_by_frame: dict[int, np.ndarray] = {}
     selected_boxes: dict[int, np.ndarray] = {}
     detection_counts: dict[int, int] = {}
+    processed_frames = 0
 
-    def process_sequence(indices: Sequence[int], initial_box: np.ndarray | None) -> None:
+    def process_sequence(
+        indices: Sequence[int],
+        initial_box: np.ndarray | None,
+        *,
+        direction: str,
+    ) -> None:
+        nonlocal processed_frames
         previous_box = initial_box
         with wired_limit(model):
             for frame_index in indices:
@@ -290,6 +372,15 @@ def run_sam31_mlx_mask(
                     previous_box=previous_box,
                 )
                 if selected_index is None:
+                    processed_frames += 1
+                    emit_progress(
+                        "detecting",
+                        processed_frames,
+                        frame_index=frame_index,
+                        direction=direction,
+                        detection_count=detection_counts[frame_index],
+                        selected=False,
+                    )
                     continue
                 mask = result.masks[selected_index].astype("uint8")
                 selected_box = mask_box(mask)
@@ -298,12 +389,27 @@ def run_sam31_mlx_mask(
                 masks_by_frame[frame_index] = mask
                 selected_boxes[frame_index] = selected_box
                 previous_box = selected_box
+                processed_frames += 1
+                emit_progress(
+                    "detecting",
+                    processed_frames,
+                    frame_index=frame_index,
+                    direction=direction,
+                    detection_count=detection_counts[frame_index],
+                    selected=True,
+                )
 
-    process_sequence(list(range(prompt_frame, len(frame_paths))), None)
+    emit_progress("detecting", 0, frame_index=prompt_frame)
+    process_sequence(list(range(prompt_frame, len(frame_paths))), None, direction="forward")
     prompt_selected_box = selected_boxes.get(prompt_frame, prompt_box)
     if prompt_frame > 0:
-        process_sequence(list(range(prompt_frame - 1, -1, -1)), prompt_selected_box)
+        process_sequence(
+            list(range(prompt_frame - 1, -1, -1)),
+            prompt_selected_box,
+            direction="reverse",
+        )
 
+    emit_progress("writing_outputs", total_frames)
     write_mask_outputs(
         frame_paths=frame_paths,
         masks_by_frame=masks_by_frame,
@@ -314,6 +420,7 @@ def run_sam31_mlx_mask(
         metadata_path=metadata_path,
     )
     elapsed_seconds = time.perf_counter() - start
+    emit_progress("completed", total_frames)
     update_manifest_after_sam31_mlx(
         manifest_path,
         metadata_path,

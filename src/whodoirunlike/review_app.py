@@ -54,6 +54,10 @@ CV_ARTIFACT_LABELS = {
     "features": "Features",
     "form_features": "Form features",
     "form_feature_arrays": "Feature arrays",
+    "openpose_landmarks": "OpenPose landmarks",
+    "openpose_skeleton_render": "OpenPose skeleton",
+    "openpose_qa_overlay": "OpenPose QA overlay",
+    "pose_comparison": "Pose comparison",
 }
 SAM2_CHECKPOINT = Path("models/sam2/sam2.1_hiera_tiny.pt")
 SAM2_MODEL_CFG = "configs/sam2.1/sam2.1_hiera_t.yaml"
@@ -70,7 +74,7 @@ MASK_JOBS: dict[str, dict[str, Any]] = {}
 MASK_JOBS_LOCK = threading.Lock()
 CV_STAGE_JOBS: dict[str, dict[str, Any]] = {}
 CV_STAGE_JOBS_LOCK = threading.Lock()
-CV_STAGE_VALUES = {"pose", "densepose", "fusion", "features"}
+CV_STAGE_VALUES = {"pose", "densepose", "fusion", "features", "openpose"}
 DENSEPOSE_CONFIG_ENV = "DENSEPOSE_CONFIG"
 DENSEPOSE_WEIGHTS_ENV = "DENSEPOSE_WEIGHTS"
 DENSEPOSE_DEVICE_ENV = "DENSEPOSE_DEVICE"
@@ -521,6 +525,16 @@ def _artifact_url(candidate_id: str, path: Path, run_dir: Path) -> str | None:
 
 def _stage_payload(manifest: dict[str, Any], prompt: dict[str, Any]) -> dict[str, Any]:
     stages = json.loads(json.dumps(manifest.get("stages", {})))
+    paths = manifest.get("paths", {})
+    stages.setdefault(
+        "openpose",
+        {
+            "status": "pending_optional",
+            "recommended_tool": "OpenPose BODY_25 optional benchmark",
+            "output": paths.get("openpose_landmarks"),
+            "comparison": paths.get("pose_comparison"),
+        },
+    )
     selection = prompt.get("selection", {}) if isinstance(prompt, dict) else {}
     prompt_ready = selection.get("type") not in (None, "", "unset")
     if prompt_ready and isinstance(stages.get("person_prompt"), dict):
@@ -759,6 +773,8 @@ def _cv_stage_backend(stage: str) -> str:
         return "mediapipe_pose"
     if stage == "densepose":
         return "detectron2_densepose"
+    if stage == "openpose":
+        return "openpose_body25"
     if stage == "features":
         return "form_feature_compiler"
     return "form_fusion"
@@ -1071,6 +1087,13 @@ def _run_cv_stage_job(config: ReviewAppConfig, candidate_id: str, stage: str) ->
                 run_dir=_cv_run_dir(config, candidate_id),
                 progress_callback=publish_progress,
             )
+        elif stage == "openpose":
+            from whodoirunlike.openpose_runner import run_openpose_comparison
+
+            result = run_openpose_comparison(
+                run_dir=_cv_run_dir(config, candidate_id),
+                progress_callback=publish_progress,
+            )
         else:
             from whodoirunlike.fusion_runner import run_fused_form
 
@@ -1083,7 +1106,7 @@ def _run_cv_stage_job(config: ReviewAppConfig, candidate_id: str, stage: str) ->
             stage,
             candidate_id,
             {
-                "status": "completed",
+                "status": "unavailable" if result.get("status") == "unavailable" else "completed",
                 "completed_at": utc_now_iso(),
                 "error": None,
                 "result": result,
@@ -1127,6 +1150,11 @@ def start_cv_stage_job(config: ReviewAppConfig, candidate_id: str, stage: str) -
             raise FileNotFoundError("Pose landmarks not found; run Pose before Features")
         if not (run_dir / "fused_form.jsonl").exists():
             raise FileNotFoundError("Fused form not found; run Fusion before Features")
+    if stage == "openpose":
+        if not (run_dir / "pose_landmarks.jsonl").exists():
+            raise FileNotFoundError("Pose landmarks not found; run Pose before OpenPose")
+        if not (run_dir / "runner_mask.mp4").exists():
+            raise FileNotFoundError("Runner mask not found; run a mask backend before OpenPose")
     if stage == "densepose":
         setup = densepose_setup_status(config)
         if not setup["ready"]:
@@ -1179,6 +1207,10 @@ def features_job_status(candidate_id: str) -> dict[str, Any]:
     return cv_stage_job_status("features", candidate_id)
 
 
+def openpose_job_status(candidate_id: str) -> dict[str, Any]:
+    return cv_stage_job_status("openpose", candidate_id)
+
+
 def start_pose_job(config: ReviewAppConfig, candidate_id: str) -> dict[str, Any]:
     return start_cv_stage_job(config, candidate_id, "pose")
 
@@ -1193,6 +1225,10 @@ def start_fusion_job(config: ReviewAppConfig, candidate_id: str) -> dict[str, An
 
 def start_features_job(config: ReviewAppConfig, candidate_id: str) -> dict[str, Any]:
     return start_cv_stage_job(config, candidate_id, "features")
+
+
+def start_openpose_job(config: ReviewAppConfig, candidate_id: str) -> dict[str, Any]:
+    return start_cv_stage_job(config, candidate_id, "openpose")
 
 
 def _subject_candidates_path(run_dir: Path, quality_mode: str) -> Path:
@@ -1288,6 +1324,9 @@ class ReviewRequestHandler(BaseHTTPRequestHandler):
         if parsed.path.startswith("/api/cv-runs/") and parsed.path.endswith("/features"):
             self._handle_get_features_job(parsed.path)
             return
+        if parsed.path.startswith("/api/cv-runs/") and parsed.path.endswith("/openpose"):
+            self._handle_get_openpose_job(parsed.path)
+            return
         if parsed.path.startswith("/api/cv-runs/"):
             self._handle_get_cv_run(parsed.path)
             return
@@ -1324,6 +1363,9 @@ class ReviewRequestHandler(BaseHTTPRequestHandler):
             return
         if parsed.path.startswith("/api/cv-runs/") and parsed.path.endswith("/features"):
             self._handle_start_features_job(parsed.path)
+            return
+        if parsed.path.startswith("/api/cv-runs/") and parsed.path.endswith("/openpose"):
+            self._handle_start_openpose_job(parsed.path)
             return
         if parsed.path.startswith("/api/cv-runs/") and parsed.path.endswith("/prepare"):
             self._handle_prepare_cv_run(parsed.path)
@@ -1511,6 +1553,43 @@ class ReviewRequestHandler(BaseHTTPRequestHandler):
         ).strip("/")
         try:
             self._send_json({"job": start_features_job(self.config, candidate_id)})
+        except FileNotFoundError as exc:
+            self._send_json({"error": str(exc)}, status=HTTPStatus.NOT_FOUND)
+        except ValueError as exc:
+            self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+
+    def _handle_get_openpose_job(self, path: str) -> None:
+        candidate_id = unquote(
+            path.removeprefix("/api/cv-runs/").removesuffix("/openpose")
+        ).strip("/")
+        try:
+            from whodoirunlike.openpose_runner import openpose_setup_status
+
+            run_dir = _cv_run_dir(self.config, candidate_id)
+            if not (run_dir / "cv_run_manifest.json").exists():
+                raise FileNotFoundError(f"CV run not found: {candidate_id}")
+            self._send_json(
+                {
+                    "job": openpose_job_status(candidate_id),
+                    "setup": openpose_setup_status(),
+                }
+            )
+        except (FileNotFoundError, ValueError) as exc:
+            self._send_json({"error": str(exc)}, status=HTTPStatus.NOT_FOUND)
+
+    def _handle_start_openpose_job(self, path: str) -> None:
+        candidate_id = unquote(
+            path.removeprefix("/api/cv-runs/").removesuffix("/openpose")
+        ).strip("/")
+        try:
+            from whodoirunlike.openpose_runner import openpose_setup_status
+
+            self._send_json(
+                {
+                    "job": start_openpose_job(self.config, candidate_id),
+                    "setup": openpose_setup_status(),
+                }
+            )
         except FileNotFoundError as exc:
             self._send_json({"error": str(exc)}, status=HTTPStatus.NOT_FOUND)
         except ValueError as exc:

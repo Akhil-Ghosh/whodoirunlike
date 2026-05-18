@@ -6,7 +6,9 @@ const state = {
   denseposeJob: null,
   fusionJob: null,
   featuresJob: null,
+  openposeJob: null,
   denseposeSetup: null,
+  openposeSetup: null,
   prepCandidates: [],
   prepStatus: "idle",
   maskBackend: "sam2",
@@ -30,6 +32,7 @@ const state = {
   denseposePollTimer: 0,
   fusionPollTimer: 0,
   featuresPollTimer: 0,
+  openposePollTimer: 0,
 };
 
 const svgNS = "http://www.w3.org/2000/svg";
@@ -65,6 +68,7 @@ const els = {
   denseposeJobState: document.querySelector("#denseposeJobState"),
   fusionJobState: document.querySelector("#fusionJobState"),
   featuresJobState: document.querySelector("#featuresJobState"),
+  openposeJobState: document.querySelector("#openposeJobState"),
   maskBackendSelect: document.querySelector("#maskBackendSelect"),
   maskQualityLabel: document.querySelector("#maskQualityLabel"),
   maskQualitySelect: document.querySelector("#maskQualitySelect"),
@@ -73,6 +77,7 @@ const els = {
   runDenseposeButton: document.querySelector("#runDenseposeButton"),
   runFusionButton: document.querySelector("#runFusionButton"),
   runFeaturesButton: document.querySelector("#runFeaturesButton"),
+  runOpenposeButton: document.querySelector("#runOpenposeButton"),
   maskProgress: document.querySelector("#maskProgress"),
   maskProgressLabel: document.querySelector("#maskProgressLabel"),
   maskProgressEta: document.querySelector("#maskProgressEta"),
@@ -98,6 +103,11 @@ const els = {
   featuresProgressEta: document.querySelector("#featuresProgressEta"),
   featuresProgressBar: document.querySelector("#featuresProgressBar"),
   featuresProgressMeta: document.querySelector("#featuresProgressMeta"),
+  openposeProgress: document.querySelector("#openposeProgress"),
+  openposeProgressLabel: document.querySelector("#openposeProgressLabel"),
+  openposeProgressEta: document.querySelector("#openposeProgressEta"),
+  openposeProgressBar: document.querySelector("#openposeProgressBar"),
+  openposeProgressMeta: document.querySelector("#openposeProgressMeta"),
   stageList: document.querySelector("#stageList"),
   artifactGrid: document.querySelector("#artifactGrid"),
   promptJson: document.querySelector("#promptJson"),
@@ -280,6 +290,7 @@ function clearAllCvPolls() {
   clearCvPoll("densepose");
   clearCvPoll("fusion");
   clearCvPoll("features");
+  clearCvPoll("openpose");
 }
 
 function scheduleSamPoll() {
@@ -300,6 +311,7 @@ function samStatusLabel(status) {
   if (status === "completed") return "Complete";
   if (status === "failed") return "Failed";
   if (status === "running") return "Running";
+  if (status === "unavailable") return "Unavailable";
   return "Idle";
 }
 
@@ -325,6 +337,9 @@ function phaseLabel(phase = "") {
   if (phase === "reading_inputs") return "Reading inputs";
   if (phase === "compiling_features") return "Compiling features";
   if (phase === "summarizing_features") return "Summarizing features";
+  if (phase === "preparing_openpose_frames") return "Preparing OpenPose frames";
+  if (phase === "running_openpose") return "Running OpenPose";
+  if (phase === "reading_openpose_results") return "Reading OpenPose";
   if (phase === "writing_outputs") return "Writing outputs";
   if (phase === "completed") return "Complete";
   if (phase === "failed") return "Failed";
@@ -484,6 +499,23 @@ function cvJobConfig(kind) {
       blockedTitle: !hasPose ? "Run Pose first" : !hasFused ? "Run Fusion first" : "Load a CV run first",
     };
   }
+  if (kind === "openpose") {
+    const hasPose = artifactExists("pose_landmarks");
+    const hasMask = artifactExists("runner_mask");
+    const setupReady = state.openposeSetup ? Boolean(state.openposeSetup.ready) : true;
+    return {
+      label: "OpenPose",
+      stateKey: "openposeJob",
+      stateEl: els.openposeJobState,
+      buttonEl: els.runOpenposeButton,
+      ready: artifactExists("openpose_landmarks") || artifactExists("pose_comparison"),
+      canRun: Boolean(state.current) && hasPose && hasMask,
+      blockedTitle: !hasPose ? "Run Pose first" : !hasMask ? "Run mask first" : "Load a CV run first",
+      setupWarning: setupReady
+        ? ""
+        : state.openposeSetup?.reasons?.[0] || "OpenPose is not configured",
+    };
+  }
   return {
     label: "Pose",
     stateKey: "poseJob",
@@ -502,10 +534,12 @@ function renderCvJobStatus(kind, job = state[cvJobConfig(kind).stateKey]) {
   const status = currentJob.status || "idle";
   const isRunning = status === "running";
   const setupBlocked = kind === "densepose" && state.denseposeSetup && !state.denseposeSetup.ready;
+  const setupWarning = config.setupWarning || "";
   const percent = currentJob.progress ? Math.round(progressPercent(currentJob.progress) * 100) : null;
   let label = `${config.label} ${samStatusLabel(status).toLowerCase()}`;
 
   if (setupBlocked) label = `${config.label} setup`;
+  if (!setupBlocked && setupWarning && status === "idle" && !config.ready) label = `${config.label} setup`;
   if (status === "idle" && config.ready) label = `${config.label} ready`;
   if (isRunning) label = percent == null ? `${config.label} running` : `${config.label} ${percent}%`;
 
@@ -513,7 +547,7 @@ function renderCvJobStatus(kind, job = state[cvJobConfig(kind).stateKey]) {
   config.stateEl.textContent = label;
   config.stateEl.className = `rank-pill cv-job-state ${
     isRunning ? "is-running" : status === "completed" || config.ready ? "is-complete" : ""
-  } ${status === "failed" || setupBlocked ? "is-error" : ""}`.trim();
+  } ${status === "failed" || status === "unavailable" || setupBlocked || setupWarning ? "is-error" : ""}`.trim();
 
   config.buttonEl.disabled = !config.canRun || isRunning;
   config.buttonEl.textContent = isRunning
@@ -521,7 +555,9 @@ function renderCvJobStatus(kind, job = state[cvJobConfig(kind).stateKey]) {
     : config.ready || status === "completed"
       ? `Run ${config.label} Again`
       : `Run ${config.label}`;
-  config.buttonEl.title = config.canRun ? `Run ${config.label} on the current CV run` : config.blockedTitle;
+  config.buttonEl.title = config.canRun
+    ? setupWarning || `Run ${config.label} on the current CV run`
+    : config.blockedTitle;
 }
 
 function renderRunList() {
@@ -638,6 +674,10 @@ function renderArtifacts(artifacts) {
     "features",
     "form_features",
     "form_feature_arrays",
+    "openpose_landmarks",
+    "openpose_skeleton_render",
+    "openpose_qa_overlay",
+    "pose_comparison",
   ];
   els.artifactGrid.innerHTML = preferredOrder
     .filter((key) => artifacts?.[key])
@@ -714,6 +754,7 @@ function renderRun() {
   renderCvJobStatus("densepose");
   renderCvJobStatus("fusion");
   renderCvJobStatus("features");
+  renderCvJobStatus("openpose");
   setSaveState("Ready");
 }
 
@@ -728,6 +769,7 @@ async function loadRun(candidateId, options = {}) {
       state.denseposeJob = null;
       state.fusionJob = null;
       state.featuresJob = null;
+      state.openposeJob = null;
     }
     state.current = await fetchJson(`/api/cv-runs/${candidateId}`);
     renderRun();
@@ -737,6 +779,7 @@ async function loadRun(candidateId, options = {}) {
       await refreshCvJobStatus("densepose");
       await refreshCvJobStatus("fusion");
       await refreshCvJobStatus("features");
+      await refreshCvJobStatus("openpose");
     }
     await loadSubjectCandidateCache(candidateId);
   } catch (error) {
@@ -929,15 +972,22 @@ async function refreshCvJobStatus(kind, options = {}) {
     if (kind === "densepose" && payload.setup) {
       state.denseposeSetup = payload.setup;
     }
+    if (kind === "openpose" && payload.setup) {
+      state.openposeSetup = payload.setup;
+    }
     renderCvJobStatus(kind, job);
     if (job.status === "running") {
       scheduleCvPoll(kind);
     } else {
       clearCvPoll(kind);
-      if (reloadOnComplete && job.status === "completed" && state.current?.candidate_id === candidateId) {
+      if (
+        reloadOnComplete &&
+        (job.status === "completed" || job.status === "unavailable") &&
+        state.current?.candidate_id === candidateId
+      ) {
         await loadRun(candidateId, { refreshJob: false, preservePolls: true });
         renderCvJobStatus(kind, job);
-        setSaveState(`${config.label} complete`);
+        setSaveState(job.status === "unavailable" ? `${config.label} unavailable` : `${config.label} complete`);
       }
       if (job.status === "failed") {
         setSaveState(`${config.label} failed`, "is-error");
@@ -1000,6 +1050,9 @@ async function startCvRun(kind) {
     });
     if (kind === "densepose" && payload.setup) {
       state.denseposeSetup = payload.setup;
+    }
+    if (kind === "openpose" && payload.setup) {
+      state.openposeSetup = payload.setup;
     }
     renderCvJobStatus(kind, payload.job);
     setSaveState(`${config.label} running`, "is-saving");
@@ -1114,6 +1167,7 @@ els.runPoseButton.addEventListener("click", () => startCvRun("pose"));
 els.runDenseposeButton.addEventListener("click", () => startCvRun("densepose"));
 els.runFusionButton.addEventListener("click", () => startCvRun("fusion"));
 els.runFeaturesButton.addEventListener("click", () => startCvRun("features"));
+els.runOpenposeButton.addEventListener("click", () => startCvRun("openpose"));
 els.copyPromptButton.addEventListener("click", async () => {
   await navigator.clipboard.writeText(els.promptJson.textContent);
   setSaveState("Copied");

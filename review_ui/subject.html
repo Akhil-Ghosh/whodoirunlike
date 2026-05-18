@@ -121,6 +121,7 @@
               <span class="rank-pill cv-job-state" id="denseposeJobState">DensePose idle</span>
               <span class="rank-pill cv-job-state" id="fusionJobState">Fusion idle</span>
               <span class="rank-pill cv-job-state" id="featuresJobState">Features idle</span>
+              <span class="rank-pill cv-job-state" id="openposeJobState">OpenPose idle</span>
               <label class="backend-select-label" for="maskBackendSelect">
                 <span>Backend</span>
                 <select id="maskBackendSelect">
@@ -150,6 +151,9 @@
               </button>
               <button class="ghost-button run-cv-button" id="runFeaturesButton" type="button">
                 Run Features
+              </button>
+              <button class="ghost-button run-cv-button" id="runOpenposeButton" type="button">
+                Compare OpenPose
               </button>
             </div>
           </div>
@@ -207,6 +211,17 @@
               <span id="featuresProgressBar"></span>
             </div>
             <div class="mask-progress-meta" id="featuresProgressMeta">Waiting for frames</div>
+          </div>
+
+          <div class="mask-progress cv-progress is-hidden" id="openposeProgress">
+            <div class="mask-progress-top">
+              <span id="openposeProgressLabel">Preparing OpenPose run</span>
+              <strong id="openposeProgressEta">ETA --</strong>
+            </div>
+            <div class="mask-progress-track" aria-hidden="true">
+              <span id="openposeProgressBar"></span>
+            </div>
+            <div class="mask-progress-meta" id="openposeProgressMeta">Waiting for frames</div>
           </div>
 
           <div class="stage-list" id="stageList"></div>

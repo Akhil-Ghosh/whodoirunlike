@@ -231,6 +231,10 @@ def build_cv_run_manifest(clip: ReviewedClip, run_dir: Path) -> dict[str, Any]:
         "features": str(run_dir / "features.json"),
         "form_features": str(run_dir / "form_features.json"),
         "form_feature_arrays": str(run_dir / "form_features.npz"),
+        "openpose_landmarks": str(run_dir / "openpose_landmarks.jsonl"),
+        "openpose_skeleton_render": str(run_dir / "openpose_skeleton_render.mp4"),
+        "openpose_qa_overlay": str(run_dir / "openpose_qa_overlay.mp4"),
+        "pose_comparison": str(run_dir / "pose_comparison.json"),
     }
     return {
         "version": 1,
@@ -295,6 +299,12 @@ def build_cv_run_manifest(clip: ReviewedClip, run_dir: Path) -> dict[str, Any]:
                 "recommended_tool": "Pose sequence + fused confidence feature compiler",
                 "output": paths["form_features"],
                 "arrays": paths["form_feature_arrays"],
+            },
+            "openpose": {
+                "status": "pending_optional",
+                "recommended_tool": "OpenPose BODY_25 optional benchmark",
+                "output": paths["openpose_landmarks"],
+                "comparison": paths["pose_comparison"],
             },
         },
         "occlusion_policy": {

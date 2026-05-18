@@ -53,6 +53,7 @@
               <button type="button" data-prompt-mode="box">Box</button>
             </div>
             <div class="step-actions">
+              <button class="ghost-button" id="detectCandidatesButton" type="button">Find Runners</button>
               <button class="ghost-button" id="undoButton" type="button">Undo</button>
               <button class="ghost-button" id="clearButton" type="button">Clear</button>
               <button class="primary-button" id="savePromptButton" type="button">Save Prompt</button>
@@ -64,6 +65,7 @@
             <svg id="promptOverlay" viewBox="0 0 1 1" preserveAspectRatio="none" aria-label="Prompt overlay"></svg>
             <div class="video-empty" id="promptEmpty">No prompt frame</div>
           </div>
+          <div class="candidate-readout" id="candidateSummary">No candidates loaded</div>
 
           <div class="prompt-readout">
             <div>

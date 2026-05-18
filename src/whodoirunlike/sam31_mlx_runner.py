@@ -20,6 +20,7 @@ from whodoirunlike.sam2_runner import (
 
 DEFAULT_SAM31_MLX_MODEL = "mlx-community/sam3.1-bf16"
 DEFAULT_SAM31_PROMPTS = ("a runner", "a person")
+DEFAULT_SAM31_CANDIDATE_LIMIT = 12
 SAM31_MLX_QUALITY_MODES = {
     "max": "Highest quality",
     "native": "1008",
@@ -231,6 +232,156 @@ def detect_frame(
         encoder_cache={},
     )
     return frame_bgr, result
+
+
+def _normalized_box_from_pixels(box: np.ndarray, width: int, height: int) -> dict[str, float]:
+    x1, y1, x2, y2 = [float(value) for value in box]
+    x1 = max(0.0, min(x1, width - 1))
+    y1 = max(0.0, min(y1, height - 1))
+    x2 = max(x1 + 1.0, min(x2, width - 1))
+    y2 = max(y1 + 1.0, min(y2, height - 1))
+    return {
+        "x": round(x1 / max(width - 1, 1), 6),
+        "y": round(y1 / max(height - 1, 1), 6),
+        "width": round((x2 - x1) / max(width - 1, 1), 6),
+        "height": round((y2 - y1) / max(height - 1, 1), 6),
+    }
+
+
+def _normalized_point_from_pixels(point: tuple[float, float], width: int, height: int) -> dict[str, float]:
+    return {
+        "x": round(max(0.0, min(float(point[0]), width - 1)) / max(width - 1, 1), 6),
+        "y": round(max(0.0, min(float(point[1]), height - 1)) / max(height - 1, 1), 6),
+    }
+
+
+def _candidate_payload(
+    *,
+    index: int,
+    box: np.ndarray,
+    mask: np.ndarray,
+    score: float,
+    width: int,
+    height: int,
+) -> dict[str, Any] | None:
+    candidate_box = mask_box(mask)
+    if candidate_box is None:
+        candidate_box = box
+    centroid = mask_centroid(mask)
+    if centroid is None:
+        centroid = box_center(candidate_box)
+    if centroid is None:
+        return None
+    mask_area = float((mask > 0).sum()) / float(max(width * height, 1))
+    normalized_box = _normalized_box_from_pixels(candidate_box, width, height)
+    center = _normalized_point_from_pixels(centroid, width, height)
+    return {
+        "id": f"sam31-{index}",
+        "index": index,
+        "score": round(float(score), 4),
+        "mask_area_ratio": round(mask_area, 6),
+        "box": normalized_box,
+        "center": center,
+    }
+
+
+def detect_sam31_subject_candidates(
+    *,
+    run_dir: Path,
+    model_path: str = DEFAULT_SAM31_MLX_MODEL,
+    prompts: Sequence[str] = DEFAULT_SAM31_PROMPTS,
+    quality_mode: str = "native",
+    threshold: float = 0.18,
+    resolution: int | None = None,
+    limit: int = DEFAULT_SAM31_CANDIDATE_LIMIT,
+    force_frames: bool = False,
+) -> dict[str, Any]:
+    try:
+        from mlx_vlm.generate import wired_limit
+        from mlx_vlm.models.sam3.generate import Sam3Predictor
+        from mlx_vlm.models.sam3_1.processing_sam3_1 import Sam31Processor
+        from mlx_vlm.utils import get_model_path, load_model
+    except ModuleNotFoundError as exc:
+        raise RuntimeError(
+            "SAM 3.1 MLX dependencies are not installed. Run: python -m pip install 'mlx-vlm>=0.4.3'"
+        ) from exc
+
+    start = time.perf_counter()
+    manifest_path = run_dir / "cv_run_manifest.json"
+    manifest = read_json(manifest_path)
+    paths = manifest["paths"]
+    source_segment = Path(paths["source_segment"])
+    prompt_path = Path(paths["person_prompt"])
+    frame_dir = run_dir / "sam31_mlx_frames"
+
+    video_meta = inspect_video(source_segment)
+    resolved_resolution = resolve_sam31_resolution(
+        mode=quality_mode,
+        video_meta=video_meta,
+        resolution=resolution,
+    )
+    frame_paths = extract_video_frames(source_segment, frame_dir, force=force_frames)
+    prompt = read_json(prompt_path)
+    prompt_frame = max(
+        0,
+        min(int(prompt.get("frame", {}).get("frame_index") or 0), len(frame_paths) - 1),
+    )
+
+    resolved_model_path = get_model_path(model_path)
+    model = load_model(resolved_model_path)
+    processor = Sam31Processor.from_pretrained(str(resolved_model_path))
+    if resolved_resolution != 1008:
+        processor.image_size = resolved_resolution
+    predictor = Sam3Predictor(model, processor, score_threshold=threshold)
+
+    with wired_limit(model):
+        _, result = detect_frame(
+            frame_path=frame_paths[prompt_frame],
+            predictor=predictor,
+            prompts=prompts,
+            threshold=threshold,
+        )
+
+    candidates: list[dict[str, Any]] = []
+    selected_candidate_boxes: list[np.ndarray] = []
+    order = np.argsort(np.asarray(result.scores))[::-1]
+    for raw_index in order:
+        mask = result.masks[int(raw_index)].astype("uint8")
+        candidate_box = mask_box(mask)
+        if candidate_box is None:
+            candidate_box = result.boxes[int(raw_index)]
+        if any(box_iou(candidate_box, existing_box) > 0.86 for existing_box in selected_candidate_boxes):
+            continue
+        candidate = _candidate_payload(
+            index=int(raw_index),
+            box=candidate_box,
+            mask=mask,
+            score=float(result.scores[int(raw_index)]),
+            width=video_meta["width"],
+            height=video_meta["height"],
+        )
+        if candidate is not None:
+            candidates.append(candidate)
+            selected_candidate_boxes.append(candidate_box)
+        if len(candidates) >= max(1, int(limit)):
+            break
+
+    return {
+        "candidate_id": manifest["candidate_id"],
+        "backend": "sam31_mlx",
+        "model": model_path,
+        "prompts": list(prompts),
+        "quality_mode": quality_mode,
+        "resolution": resolved_resolution,
+        "threshold": threshold,
+        "frame_index": prompt_frame,
+        "frame_count": len(frame_paths),
+        "image_width": video_meta["width"],
+        "image_height": video_meta["height"],
+        "candidate_count": len(candidates),
+        "candidates": candidates,
+        "elapsed_seconds": round(time.perf_counter() - start, 3),
+    }
 
 
 def update_manifest_after_sam31_mlx(

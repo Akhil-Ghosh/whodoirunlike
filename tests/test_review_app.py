@@ -10,6 +10,7 @@ from whodoirunlike.review_app import (
     list_cv_runs,
     load_cv_run_payload,
     load_review_clips,
+    load_subject_candidates,
     mask_job_status,
     save_annotation,
     save_cv_prompt,
@@ -264,6 +265,58 @@ def test_save_cv_prompt_preserves_many_clicks(tmp_path: Path) -> None:
 
     assert len(saved_prompt["selection"]["positive_points"]) == 25
     assert len(saved_prompt["selection"]["negative_points"]) == 35
+
+
+def test_save_cv_prompt_preserves_subject_candidate(tmp_path: Path) -> None:
+    run_dir = write_cv_run(tmp_path)
+    config = ReviewAppConfig(
+        source_path=tmp_path / "source.json",
+        annotations_path=tmp_path / "annotations.json",
+        static_dir=tmp_path,
+        repo_root=tmp_path,
+        limit=2,
+    )
+
+    save_cv_prompt(
+        config,
+        "clip-001",
+        {
+            "selection": {
+                "box": {"x": 0.2, "y": 0.3, "width": 0.1, "height": 0.4},
+                "subject_candidate": {
+                    "id": "sam31-4",
+                    "index": 4,
+                    "score": 0.87654,
+                    "mask_area_ratio": 0.045678,
+                    "center": {"x": 0.25, "y": 0.5},
+                    "box": {"x": 0.2, "y": 0.3, "width": 0.1, "height": 0.4},
+                },
+            }
+        },
+    )
+    saved_prompt = json.loads((run_dir / "person_prompt.json").read_text(encoding="utf-8"))
+
+    assert saved_prompt["selection"]["type"] == "box"
+    assert saved_prompt["selection"]["subject_candidate"]["id"] == "sam31-4"
+    assert saved_prompt["selection"]["subject_candidate"]["score"] == 0.8765
+    assert saved_prompt["selection"]["subject_candidate"]["center"] == {"x": 0.25, "y": 0.5}
+
+
+def test_load_subject_candidates_defaults_to_empty(tmp_path: Path) -> None:
+    write_cv_run(tmp_path)
+    config = ReviewAppConfig(
+        source_path=tmp_path / "source.json",
+        annotations_path=tmp_path / "annotations.json",
+        static_dir=tmp_path,
+        repo_root=tmp_path,
+        limit=2,
+    )
+
+    payload = load_subject_candidates(config, "clip-001")
+
+    assert payload["cached"] is False
+    assert payload["candidate_count"] == 0
+    assert payload["candidates"] == []
 
 
 def test_sam2_job_status_defaults_to_idle() -> None:

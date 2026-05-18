@@ -460,6 +460,24 @@ def _sanitize_box(box: Any) -> dict[str, float] | None:
     return {"x": x, "y": y, "width": round(width, 6), "height": round(height, 6)}
 
 
+def _sanitize_subject_candidate(candidate: Any) -> dict[str, Any] | None:
+    if not isinstance(candidate, dict):
+        return None
+    sanitized: dict[str, Any] = {
+        "id": str(candidate.get("id") or "")[:80],
+        "index": _as_int(candidate.get("index")),
+        "score": round(_as_float(candidate.get("score")), 4),
+        "mask_area_ratio": round(_as_float(candidate.get("mask_area_ratio")), 6),
+    }
+    center = candidate.get("center")
+    if isinstance(center, dict):
+        sanitized["center"] = _sanitize_point(center)
+    box = _sanitize_box(candidate.get("box"))
+    if box:
+        sanitized["box"] = box
+    return sanitized
+
+
 def sanitize_prompt_selection(selection: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(selection, dict):
         raise ValueError("selection must be an object")
@@ -484,13 +502,17 @@ def sanitize_prompt_selection(selection: dict[str, Any]) -> dict[str, Any]:
     if selection_type not in PROMPT_SELECTION_TYPES:
         raise ValueError(f"selection.type must be one of: {', '.join(sorted(PROMPT_SELECTION_TYPES))}")
 
-    return {
+    sanitized = {
         "type": selection_type,
         "positive_points": positive_points,
         "negative_points": negative_points,
         "box": box,
         "mask_path": selection.get("mask_path") or None,
     }
+    subject_candidate = _sanitize_subject_candidate(selection.get("subject_candidate"))
+    if subject_candidate:
+        sanitized["subject_candidate"] = subject_candidate
+    return sanitized
 
 
 def save_cv_prompt(config: ReviewAppConfig, candidate_id: str, data: dict[str, Any]) -> dict[str, Any]:
@@ -741,6 +763,63 @@ def start_sam2_job(config: ReviewAppConfig, candidate_id: str) -> dict[str, Any]
     return start_mask_job(config, candidate_id, backend="sam2")
 
 
+def _subject_candidates_path(run_dir: Path, quality_mode: str) -> Path:
+    return run_dir / f"subject_candidates.sam31_mlx.{quality_mode}.json"
+
+
+def load_subject_candidates(
+    config: ReviewAppConfig,
+    candidate_id: str,
+    *,
+    quality_mode: str = "native",
+) -> dict[str, Any]:
+    run_dir = _cv_run_dir(config, candidate_id)
+    if not (run_dir / "cv_run_manifest.json").exists():
+        raise FileNotFoundError(f"CV run not found: {candidate_id}")
+    path = _subject_candidates_path(run_dir, quality_mode)
+    if not path.exists():
+        return {
+            "candidate_id": candidate_id,
+            "backend": "sam31_mlx",
+            "quality_mode": quality_mode,
+            "cached": False,
+            "candidates": [],
+            "candidate_count": 0,
+        }
+    payload = _read_json(path, {})
+    return {**payload, "cached": True}
+
+
+def detect_subject_candidates(
+    config: ReviewAppConfig,
+    candidate_id: str,
+    data: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    data = data or {}
+    candidate_id = _safe_candidate_id(candidate_id)
+    run_dir = _cv_run_dir(config, candidate_id)
+    if not (run_dir / "cv_run_manifest.json").exists():
+        raise FileNotFoundError(f"CV run not found: {candidate_id}")
+
+    options = _sanitize_mask_options(data)
+    quality_mode = str(options.get("quality_mode") or "native")
+    force = bool(data.get("force"))
+    path = _subject_candidates_path(run_dir, quality_mode)
+    if path.exists() and not force:
+        return {**_read_json(path, {}), "cached": True}
+
+    from whodoirunlike.sam31_mlx_runner import detect_sam31_subject_candidates
+
+    payload = detect_sam31_subject_candidates(
+        run_dir=run_dir,
+        quality_mode=quality_mode,
+        resolution=options.get("resolution"),
+    )
+    payload["created_at"] = utc_now_iso()
+    _write_json(path, payload)
+    return {**payload, "cached": False}
+
+
 class ReviewRequestHandler(BaseHTTPRequestHandler):
     server_version = "WhoDoIRunLikeReview/0.1"
     config: ReviewAppConfig
@@ -758,6 +837,9 @@ class ReviewRequestHandler(BaseHTTPRequestHandler):
             return
         if parsed.path.startswith("/api/cv-runs/") and parsed.path.endswith("/sam2"):
             self._handle_get_sam2_job(parsed.path)
+            return
+        if parsed.path.startswith("/api/cv-runs/") and parsed.path.endswith("/subject-candidates"):
+            self._handle_get_subject_candidates(parsed)
             return
         if parsed.path.startswith("/api/cv-runs/"):
             self._handle_get_cv_run(parsed.path)
@@ -780,6 +862,9 @@ class ReviewRequestHandler(BaseHTTPRequestHandler):
             return
         if parsed.path.startswith("/api/cv-runs/") and parsed.path.endswith("/prompt"):
             self._handle_save_cv_prompt(parsed.path)
+            return
+        if parsed.path.startswith("/api/cv-runs/") and parsed.path.endswith("/subject-candidates"):
+            self._handle_detect_subject_candidates(parsed.path)
             return
 
         if parsed.path != "/api/annotations":
@@ -834,6 +919,46 @@ class ReviewRequestHandler(BaseHTTPRequestHandler):
             self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
         except FileNotFoundError as exc:
             self._send_json({"error": str(exc)}, status=HTTPStatus.NOT_FOUND)
+
+    def _handle_get_subject_candidates(self, parsed: Any) -> None:
+        candidate_id = unquote(
+            parsed.path.removeprefix("/api/cv-runs/").removesuffix("/subject-candidates")
+        ).strip("/")
+        try:
+            data = {key: values[-1] for key, values in parse_qs(parsed.query).items()}
+            options = _sanitize_mask_options(data)
+            self._send_json(
+                {
+                    "subject_candidates": load_subject_candidates(
+                        self.config,
+                        candidate_id,
+                        quality_mode=str(options.get("quality_mode") or "native"),
+                    ),
+                    "quality_modes": MASK_QUALITY_MODES,
+                }
+            )
+        except (FileNotFoundError, ValueError) as exc:
+            self._send_json({"error": str(exc)}, status=HTTPStatus.NOT_FOUND)
+
+    def _handle_detect_subject_candidates(self, path: str) -> None:
+        candidate_id = unquote(
+            path.removeprefix("/api/cv-runs/").removesuffix("/subject-candidates")
+        ).strip("/")
+        try:
+            length = min(int(self.headers.get("Content-Length", "0")), 64_000)
+            data = json.loads(self.rfile.read(length).decode("utf-8")) if length else {}
+            self._send_json(
+                {
+                    "subject_candidates": detect_subject_candidates(self.config, candidate_id, data),
+                    "quality_modes": MASK_QUALITY_MODES,
+                }
+            )
+        except json.JSONDecodeError as exc:
+            self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+        except FileNotFoundError as exc:
+            self._send_json({"error": str(exc)}, status=HTTPStatus.NOT_FOUND)
+        except ValueError as exc:
+            self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
 
     def _handle_get_sam2_job(self, path: str) -> None:
         candidate_id = unquote(path.removeprefix("/api/cv-runs/").removesuffix("/sam2")).strip("/")

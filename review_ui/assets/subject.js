@@ -4,7 +4,16 @@ const state = {
   samJob: null,
   maskBackend: "sam2",
   maskQualityMode: "native",
-  selection: { type: "unset", positive_points: [], negative_points: [], box: null, mask_path: null },
+  subjectCandidates: [],
+  subjectCandidatesStatus: "idle",
+  selection: {
+    type: "unset",
+    positive_points: [],
+    negative_points: [],
+    box: null,
+    mask_path: null,
+    subject_candidate: null,
+  },
   promptMode: "positive",
   boxStart: null,
   draftBox: null,
@@ -23,12 +32,14 @@ const els = {
   runMeta: document.querySelector("#runMeta"),
   manifestLink: document.querySelector("#manifestLink"),
   promptModes: document.querySelectorAll("[data-prompt-mode]"),
+  detectCandidatesButton: document.querySelector("#detectCandidatesButton"),
   undoButton: document.querySelector("#undoButton"),
   clearButton: document.querySelector("#clearButton"),
   savePromptButton: document.querySelector("#savePromptButton"),
   promptImage: document.querySelector("#promptImage"),
   promptOverlay: document.querySelector("#promptOverlay"),
   promptEmpty: document.querySelector("#promptEmpty"),
+  candidateSummary: document.querySelector("#candidateSummary"),
   selectionSummary: document.querySelector("#selectionSummary"),
   frameSummary: document.querySelector("#frameSummary"),
   angleSummary: document.querySelector("#angleSummary"),
@@ -92,6 +103,7 @@ function normalizedSelection() {
     negative_points: negative,
     box,
     mask_path: state.selection.mask_path || null,
+    subject_candidate: state.selection.subject_candidate || null,
   };
 }
 
@@ -119,6 +131,30 @@ function makeSvg(name, attributes = {}) {
 function renderOverlay() {
   els.promptOverlay.innerHTML = "";
   const selection = normalizedSelection();
+  state.subjectCandidates.forEach((candidate, index) => {
+    const candidateBox = candidate.box;
+    if (!candidateBox) return;
+    const isSelected = selection.subject_candidate?.id === candidate.id;
+    const node = makeSvg("rect", {
+      class: `subject-candidate-box ${isSelected ? "is-selected" : ""}`.trim(),
+      x: candidateBox.x,
+      y: candidateBox.y,
+      width: candidateBox.width,
+      height: candidateBox.height,
+      "data-candidate-index": index,
+    });
+    const title = makeSvg("title");
+    title.textContent = `Candidate ${index + 1} · score ${candidate.score}`;
+    node.appendChild(title);
+    node.addEventListener("pointerdown", (event) => {
+      event.stopPropagation();
+    });
+    node.addEventListener("click", (event) => {
+      event.stopPropagation();
+      selectSubjectCandidate(candidate);
+    });
+    els.promptOverlay.appendChild(node);
+  });
   if (selection.box) {
     els.promptOverlay.appendChild(
       makeSvg("rect", {
@@ -158,13 +194,32 @@ function renderSelectionSummary() {
   const selection = normalizedSelection();
   const positiveCount = selection.positive_points.length;
   const negativeCount = selection.negative_points.length;
-  const boxLabel = selection.box ? "box" : "no box";
+  const boxLabel = selection.subject_candidate ? "candidate" : selection.box ? "box" : "no box";
   const summary =
     selection.type === "unset" ? "Unset" : `${positiveCount}+ / ${negativeCount}- / ${boxLabel}`;
   els.selectionSummary.textContent = summary;
   els.promptState.textContent = selection.type === "unset" ? "Unset" : "Ready";
   els.promptJson.textContent = JSON.stringify(selection, null, 2);
   renderSamJobStatus();
+}
+
+function renderCandidateSummary() {
+  const count = state.subjectCandidates.length;
+  els.detectCandidatesButton.disabled = !state.current || state.subjectCandidatesStatus === "loading";
+  if (state.subjectCandidatesStatus === "loading") {
+    els.detectCandidatesButton.textContent = "Finding...";
+    els.candidateSummary.textContent = "Scanning prompt frame with SAM 3.1";
+    return;
+  }
+  els.detectCandidatesButton.textContent = count ? "Refresh Runners" : "Find Runners";
+  if (state.subjectCandidatesStatus === "error") return;
+  if (!count) {
+    els.candidateSummary.textContent = "No candidates loaded";
+    return;
+  }
+  const selected = normalizedSelection().subject_candidate;
+  const selectedLabel = selected ? ` · selected ${selected.index + 1}` : "";
+  els.candidateSummary.textContent = `${count} candidate${count === 1 ? "" : "s"} loaded${selectedLabel}`;
 }
 
 function clearSamPoll() {
@@ -390,8 +445,11 @@ function renderRun() {
     negative_points: [],
     box: null,
     mask_path: null,
+    subject_candidate: null,
     ...(run.prompt?.selection || {}),
   };
+  state.subjectCandidates = [];
+  state.subjectCandidatesStatus = "idle";
 
   els.runBucket.textContent = review.primary_bucket || "CV run";
   els.runTitle.textContent = source.title || "Untitled run";
@@ -420,6 +478,7 @@ function renderRun() {
   }
 
   renderOverlay();
+  renderCandidateSummary();
   renderStages(run.stages);
   renderArtifacts(run.artifacts);
   renderRunList();
@@ -438,6 +497,7 @@ async function loadRun(candidateId, options = {}) {
     if (refreshJob) {
       await refreshSamJobStatus();
     }
+    await loadSubjectCandidateCache(candidateId);
   } catch (error) {
     setSaveState("Load failed", "is-error");
     els.runTitle.textContent = "Could not load CV run";
@@ -447,6 +507,7 @@ async function loadRun(candidateId, options = {}) {
 
 function addPromptPoint(event) {
   if (!state.current || state.promptMode === "box") return;
+  if (event.target?.dataset?.candidateIndex != null) return;
   const point = pointerPosition(event);
   if (state.promptMode === "negative") {
     state.selection.negative_points = [...(state.selection.negative_points || []), point];
@@ -473,6 +534,7 @@ function boxFromPoints(start, end) {
 function undoSelection() {
   if (state.selection.box) {
     state.selection.box = null;
+    state.selection.subject_candidate = null;
   } else if (state.promptMode === "negative" && state.selection.negative_points?.length) {
     state.selection.negative_points = state.selection.negative_points.slice(0, -1);
   } else if (state.selection.positive_points?.length) {
@@ -484,9 +546,75 @@ function undoSelection() {
 }
 
 function clearSelection() {
-  state.selection = { type: "unset", positive_points: [], negative_points: [], box: null, mask_path: null };
+  state.selection = {
+    type: "unset",
+    positive_points: [],
+    negative_points: [],
+    box: null,
+    mask_path: null,
+    subject_candidate: null,
+  };
   state.draftBox = null;
   renderOverlay();
+}
+
+async function detectSubjectCandidates(options = {}) {
+  const { force = true } = options;
+  if (!state.current) return;
+  const candidateId = state.current.candidate_id;
+  try {
+    state.subjectCandidatesStatus = "loading";
+    renderCandidateSummary();
+    setSaveState("Finding runners", "is-saving");
+    const payload = await fetchJson(`/api/cv-runs/${candidateId}/subject-candidates`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ quality_mode: "native", force }),
+    });
+    if (state.current?.candidate_id !== candidateId) return;
+    state.subjectCandidates = payload.subject_candidates?.candidates || [];
+    state.subjectCandidatesStatus = "ready";
+    renderOverlay();
+    renderCandidateSummary();
+    setSaveState(state.subjectCandidates.length ? "Candidates ready" : "No runners found");
+  } catch (error) {
+    state.subjectCandidatesStatus = "error";
+    els.candidateSummary.textContent = String(error);
+    renderCandidateSummary();
+    setSaveState("Candidate scan failed", "is-error");
+  }
+}
+
+async function loadSubjectCandidateCache(candidateId) {
+  try {
+    const payload = await fetchJson(
+      `/api/cv-runs/${candidateId}/subject-candidates?quality_mode=native`
+    );
+    if (state.current?.candidate_id !== candidateId) return;
+    const subjectCandidates = payload.subject_candidates;
+    if (!subjectCandidates?.cached || !subjectCandidates.candidates?.length) return;
+    state.subjectCandidates = subjectCandidates.candidates;
+    state.subjectCandidatesStatus = "ready";
+    renderOverlay();
+    renderCandidateSummary();
+  } catch {
+    // Candidate cache is optional; keep the manual selector available if it is absent.
+  }
+}
+
+async function selectSubjectCandidate(candidate) {
+  if (!candidate?.box) return;
+  state.selection = {
+    type: "box",
+    positive_points: [],
+    negative_points: [],
+    box: candidate.box,
+    mask_path: null,
+    subject_candidate: candidate,
+  };
+  renderOverlay();
+  renderCandidateSummary();
+  await savePrompt({ rerender: false, flash: true });
 }
 
 async function savePrompt(options = {}) {
@@ -602,6 +730,7 @@ els.promptModes.forEach((button) => {
 });
 
 els.promptOverlay.addEventListener("click", addPromptPoint);
+els.detectCandidatesButton.addEventListener("click", () => detectSubjectCandidates({ force: true }));
 
 els.promptOverlay.addEventListener("pointerdown", (event) => {
   if (state.promptMode !== "box") return;

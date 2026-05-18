@@ -686,6 +686,7 @@ textarea {
 
 .prompt-box {
   vector-effect: non-scaling-stroke;
+  pointer-events: none;
   fill: rgba(167, 124, 78, 0.16);
   stroke: rgba(255, 250, 243, 0.96);
   stroke-width: 0.004;
@@ -693,6 +694,33 @@ textarea {
 
 .prompt-box.is-draft {
   stroke-dasharray: 0.018 0.014;
+}
+
+.subject-candidate-box {
+  vector-effect: non-scaling-stroke;
+  cursor: pointer;
+  fill: rgba(255, 250, 243, 0.04);
+  stroke: rgba(255, 250, 243, 0.76);
+  stroke-dasharray: 0.012 0.01;
+  stroke-width: 0.003;
+  transition: fill 0.18s ease;
+}
+
+.subject-candidate-box:hover {
+  fill: rgba(167, 124, 78, 0.28);
+  stroke: rgba(255, 250, 243, 0.98);
+}
+
+.subject-candidate-box.is-selected {
+  fill: rgba(82, 116, 94, 0.24);
+  stroke: rgba(255, 250, 243, 0.98);
+  stroke-dasharray: none;
+}
+
+.candidate-readout {
+  margin-top: 10px;
+  color: var(--muted);
+  font-size: 0.78rem;
 }
 
 .prompt-readout {

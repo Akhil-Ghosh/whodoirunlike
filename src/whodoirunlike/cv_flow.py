@@ -395,6 +395,11 @@ def build_cv_run_manifest(clip: ReviewedClip, run_dir: Path) -> dict[str, Any]:
                 "output": paths["form_features"],
                 "arrays": paths["form_feature_arrays"],
             },
+            "artifact_tables": {
+                "status": "pending",
+                "recommended_tool": "JSONL to Parquet artifact exporter",
+                "outputs": [paths["poses"], paths["densepose_parquet"], paths["fused_form_parquet"]],
+            },
             "openpose": {
                 "status": "pending_optional",
                 "recommended_tool": "OpenPose BODY_25 optional benchmark",

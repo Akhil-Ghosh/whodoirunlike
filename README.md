@@ -286,11 +286,30 @@ This writes `tracklets.parquet`, `tracklets.jsonl`, `reid.parquet`, `reid.jsonl`
 a lightweight prompt/template tracker with HSV-histogram ReID, meant as the runnable local
 contract before the YOLO + BoT-SORT + OSNet backend lands.
 
+Run the full local pipeline when optional model dependencies are installed:
+
+```bash
+python scripts/run_full_cv_pipeline.py \
+  --candidate-id <candidate_id> \
+  --pose-backend mmpose_rtmpose_l_384 \
+  --mask-quality-mode native
+```
+
+Postprocess and triage artifacts:
+
+```bash
+python scripts/export_cv_tables.py --candidate-id <candidate_id>
+python scripts/run_qc_metrics.py --candidate-id <candidate_id>
+python scripts/build_uncertainty_queue.py
+python scripts/run_multiview_match.py --candidate-a <candidate_id_a> --candidate-b <candidate_id_b>
+```
+
 1. Use `run_clip_curation.py` to propose ranked windows before human review.
 2. Keep the prompt-frame UI focused on target identity, not manual masking.
 3. Run detector/tracker/ReID outputs: `tracklets.parquet`, `reid.parquet`, and identity-risk flags.
-4. Gate SAM 3.1 mask generation on the chosen target track.
+4. Gate SAM 3.1 mask generation on the chosen target track and write `masks.jsonl`.
 5. Scale RTMPose/RTMW pose extraction over approved identity-stable segments.
 6. Add Detectron2 DensePose as a secondary body-surface layer after target tracking is stable.
-7. Generate fused confidence-weighted form artifacts and `qc_metrics.json`.
-8. Compute pose-sequence similarities and Gemini render embeddings.
+7. Export Parquet tables, generate fused confidence-weighted form artifacts, and write `qc_metrics.json`.
+8. Build the active-learning uncertainty queue and multi-view matching artifacts.
+9. Compute pose-sequence similarities and Gemini render embeddings.

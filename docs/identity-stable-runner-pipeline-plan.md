@@ -108,14 +108,17 @@ Recommended initial thresholds are stored in `track_seed.json` when a CV run is 
 
 ### Phase 4: Mask Propagation
 
-Current default:
+Implemented:
 
 - SAM 3.1 MLX via `scripts/run_sam31_mlx_mask.py`
+- Track-gated SAM 3.1 candidate selection when `tracklets.jsonl` or `tracklets.parquet`
+  exists
+- `masks.jsonl` with uncompressed RLE mask records
+- Legacy SAM 2.1 fallback also writes `masks.jsonl`
 
 Future production target:
 
-- Run SAM 3.1 or Cutie on a dynamic crop around the selected target track.
-- Write `masks.jsonl` as COCO RLE-style frame records once pycocotools is introduced.
+- Add Cutie as an alternate dynamic-crop propagator around the selected target track.
 - Keep `runner_mask.mp4`, `masked_runner.mp4`, and `qa_overlay.mp4` as review artifacts.
 
 Reset or request review when identity similarity drops, target area jumps, centroid motion
@@ -123,11 +126,17 @@ spikes, or two candidate tracks have near-tied ReID similarity.
 
 ### Phase 5: Pose, Fusion, And QC
 
-Current and next pose path:
+Implemented:
 
 - RTMLib RTMPose/RTMW is available through `mmpose_runner.py`.
 - OpenPose and MediaPipe remain baseline runners.
-- `poses.parquet` is reserved for analytics-friendly pose tables.
+- `scripts/export_cv_tables.py` writes `poses.parquet`, `densepose.parquet`, and
+  `fused_form.parquet`
+- `scripts/run_qc_metrics.py` writes `qc_metrics.json`
+- `scripts/build_uncertainty_queue.py` builds the active-learning queue
+- `scripts/run_multiview_match.py` scores synchronized or unrelated cross-view matches
+- `scripts/run_full_cv_pipeline.py` runs the full local sequence when optional model
+  dependencies are installed
 
 QC should report:
 
@@ -147,7 +156,9 @@ target_prompt -> person_prompt.json
 track_seed.json
 view_bucket.json
 tracklets.parquet
+tracklets.jsonl
 reid.parquet
+reid.jsonl
 masks.jsonl
 mask_logits.zarr
 poses.parquet

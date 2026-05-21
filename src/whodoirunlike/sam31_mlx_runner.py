@@ -9,6 +9,8 @@ import numpy as np
 from PIL import Image
 
 from whodoirunlike.cv_flow import utc_now_iso
+from whodoirunlike.artifact_tables import read_jsonl
+from whodoirunlike.mask_artifacts import write_masks_jsonl_from_video
 from whodoirunlike.sam2_runner import (
     extract_video_frames,
     inspect_video,
@@ -200,6 +202,45 @@ def choose_detection_index(
     return best_index
 
 
+def load_track_boxes(
+    manifest_paths: dict[str, Any],
+    *,
+    width: int,
+    height: int,
+) -> dict[int, np.ndarray]:
+    tracklets_path = Path(str(manifest_paths.get("tracklets_jsonl") or ""))
+    rows: list[dict[str, Any]] = []
+    if tracklets_path.exists():
+        rows = read_jsonl(tracklets_path)
+    else:
+        parquet_path = Path(str(manifest_paths.get("tracklets") or ""))
+        if parquet_path.exists():
+            try:
+                import pyarrow.parquet as pq
+            except ModuleNotFoundError:
+                rows = []
+            else:
+                rows = pq.read_table(parquet_path).to_pylist()
+
+    boxes: dict[int, np.ndarray] = {}
+    for row in rows:
+        if not row.get("is_target", True):
+            continue
+        if row.get("identity_state") not in (None, "", "usable"):
+            continue
+        values = [row.get("bbox_x"), row.get("bbox_y"), row.get("bbox_width"), row.get("bbox_height")]
+        if any(value in (None, "") for value in values):
+            continue
+        x = float(values[0]) * max(width - 1, 1)
+        y = float(values[1]) * max(height - 1, 1)
+        w = float(values[2]) * max(width - 1, 1)
+        h = float(values[3]) * max(height - 1, 1)
+        if w <= 1 or h <= 1:
+            continue
+        boxes[int(row["frame_index"])] = np.array([x, y, x + w, y + h], dtype=np.float32)
+    return boxes
+
+
 def detect_frame(
     *,
     frame_path: Path,
@@ -387,12 +428,14 @@ def detect_sam31_subject_candidates(
 def update_manifest_after_sam31_mlx(
     manifest_path: Path,
     metadata_path: Path,
+    masks_jsonl_path: Path,
     *,
     model_path: str,
     prompts: Sequence[str],
     quality_mode: str,
     resolution: int,
     elapsed_seconds: float,
+    mask_summary: dict[str, Any] | None = None,
 ) -> None:
     manifest = read_json(manifest_path)
     stages = manifest.setdefault("stages", {})
@@ -406,6 +449,9 @@ def update_manifest_after_sam31_mlx(
     whole_runner_mask["resolution"] = resolution
     whole_runner_mask["elapsed_seconds"] = round(elapsed_seconds, 3)
     whole_runner_mask["metadata"] = str(metadata_path)
+    whole_runner_mask["masks_jsonl"] = str(masks_jsonl_path)
+    if mask_summary:
+        whole_runner_mask["mask_summary"] = mask_summary
     stages.setdefault("renders", {})["status"] = "partial_complete"
     manifest["updated_at"] = utc_now_iso()
     write_json(manifest_path, manifest)
@@ -455,6 +501,7 @@ def run_sam31_mlx_mask(
     prompt_frame = max(0, min(prompt["frame_index"], len(frame_paths) - 1))
     prompt_box = prompt.get("box")
     prompt_anchor = normalized_prompt_anchor(prompt, video_meta["width"], video_meta["height"])
+    track_boxes = load_track_boxes(paths, width=video_meta["width"], height=video_meta["height"])
     total_frames = len(frame_paths)
 
     def emit_progress(
@@ -518,7 +565,7 @@ def run_sam31_mlx_mask(
                     scores=result.scores,
                     width=video_meta["width"],
                     height=video_meta["height"],
-                    prompt_box=prompt_box,
+                    prompt_box=track_boxes.get(frame_index, prompt_box),
                     prompt_anchor=prompt_anchor,
                     previous_box=previous_box,
                 )
@@ -570,16 +617,20 @@ def run_sam31_mlx_mask(
         qa_overlay_path=qa_overlay_path,
         metadata_path=metadata_path,
     )
+    masks_jsonl_path = Path(str(paths.get("masks_jsonl") or run_dir / "masks.jsonl"))
+    mask_summary = write_masks_jsonl_from_video(runner_mask_path, masks_jsonl_path)
     elapsed_seconds = time.perf_counter() - start
     emit_progress("completed", total_frames)
     update_manifest_after_sam31_mlx(
         manifest_path,
         metadata_path,
+        masks_jsonl_path,
         model_path=model_path,
         prompts=prompts,
         quality_mode=quality_mode,
         resolution=resolved_resolution,
         elapsed_seconds=elapsed_seconds,
+        mask_summary=mask_summary,
     )
     return {
         "candidate_id": manifest["candidate_id"],
@@ -597,4 +648,7 @@ def run_sam31_mlx_mask(
         "masked_runner": str(masked_runner_path),
         "qa_overlay": str(qa_overlay_path),
         "metadata": str(metadata_path),
+        "masks_jsonl": str(masks_jsonl_path),
+        "mask_summary": mask_summary,
+        "track_gated_frames": len(track_boxes),
     }

@@ -1459,6 +1459,8 @@ def _run_pipeline_job(config: ReviewAppConfig, candidate_id: str, options: dict[
         ("densepose", "detectron2_densepose"),
         ("fusion", "form_fusion"),
         ("features", "form_feature_compiler"),
+        ("artifact_tables", "jsonl_to_parquet"),
+        ("qc", "qc_metrics"),
     ]
     step_count = len(steps)
     try:
@@ -1546,6 +1548,36 @@ def _run_pipeline_job(config: ReviewAppConfig, candidate_id: str, options: dict[
         if features_job.get("status") != "completed":
             raise RuntimeError(features_job.get("error") or "Feature compilation failed")
 
+        from whodoirunlike.artifact_tables import export_cv_tables
+        from whodoirunlike.qc import run_qc_metrics
+
+        _set_pipeline_job(
+            candidate_id,
+            {
+                "progress": _pipeline_progress(
+                    phase="running",
+                    stage="artifact_tables",
+                    step_index=6,
+                    step_count=step_count,
+                    stage_job={"progress": {"percent": 0.5}},
+                )
+            },
+        )
+        table_result = export_cv_tables(_cv_run_dir(config, candidate_id))
+        _set_pipeline_job(
+            candidate_id,
+            {
+                "progress": _pipeline_progress(
+                    phase="running",
+                    stage="qc",
+                    step_index=7,
+                    step_count=step_count,
+                    stage_job={"progress": {"percent": 0.5}},
+                )
+            },
+        )
+        qc_result = run_qc_metrics(_cv_run_dir(config, candidate_id))
+
         _set_pipeline_job(
             candidate_id,
             {
@@ -1556,14 +1588,16 @@ def _run_pipeline_job(config: ReviewAppConfig, candidate_id: str, options: dict[
                     "steps": steps,
                     "pose_backend": pose_backend,
                     "mask_quality_mode": mask_quality_mode,
+                    "artifact_tables": table_result,
+                    "qc_metrics": qc_result,
                 },
                 "progress": {
                     "phase": "completed",
-                    "stage": "features",
+                    "stage": "qc",
                     "step_index": step_count,
                     "step_count": step_count,
                     "percent": 1.0,
-                    "stage_progress": features_job.get("progress") or {},
+                    "stage_progress": {"percent": 1.0},
                 },
             },
         )
@@ -1611,7 +1645,7 @@ def start_pipeline_job(
             "error": None,
             "result": None,
             "options": options,
-            "progress": _pipeline_progress(phase="queued", stage="identity", step_index=0, step_count=6),
+            "progress": _pipeline_progress(phase="queued", stage="identity", step_index=0, step_count=8),
         },
     )
     thread = threading.Thread(

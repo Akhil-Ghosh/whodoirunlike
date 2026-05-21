@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://whodoirunlike.com/schemas/qc_metrics.schema.json",
+  "title": "CV QC Metrics",
+  "type": "object",
+  "required": ["version", "candidate_id", "identity", "mask", "pose", "fused", "uncertainty_score"],
+  "properties": {
+    "version": { "const": 1 },
+    "candidate_id": { "type": ["string", "null"] },
+    "updated_at": { "type": "string" },
+    "uncertainty_score": { "type": "number", "minimum": 0, "maximum": 1 },
+    "identity": { "type": "object" },
+    "mask": { "type": "object" },
+    "pose": { "type": "object" },
+    "fused": { "type": "object" }
+  }
+}

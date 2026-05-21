@@ -9,6 +9,7 @@ import cv2
 import numpy as np
 
 from whodoirunlike.cv_flow import utc_now_iso
+from whodoirunlike.mask_artifacts import write_masks_jsonl_from_video
 from whodoirunlike.video_io import make_browser_playable_mp4s
 
 
@@ -235,11 +236,20 @@ def write_mask_outputs(
             f.write(json.dumps(row) + "\n")
 
 
-def update_manifest_after_sam2(manifest_path: Path, metadata_path: Path) -> None:
+def update_manifest_after_sam2(
+    manifest_path: Path,
+    metadata_path: Path,
+    masks_jsonl_path: Path | None = None,
+    mask_summary: dict[str, Any] | None = None,
+) -> None:
     manifest = read_json(manifest_path)
     stages = manifest.setdefault("stages", {})
     stages.setdefault("whole_runner_mask", {})["status"] = "complete"
     stages["whole_runner_mask"]["metadata"] = str(metadata_path)
+    if masks_jsonl_path:
+        stages["whole_runner_mask"]["masks_jsonl"] = str(masks_jsonl_path)
+    if mask_summary:
+        stages["whole_runner_mask"]["mask_summary"] = mask_summary
     stages.setdefault("renders", {})["status"] = "partial_complete"
     manifest["updated_at"] = utc_now_iso()
     write_json(manifest_path, manifest)
@@ -281,6 +291,7 @@ def run_sam2_mask(
     masked_runner_path = Path(paths["masked_runner"])
     qa_overlay_path = Path(paths["qa_overlay"])
     metadata_path = run_dir / "runner_mask_metadata.jsonl"
+    masks_jsonl_path = Path(str(paths.get("masks_jsonl") or run_dir / "masks.jsonl"))
     frame_dir = run_dir / "sam2_frames"
 
     video_meta = inspect_video(source_segment)
@@ -326,7 +337,8 @@ def run_sam2_mask(
         qa_overlay_path=qa_overlay_path,
         metadata_path=metadata_path,
     )
-    update_manifest_after_sam2(manifest_path, metadata_path)
+    mask_summary = write_masks_jsonl_from_video(runner_mask_path, masks_jsonl_path)
+    update_manifest_after_sam2(manifest_path, metadata_path, masks_jsonl_path, mask_summary)
     return {
         "candidate_id": manifest["candidate_id"],
         "device": selected_device,
@@ -337,4 +349,6 @@ def run_sam2_mask(
         "masked_runner": str(masked_runner_path),
         "qa_overlay": str(qa_overlay_path),
         "metadata": str(metadata_path),
+        "masks_jsonl": str(masks_jsonl_path),
+        "mask_summary": mask_summary,
     }

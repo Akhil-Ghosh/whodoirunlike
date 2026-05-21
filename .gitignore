@@ -16,6 +16,7 @@ out/
 artifacts/**
 clips/**
 models/**
+/yolo*.pt
 !artifacts/.gitkeep
 !clips/.gitkeep
 !models/.gitkeep

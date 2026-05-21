@@ -869,6 +869,12 @@ def update_manifest_after_identity_tracking(
     result: dict[str, Any],
 ) -> None:
     manifest = read_json(manifest_path)
+    paths = manifest.setdefault("paths", {})
+    paths["tracklets"] = str(tracklets_path)
+    paths["tracklets_jsonl"] = str(tracklets_jsonl_path)
+    paths["reid"] = str(reid_path)
+    paths["reid_jsonl"] = str(reid_jsonl_path)
+    paths["qc_metrics"] = str(qc_metrics_path)
     stages = manifest.setdefault("stages", {})
     detector_tracker = stages.setdefault("detector_tracker", {})
     detector_tracker.update(

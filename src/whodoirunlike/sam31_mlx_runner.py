@@ -33,6 +33,13 @@ SAM31_MAX_AUTO_RESOLUTION = 2016
 Sam31ProgressCallback = Callable[[dict[str, Any]], None]
 
 
+def _existing_file_path(value: Any) -> Path | None:
+    if value in (None, ""):
+        return None
+    path = Path(str(value))
+    return path if path.is_file() else None
+
+
 def build_sam31_progress(
     *,
     phase: str,
@@ -208,13 +215,13 @@ def load_track_boxes(
     width: int,
     height: int,
 ) -> dict[int, np.ndarray]:
-    tracklets_path = Path(str(manifest_paths.get("tracklets_jsonl") or ""))
+    tracklets_path = _existing_file_path(manifest_paths.get("tracklets_jsonl"))
     rows: list[dict[str, Any]] = []
-    if tracklets_path.exists():
+    if tracklets_path:
         rows = read_jsonl(tracklets_path)
     else:
-        parquet_path = Path(str(manifest_paths.get("tracklets") or ""))
-        if parquet_path.exists():
+        parquet_path = _existing_file_path(manifest_paths.get("tracklets"))
+        if parquet_path:
             try:
                 import pyarrow.parquet as pq
             except ModuleNotFoundError:
@@ -450,6 +457,8 @@ def update_manifest_after_sam31_mlx(
     whole_runner_mask["elapsed_seconds"] = round(elapsed_seconds, 3)
     whole_runner_mask["metadata"] = str(metadata_path)
     whole_runner_mask["masks_jsonl"] = str(masks_jsonl_path)
+    whole_runner_mask.pop("error", None)
+    manifest.setdefault("paths", {})["masks_jsonl"] = str(masks_jsonl_path)
     if mask_summary:
         whole_runner_mask["mask_summary"] = mask_summary
     stages.setdefault("renders", {})["status"] = "partial_complete"
@@ -501,7 +510,13 @@ def run_sam31_mlx_mask(
     prompt_frame = max(0, min(prompt["frame_index"], len(frame_paths) - 1))
     prompt_box = prompt.get("box")
     prompt_anchor = normalized_prompt_anchor(prompt, video_meta["width"], video_meta["height"])
-    track_boxes = load_track_boxes(paths, width=video_meta["width"], height=video_meta["height"])
+    detector_tracker = manifest.get("stages", {}).get("detector_tracker", {})
+    track_paths = {**paths}
+    if isinstance(detector_tracker, dict):
+        for key in ("tracklets_jsonl", "tracklets"):
+            if detector_tracker.get(key):
+                track_paths[key] = detector_tracker[key]
+    track_boxes = load_track_boxes(track_paths, width=video_meta["width"], height=video_meta["height"])
     total_frames = len(frame_paths)
 
     def emit_progress(

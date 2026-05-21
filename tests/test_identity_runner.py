@@ -6,8 +6,14 @@ from pathlib import Path
 import cv2
 import numpy as np
 import pyarrow.parquet as pq
+import pytest
 
-from whodoirunlike.identity_runner import prompt_initial_box, run_identity_tracking
+from whodoirunlike import identity_runner
+from whodoirunlike.identity_runner import (
+    canonical_identity_backend,
+    prompt_initial_box,
+    run_identity_tracking,
+)
 
 
 def write_identity_video(path: Path) -> None:
@@ -103,7 +109,7 @@ def test_run_identity_tracking_writes_parquet_and_updates_manifest(tmp_path: Pat
     run_dir.mkdir(parents=True)
     write_identity_run(run_dir)
 
-    result = run_identity_tracking(run_dir=run_dir)
+    result = run_identity_tracking(run_dir=run_dir, backend="prompt_template_tracker_v1")
 
     assert result["status"] == "complete"
     assert result["backend"] == "prompt_template_tracker_v1"
@@ -128,3 +134,81 @@ def test_run_identity_tracking_writes_parquet_and_updates_manifest(tmp_path: Pat
     assert track_seed["target_track_id"] == 1
     assert track_seed["status"] == "complete"
     assert qc_metrics["identity"]["frame_count"] == 18
+
+
+def test_canonical_identity_backend_accepts_plan_aliases() -> None:
+    assert canonical_identity_backend("botsort") == "boxmot_botsort"
+    assert canonical_identity_backend("deep-oc-sort") == "boxmot_deepocsort"
+    assert canonical_identity_backend("template") == "prompt_template_tracker_v1"
+
+
+class FakeBoxes:
+    def __init__(self, frame_index: int) -> None:
+        x = 22 + frame_index
+        self.xyxy = np.array([[x, 18, x + 14, 48]], dtype=np.float32)
+        self.conf = np.array([0.91], dtype=np.float32)
+        self.cls = np.array([0], dtype=np.float32)
+
+
+class FakeResult:
+    def __init__(self, frame_index: int) -> None:
+        self.boxes = FakeBoxes(frame_index)
+
+
+class FakeYolo:
+    def __init__(self) -> None:
+        self.frame_index = 0
+
+    def predict(self, frame: np.ndarray, **kwargs: object) -> list[FakeResult]:
+        result = FakeResult(self.frame_index)
+        self.frame_index += 1
+        return [result]
+
+
+class FakeBoxmotTracker:
+    def update(self, detections: np.ndarray, frame: np.ndarray) -> np.ndarray:
+        if detections.size == 0:
+            return np.empty((0, 8), dtype=np.float32)
+        det = detections[0]
+        return np.array([[det[0], det[1], det[2], det[3], 7, det[4], 0, 0]], dtype=np.float32)
+
+
+def test_boxmot_identity_tracking_uses_prompt_to_select_target_track(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_dir = tmp_path / "cv_runs" / "identity-clip"
+    run_dir.mkdir(parents=True)
+    write_identity_run(run_dir)
+
+    monkeypatch.setattr(
+        identity_runner,
+        "identity_setup_status",
+        lambda backend=None: {"ready": True, "reasons": [], "install_command": None},
+    )
+    monkeypatch.setattr(identity_runner, "_load_yolo_model", lambda detector_model: FakeYolo())
+    monkeypatch.setattr(
+        identity_runner,
+        "_create_boxmot_tracker",
+        lambda backend, reid_weights, device, half: FakeBoxmotTracker(),
+    )
+
+    result = run_identity_tracking(run_dir=run_dir, backend="boxmot_botsort", device="cpu")
+
+    assert result["status"] == "complete"
+    assert result["backend"] == "boxmot_botsort"
+    assert result["metrics"]["target_track_id"] == 7
+    assert result["metrics"]["boxmot_tracker"] == "BotSort"
+
+    track_table = pq.read_table(run_dir / "tracklets.parquet")
+    track_rows = track_table.to_pylist()
+    assert track_table.num_rows == 18
+    assert {row["track_id"] for row in track_rows} == {7}
+    assert all(row["is_target"] for row in track_rows)
+
+    manifest = json.loads((run_dir / "cv_run_manifest.json").read_text(encoding="utf-8"))
+    track_seed = json.loads((run_dir / "track_seed.json").read_text(encoding="utf-8"))
+    assert manifest["stages"]["detector_tracker"]["backend"] == "boxmot_botsort"
+    assert track_seed["backend"] == "boxmot_botsort"
+    assert track_seed["tracker"]["name"] == "BotSort"
+    assert track_seed["target_track_id"] == 7

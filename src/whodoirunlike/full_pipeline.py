@@ -6,7 +6,7 @@ from typing import Any
 from whodoirunlike.artifact_tables import export_cv_tables
 from whodoirunlike.form_features import compile_form_features
 from whodoirunlike.fusion_runner import run_fused_form
-from whodoirunlike.identity_runner import run_identity_tracking
+from whodoirunlike.identity_runner import DEFAULT_IDENTITY_BACKEND, run_identity_tracking
 from whodoirunlike.qc import run_qc_metrics
 from whodoirunlike.sam31_mlx_runner import run_sam31_mlx_mask
 
@@ -14,12 +14,13 @@ from whodoirunlike.sam31_mlx_runner import run_sam31_mlx_mask
 def run_full_cv_pipeline(
     *,
     run_dir: Path,
+    identity_backend: str = DEFAULT_IDENTITY_BACKEND,
     pose_backend: str = "mmpose_rtmpose_l_384",
     mask_quality_mode: str = "native",
     skip_densepose: bool = False,
 ) -> dict[str, Any]:
     result: dict[str, Any] = {"run_dir": str(run_dir), "steps": []}
-    identity = run_identity_tracking(run_dir=run_dir)
+    identity = run_identity_tracking(run_dir=run_dir, backend=identity_backend)
     result["steps"].append({"stage": "identity", "result": identity})
 
     mask = run_sam31_mlx_mask(run_dir=run_dir, quality_mode=mask_quality_mode)

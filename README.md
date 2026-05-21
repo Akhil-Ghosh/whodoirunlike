@@ -282,9 +282,17 @@ python scripts/run_identity_track.py --candidate-id <candidate_id>
 ```
 
 This writes `tracklets.parquet`, `tracklets.jsonl`, `reid.parquet`, `reid.jsonl`, updates
-`track_seed.json`, and adds identity metrics to `qc_metrics.json`. The current backend is
-a lightweight prompt/template tracker with HSV-histogram ReID, meant as the runnable local
-contract before the YOLO + BoT-SORT + OSNet backend lands.
+`track_seed.json`, and adds identity metrics to `qc_metrics.json`. The default backend is
+YOLO person detection plus BoxMOT BoT-SORT with OSNet-style ReID weights:
+
+```bash
+python -m pip install -e ".[mot]"
+python scripts/run_identity_track.py --candidate-id <candidate_id> --backend boxmot_botsort
+```
+
+Use `--backend boxmot_deepocsort` for the hard-occlusion A/B path,
+`--backend boxmot_bytetrack` for the fastest baseline, or
+`--backend prompt_template_tracker_v1` for the deterministic local fallback.
 
 Run the full local pipeline when optional model dependencies are installed:
 

@@ -35,6 +35,10 @@ sam31 = [
 identity = [
   "pyarrow>=16",
 ]
+mot = [
+  "boxmot>=17",
+  "ultralytics>=8.3",
+]
 mmpose = [
   "onnxruntime>=1.20",
   "rtmlib>=0.0.15",

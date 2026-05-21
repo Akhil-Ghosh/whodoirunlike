@@ -826,7 +826,9 @@ def _manifest_stage_key(stage: str) -> str:
 
 def _cv_stage_backend(stage: str, options: dict[str, Any] | None = None) -> str:
     if stage == "identity":
-        return "prompt_template_tracker_v1"
+        from whodoirunlike.identity_runner import DEFAULT_IDENTITY_BACKEND, canonical_identity_backend
+
+        return canonical_identity_backend((options or {}).get("identity_backend") or DEFAULT_IDENTITY_BACKEND)
     if stage == "pose":
         pose_backend = _validate_pose_backend((options or {}).get("pose_backend"))
         if pose_backend == "openpose":
@@ -1130,6 +1132,7 @@ def _run_cv_stage_job(
 
             result = run_identity_tracking(
                 run_dir=_cv_run_dir(config, candidate_id),
+                backend=backend,
                 progress_callback=publish_progress,
             )
         elif stage == "pose":
@@ -1453,7 +1456,7 @@ def _wait_for_pipeline_child(
 
 def _run_pipeline_job(config: ReviewAppConfig, candidate_id: str, options: dict[str, Any]) -> None:
     steps = [
-        ("identity", "prompt_template_tracker_v1"),
+        ("identity", _cv_stage_backend("identity", options)),
         ("mask", "sam31_mlx"),
         ("pose", _validate_pose_backend(options.get("pose_backend"))),
         ("densepose", "detectron2_densepose"),

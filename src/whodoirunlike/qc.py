@@ -28,6 +28,8 @@ def _load_rows(path: Path) -> list[dict[str, Any]]:
 
 def identity_metrics(tracklets_path: Path) -> dict[str, Any]:
     rows = _load_rows(tracklets_path)
+    target_rows = [row for row in rows if row.get("is_target", True)]
+    rows = target_rows or rows
     total = len(rows)
     if not rows:
         return {"frame_count": 0, "target_identity_stability_rate": 0.0}

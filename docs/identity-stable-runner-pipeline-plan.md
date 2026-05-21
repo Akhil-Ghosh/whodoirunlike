@@ -94,15 +94,23 @@ Run:
 python scripts/run_identity_track.py --candidate-id <candidate_id>
 ```
 
-The current local backend is `prompt_template_tracker_v1`: a prompt-seeded template tracker
-with HSV-histogram ReID. It is intentionally small and deterministic so the artifact
-contract can be exercised before the heavier production backend lands.
+The default backend is now `boxmot_botsort`: YOLO person detections feeding BoxMOT
+BoT-SORT with OSNet-style ReID weights. Install the optional MOT stack before running it:
 
-Next implementation target:
+```bash
+python -m pip install -e ".[mot]"
+```
 
-- Replace or augment the baseline with BoT-SORT plus Torchreid OSNet embeddings.
-- Keep Deep OC-SORT as the hard-occlusion A/B test and ByteTrack as the fastest baseline.
-- Mark identity-risk intervals instead of smoothing through them.
+Selectable backends:
+
+- `boxmot_botsort`: production default for identity preservation.
+- `boxmot_deepocsort`: hard-occlusion A/B test.
+- `boxmot_bytetrack`: fastest tracking-by-detection baseline.
+- `prompt_template_tracker_v1`: deterministic fallback for local artifact-contract tests.
+
+The tracker writes all tracklets but marks only the prompt-selected target as `is_target`.
+SAM 3.1 then consumes only usable target rows, so segmentation is gated by explicit
+detector/tracker/ReID identity logic rather than acting as the identity engine.
 
 Recommended initial thresholds are stored in `track_seed.json` when a CV run is prepared.
 

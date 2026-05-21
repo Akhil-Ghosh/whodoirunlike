@@ -80,10 +80,27 @@ runners, and an optional loose box only when overlap makes the click ambiguous.
 
 ### Phase 3: Detector, Tracker, And ReID
 
+Implemented foundation:
+
+- `src/whodoirunlike/identity_runner.py`
+- `scripts/run_identity_track.py`
+- Writes `tracklets.parquet`, `tracklets.jsonl`, `reid.parquet`, `reid.jsonl`
+- Updates `track_seed.json`, `cv_run_manifest.json`, and identity metrics in
+  `qc_metrics.json`
+
+Run:
+
+```bash
+python scripts/run_identity_track.py --candidate-id <candidate_id>
+```
+
+The current local backend is `prompt_template_tracker_v1`: a prompt-seeded template tracker
+with HSV-histogram ReID. It is intentionally small and deterministic so the artifact
+contract can be exercised before the heavier production backend lands.
+
 Next implementation target:
 
-- Add a detector/tracker runner that writes `tracklets.parquet` and `reid.parquet`.
-- Start with BoT-SORT plus Torchreid OSNet embeddings.
+- Replace or augment the baseline with BoT-SORT plus Torchreid OSNet embeddings.
 - Keep Deep OC-SORT as the hard-occlusion A/B test and ByteTrack as the fastest baseline.
 - Mark identity-risk intervals instead of smoothing through them.
 

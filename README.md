@@ -275,9 +275,20 @@ python scripts/prepare_single_clip_cv_run.py --candidate-id <candidate_id>
 
 This creates `artifacts/cv_runs/<candidate_id>/source_segment.mp4`, a prompt frame, a `person_prompt.json` target-selection stub, `track_seed.json`, `view_bucket.json`, and a `cv_run_manifest.json` describing the identity, segmentation, pose, DensePose, render, and feature stages.
 
+After saving the target prompt, run the identity stage:
+
+```bash
+python scripts/run_identity_track.py --candidate-id <candidate_id>
+```
+
+This writes `tracklets.parquet`, `tracklets.jsonl`, `reid.parquet`, `reid.jsonl`, updates
+`track_seed.json`, and adds identity metrics to `qc_metrics.json`. The current backend is
+a lightweight prompt/template tracker with HSV-histogram ReID, meant as the runnable local
+contract before the YOLO + BoT-SORT + OSNet backend lands.
+
 1. Use `run_clip_curation.py` to propose ranked windows before human review.
 2. Keep the prompt-frame UI focused on target identity, not manual masking.
-3. Add detector/tracker/ReID outputs: `tracklets.parquet`, `reid.parquet`, and identity-risk flags.
+3. Run detector/tracker/ReID outputs: `tracklets.parquet`, `reid.parquet`, and identity-risk flags.
 4. Gate SAM 3.1 mask generation on the chosen target track.
 5. Scale RTMPose/RTMW pose extraction over approved identity-stable segments.
 6. Add Detectron2 DensePose as a secondary body-surface layer after target tracking is stable.

@@ -247,7 +247,8 @@ def test_save_cv_prompt_updates_selection_and_stage_state(tmp_path: Path) -> Non
     assert saved_prompt["selection"]["positive_points"] == [{"x": 1.0, "y": 0.5}]
     assert saved_prompt["selection"]["negative_points"] == [{"x": 0.1, "y": 0.0}]
     assert saved_manifest["stages"]["person_prompt"]["status"] == "ready"
-    assert saved_manifest["stages"]["whole_runner_mask"]["status"] == "pending_run"
+    assert saved_manifest["stages"]["detector_tracker"]["status"] == "pending_run"
+    assert saved_manifest["stages"]["whole_runner_mask"]["status"] == "pending_tracker"
     assert payload["stages"]["person_prompt"]["status"] == "ready"
     assert list_cv_runs(config)[0]["prompt_ready"] is True
 

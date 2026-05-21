@@ -48,7 +48,9 @@ CV_ARTIFACT_LABELS = {
     "track_seed": "Track seed",
     "view_bucket": "View bucket",
     "tracklets": "Tracklets",
+    "tracklets_jsonl": "Tracklets JSONL",
     "reid": "ReID embeddings",
+    "reid_jsonl": "ReID JSONL",
     "pose_landmarks": "Pose landmarks",
     "poses": "Pose table",
     "runner_mask": "Runner mask",
@@ -98,7 +100,7 @@ CV_STAGE_JOBS: dict[str, dict[str, Any]] = {}
 CV_STAGE_JOBS_LOCK = threading.Lock()
 PIPELINE_JOBS: dict[str, dict[str, Any]] = {}
 PIPELINE_JOBS_LOCK = threading.Lock()
-CV_STAGE_VALUES = {"pose", "densepose", "fusion", "features", "openpose"}
+CV_STAGE_VALUES = {"identity", "pose", "densepose", "fusion", "features", "openpose"}
 DENSEPOSE_CONFIG_ENV = "DENSEPOSE_CONFIG"
 DENSEPOSE_WEIGHTS_ENV = "DENSEPOSE_WEIGHTS"
 DENSEPOSE_DEVICE_ENV = "DENSEPOSE_DEVICE"
@@ -563,9 +565,12 @@ def _stage_payload(manifest: dict[str, Any], prompt: dict[str, Any]) -> dict[str
     prompt_ready = selection.get("type") not in (None, "", "unset")
     if prompt_ready and isinstance(stages.get("person_prompt"), dict):
         stages["person_prompt"]["status"] = "ready"
+    if prompt_ready and isinstance(stages.get("detector_tracker"), dict):
+        if stages["detector_tracker"].get("status") == "pending_prompt":
+            stages["detector_tracker"]["status"] = "pending_run"
     if prompt_ready and isinstance(stages.get("whole_runner_mask"), dict):
         if stages["whole_runner_mask"].get("status") == "pending_prompt":
-            stages["whole_runner_mask"]["status"] = "pending_run"
+            stages["whole_runner_mask"]["status"] = "pending_tracker"
     return stages
 
 
@@ -728,9 +733,12 @@ def save_cv_prompt(config: ReviewAppConfig, candidate_id: str, data: dict[str, A
 
     stages = manifest.setdefault("stages", {})
     stages.setdefault("person_prompt", {})["status"] = "ready"
+    detector_tracker = stages.setdefault("detector_tracker", {})
+    if detector_tracker.get("status") in (None, "", "pending_prompt"):
+        detector_tracker["status"] = "pending_run"
     whole_runner_mask = stages.setdefault("whole_runner_mask", {})
     if whole_runner_mask.get("status") in (None, "", "pending_prompt"):
-        whole_runner_mask["status"] = "pending_run"
+        whole_runner_mask["status"] = "pending_tracker"
     manifest["updated_at"] = utc_now_iso()
     _write_json(manifest_path, manifest)
     return load_cv_run_payload(config, candidate_id)
@@ -807,6 +815,8 @@ def _validate_cv_stage(stage: str) -> str:
 
 
 def _manifest_stage_key(stage: str) -> str:
+    if stage == "identity":
+        return "detector_tracker"
     if stage == "fusion":
         return "fused_form"
     if stage == "features":
@@ -815,6 +825,8 @@ def _manifest_stage_key(stage: str) -> str:
 
 
 def _cv_stage_backend(stage: str, options: dict[str, Any] | None = None) -> str:
+    if stage == "identity":
+        return "prompt_template_tracker_v1"
     if stage == "pose":
         pose_backend = _validate_pose_backend((options or {}).get("pose_backend"))
         if pose_backend == "openpose":
@@ -1113,7 +1125,14 @@ def _run_cv_stage_job(
 
     backend = _cv_stage_backend(stage, options)
     try:
-        if stage == "pose":
+        if stage == "identity":
+            from whodoirunlike.identity_runner import run_identity_tracking
+
+            result = run_identity_tracking(
+                run_dir=_cv_run_dir(config, candidate_id),
+                progress_callback=publish_progress,
+            )
+        elif stage == "pose":
             pose_backend = _validate_pose_backend(options.get("pose_backend"))
             if pose_backend == "openpose":
                 from whodoirunlike.openpose_runner import run_openpose_pose
@@ -1223,6 +1242,10 @@ def _start_cv_stage_job(
     run_dir = _cv_run_dir(config, candidate_id)
     if not (run_dir / "cv_run_manifest.json").exists():
         raise FileNotFoundError(f"CV run not found: {candidate_id}")
+    if stage == "identity":
+        prompt = _read_json(run_dir / "person_prompt.json", {})
+        if prompt.get("selection", {}).get("type") in (None, "", "unset"):
+            raise ValueError("Select and save the runner before identity tracking")
     if stage == "pose":
         pose_backend = _validate_pose_backend(options.get("pose_backend"))
         if pose_backend == "openpose":
@@ -1299,6 +1322,10 @@ def pose_job_status(candidate_id: str) -> dict[str, Any]:
     return cv_stage_job_status("pose", candidate_id)
 
 
+def identity_job_status(candidate_id: str) -> dict[str, Any]:
+    return cv_stage_job_status("identity", candidate_id)
+
+
 def densepose_job_status(candidate_id: str) -> dict[str, Any]:
     return cv_stage_job_status("densepose", candidate_id)
 
@@ -1327,6 +1354,10 @@ def start_pose_job(
         "pose",
         options={"pose_backend": _validate_pose_backend(pose_backend)},
     )
+
+
+def start_identity_job(config: ReviewAppConfig, candidate_id: str) -> dict[str, Any]:
+    return start_cv_stage_job(config, candidate_id, "identity")
 
 
 def start_densepose_job(config: ReviewAppConfig, candidate_id: str) -> dict[str, Any]:
@@ -1422,6 +1453,7 @@ def _wait_for_pipeline_child(
 
 def _run_pipeline_job(config: ReviewAppConfig, candidate_id: str, options: dict[str, Any]) -> None:
     steps = [
+        ("identity", "prompt_template_tracker_v1"),
         ("mask", "sam31_mlx"),
         ("pose", _validate_pose_backend(options.get("pose_backend"))),
         ("densepose", "detectron2_densepose"),
@@ -1433,8 +1465,26 @@ def _run_pipeline_job(config: ReviewAppConfig, candidate_id: str, options: dict[
         mask_quality_mode = str(options.get("mask_quality_mode") or "native")
         _set_pipeline_job(
             candidate_id,
-            {"progress": _pipeline_progress(phase="starting", stage="mask", step_index=0, step_count=step_count)},
+            {
+                "progress": _pipeline_progress(
+                    phase="starting",
+                    stage="identity",
+                    step_index=0,
+                    step_count=step_count,
+                )
+            },
         )
+        start_identity_job(config, candidate_id)
+        identity_job = _wait_for_pipeline_child(
+            candidate_id,
+            stage="identity",
+            step_index=0,
+            step_count=step_count,
+            status_fn=identity_job_status,
+        )
+        if identity_job.get("status") != "completed":
+            raise RuntimeError(identity_job.get("error") or "Identity tracking failed")
+
         start_mask_job(
             config,
             candidate_id,
@@ -1444,7 +1494,7 @@ def _run_pipeline_job(config: ReviewAppConfig, candidate_id: str, options: dict[
         mask_job = _wait_for_pipeline_child(
             candidate_id,
             stage="mask",
-            step_index=0,
+            step_index=1,
             step_count=step_count,
             status_fn=mask_job_status,
         )
@@ -1456,7 +1506,7 @@ def _run_pipeline_job(config: ReviewAppConfig, candidate_id: str, options: dict[
         pose_job = _wait_for_pipeline_child(
             candidate_id,
             stage="pose",
-            step_index=1,
+            step_index=2,
             step_count=step_count,
             status_fn=pose_job_status,
         )
@@ -1467,7 +1517,7 @@ def _run_pipeline_job(config: ReviewAppConfig, candidate_id: str, options: dict[
         densepose_job = _wait_for_pipeline_child(
             candidate_id,
             stage="densepose",
-            step_index=2,
+            step_index=3,
             step_count=step_count,
             status_fn=densepose_job_status,
         )
@@ -1478,7 +1528,7 @@ def _run_pipeline_job(config: ReviewAppConfig, candidate_id: str, options: dict[
         fusion_job = _wait_for_pipeline_child(
             candidate_id,
             stage="fusion",
-            step_index=3,
+            step_index=4,
             step_count=step_count,
             status_fn=fusion_job_status,
         )
@@ -1489,7 +1539,7 @@ def _run_pipeline_job(config: ReviewAppConfig, candidate_id: str, options: dict[
         features_job = _wait_for_pipeline_child(
             candidate_id,
             stage="features",
-            step_index=4,
+            step_index=5,
             step_count=step_count,
             status_fn=features_job_status,
         )
@@ -1561,7 +1611,7 @@ def start_pipeline_job(
             "error": None,
             "result": None,
             "options": options,
-            "progress": _pipeline_progress(phase="queued", stage="mask", step_index=0, step_count=5),
+            "progress": _pipeline_progress(phase="queued", stage="identity", step_index=0, step_count=6),
         },
     )
     thread = threading.Thread(
@@ -1655,6 +1705,9 @@ class ReviewRequestHandler(BaseHTTPRequestHandler):
         if parsed.path.startswith("/api/cv-runs/") and parsed.path.endswith("/subject-candidates"):
             self._handle_get_subject_candidates(parsed)
             return
+        if parsed.path.startswith("/api/cv-runs/") and parsed.path.endswith("/identity"):
+            self._handle_get_identity_job(parsed.path)
+            return
         if parsed.path.startswith("/api/cv-runs/") and parsed.path.endswith("/pose"):
             self._handle_get_pose_job(parsed.path)
             return
@@ -1697,6 +1750,9 @@ class ReviewRequestHandler(BaseHTTPRequestHandler):
             return
         if parsed.path.startswith("/api/cv-runs/") and parsed.path.endswith("/subject-candidates"):
             self._handle_detect_subject_candidates(parsed.path)
+            return
+        if parsed.path.startswith("/api/cv-runs/") and parsed.path.endswith("/identity"):
+            self._handle_start_identity_job(parsed.path)
             return
         if parsed.path.startswith("/api/cv-runs/") and parsed.path.endswith("/pose"):
             self._handle_start_pose_job(parsed.path)
@@ -1808,6 +1864,29 @@ class ReviewRequestHandler(BaseHTTPRequestHandler):
             )
         except json.JSONDecodeError as exc:
             self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+        except FileNotFoundError as exc:
+            self._send_json({"error": str(exc)}, status=HTTPStatus.NOT_FOUND)
+        except ValueError as exc:
+            self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+
+    def _handle_get_identity_job(self, path: str) -> None:
+        candidate_id = unquote(
+            path.removeprefix("/api/cv-runs/").removesuffix("/identity")
+        ).strip("/")
+        try:
+            run_dir = _cv_run_dir(self.config, candidate_id)
+            if not (run_dir / "cv_run_manifest.json").exists():
+                raise FileNotFoundError(f"CV run not found: {candidate_id}")
+            self._send_json({"job": identity_job_status(candidate_id)})
+        except (FileNotFoundError, ValueError) as exc:
+            self._send_json({"error": str(exc)}, status=HTTPStatus.NOT_FOUND)
+
+    def _handle_start_identity_job(self, path: str) -> None:
+        candidate_id = unquote(
+            path.removeprefix("/api/cv-runs/").removesuffix("/identity")
+        ).strip("/")
+        try:
+            self._send_json({"job": start_identity_job(self.config, candidate_id)})
         except FileNotFoundError as exc:
             self._send_json({"error": str(exc)}, status=HTTPStatus.NOT_FOUND)
         except ValueError as exc:

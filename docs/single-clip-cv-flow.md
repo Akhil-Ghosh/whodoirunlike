@@ -51,7 +51,8 @@ artifacts/cv_runs/<candidate_id>/
 1. Trim the reviewed interval into `source_segment.mp4`.
 2. Extract a clean prompt frame near the middle of the interval.
 3. Show the prompt frame in an internal UI and let the reviewer click the target runner or draw a loose box.
-4. Use detector/tracker/ReID logic to lock onto the intended person through the segment.
+4. Run `scripts/run_identity_track.py` to lock onto the intended person through the segment
+   and write `tracklets.parquet`, `reid.parquet`, and identity QC metrics.
 5. Run SAM 3.1 or a future Cutie-style propagator on the known target identity, preferably on a dynamic crop.
 6. Run pose estimation across the segment and save per-frame landmarks, confidence, bounding boxes, and dropped-frame reasons. The pose runner should hard-mask each source frame with `runner_mask.mp4` before inference when a mask is available, then reject pose candidates that do not overlap the runner mask.
 7. Generate a normalized skeleton-render video for Gemini pose-render embeddings.

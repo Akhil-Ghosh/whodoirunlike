@@ -517,7 +517,7 @@ function renderPipelineJobStatus(job = state.pipelineJob) {
   els.runPipelineButton.title = setupWarning
     ? setupWarning
     : hasPrompt
-      ? `Run SAM 3.1, ${poseBackendLabel()}, DensePose, Fusion, and Features`
+      ? `Run Identity, SAM 3.1, ${poseBackendLabel()}, DensePose, Fusion, and Features`
     : "Select and save the runner first";
 }
 

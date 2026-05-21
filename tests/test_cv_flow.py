@@ -83,6 +83,8 @@ def test_prepare_single_clip_cv_run_creates_artifact_scaffold(tmp_path: Path) ->
     assert prompt_payload["frame"]["width"] == 64
     assert manifest["review"]["camera_angle"] == "side"
     assert manifest["paths"]["target_prompt"] == manifest["paths"]["person_prompt"]
+    assert manifest["paths"]["tracklets_jsonl"].endswith("tracklets.jsonl")
+    assert manifest["paths"]["reid_jsonl"].endswith("reid.jsonl")
     assert manifest["stages"]["detector_tracker"]["status"] == "pending_prompt"
     assert manifest["stages"]["whole_runner_mask"]["status"] == "pending_prompt"
     assert manifest["stages"]["densepose"]["status"] == "pending_runner_mask"

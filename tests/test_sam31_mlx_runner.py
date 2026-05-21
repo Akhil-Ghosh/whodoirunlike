@@ -41,6 +41,38 @@ def test_choose_detection_prefers_prompt_overlap_over_raw_score() -> None:
     assert selected == 0
 
 
+def test_choose_detection_strict_prompt_box_rejects_wrong_identity() -> None:
+    masks = np.ones((2, 100, 100), dtype=np.uint8)
+    selected = choose_detection_index(
+        boxes=np.array([[0, 0, 20, 20], [70, 70, 95, 95]], dtype=float),
+        masks=masks,
+        scores=np.array([0.3, 0.99]),
+        width=100,
+        height=100,
+        prompt_box=np.array([0, 0, 22, 22], dtype=float),
+        strict_prompt_box=True,
+        min_prompt_iou=0.3,
+    )
+
+    assert selected == 0
+
+
+def test_choose_detection_strict_prompt_box_returns_none_when_track_is_unmatched() -> None:
+    masks = np.ones((1, 100, 100), dtype=np.uint8)
+    selected = choose_detection_index(
+        boxes=np.array([[70, 70, 95, 95]], dtype=float),
+        masks=masks,
+        scores=np.array([0.99]),
+        width=100,
+        height=100,
+        prompt_box=np.array([0, 0, 22, 22], dtype=float),
+        strict_prompt_box=True,
+        min_prompt_iou=0.3,
+    )
+
+    assert selected is None
+
+
 def test_resolve_sam31_resolution_modes() -> None:
     assert resolve_sam31_resolution(mode="fast") == 224
     assert resolve_sam31_resolution(mode="native") == 1008

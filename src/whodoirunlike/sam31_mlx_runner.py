@@ -182,6 +182,8 @@ def choose_detection_index(
     prompt_box: np.ndarray | None = None,
     prompt_anchor: tuple[float, float] | None = None,
     previous_box: np.ndarray | None = None,
+    strict_prompt_box: bool = False,
+    min_prompt_iou: float = 0.3,
 ) -> int | None:
     if len(scores) == 0:
         return None
@@ -191,18 +193,30 @@ def choose_detection_index(
     for index, score in enumerate(scores):
         box = boxes[index]
         mask = masks[index]
+        mask_bbox = mask_box(mask)
+        candidate_box = mask_bbox if mask_bbox is not None else box
         mask_area = float((mask > 0).sum()) / float(width * height)
         continuity = box_iou(box, previous_box)
-        prompt_overlap = box_iou(box, prompt_box)
+        prompt_overlap = max(box_iou(box, prompt_box), box_iou(candidate_box, prompt_box))
+        if strict_prompt_box and prompt_box is not None and prompt_overlap < min_prompt_iou:
+            continue
         anchor = point_score(prompt_anchor, box, width, height)
         compact_area = 1.0 if 0.006 <= mask_area <= 0.18 else 0.25
-        total = (
-            float(score) * 0.45
-            + continuity * 2.25
-            + prompt_overlap * (1.6 if previous_box is None else 0.4)
-            + anchor * (0.85 if previous_box is None else 0.25)
-            + compact_area * 0.2
-        )
+        if strict_prompt_box and prompt_box is not None:
+            total = (
+                prompt_overlap * 5.0
+                + float(score) * 0.25
+                + continuity * 0.2
+                + compact_area * 0.1
+            )
+        else:
+            total = (
+                float(score) * 0.45
+                + continuity * 2.25
+                + prompt_overlap * (1.6 if previous_box is None else 0.4)
+                + anchor * (0.85 if previous_box is None else 0.25)
+                + compact_area * 0.2
+            )
         if total > best_score:
             best_score = total
             best_index = index
@@ -517,6 +531,7 @@ def run_sam31_mlx_mask(
             if detector_tracker.get(key):
                 track_paths[key] = detector_tracker[key]
     track_boxes = load_track_boxes(track_paths, width=video_meta["width"], height=video_meta["height"])
+    strict_identity_gate = bool(track_boxes)
     total_frames = len(frame_paths)
 
     def emit_progress(
@@ -567,6 +582,18 @@ def run_sam31_mlx_mask(
         previous_box = initial_box
         with wired_limit(model):
             for frame_index in indices:
+                identity_box = track_boxes.get(frame_index)
+                if strict_identity_gate and identity_box is None:
+                    processed_frames += 1
+                    emit_progress(
+                        "identity_gated",
+                        processed_frames,
+                        frame_index=frame_index,
+                        direction=direction,
+                        detection_count=0,
+                        selected=False,
+                    )
+                    continue
                 _, result = detect_frame(
                     frame_path=frame_paths[frame_index],
                     predictor=predictor,
@@ -580,9 +607,10 @@ def run_sam31_mlx_mask(
                     scores=result.scores,
                     width=video_meta["width"],
                     height=video_meta["height"],
-                    prompt_box=track_boxes.get(frame_index, prompt_box),
-                    prompt_anchor=prompt_anchor,
+                    prompt_box=identity_box if identity_box is not None else prompt_box,
+                    prompt_anchor=box_center(identity_box) if identity_box is not None else prompt_anchor,
                     previous_box=previous_box,
+                    strict_prompt_box=identity_box is not None,
                 )
                 if selected_index is None:
                     processed_frames += 1
@@ -601,7 +629,7 @@ def run_sam31_mlx_mask(
                     selected_box = result.boxes[selected_index]
                 masks_by_frame[frame_index] = mask
                 selected_boxes[frame_index] = selected_box
-                previous_box = selected_box
+                previous_box = identity_box if identity_box is not None else selected_box
                 processed_frames += 1
                 emit_progress(
                     "detecting",

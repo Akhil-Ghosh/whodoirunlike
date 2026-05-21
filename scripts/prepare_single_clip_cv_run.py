@@ -44,6 +44,8 @@ def main() -> None:
                 "source_segment": manifest["paths"]["source_segment"],
                 "prompt_frame": manifest["paths"]["prompt_frame"],
                 "person_prompt": manifest["paths"]["person_prompt"],
+                "track_seed": manifest["paths"]["track_seed"],
+                "view_bucket": manifest["paths"]["view_bucket"],
                 "manifest": str(run_dir / "cv_run_manifest.json"),
             }
         )

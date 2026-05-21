@@ -12,7 +12,9 @@ This pipeline separates four jobs that are easy to blur together:
 
 ### Whole-Runner Segmentation
 
-Use SAM 2.1 video prediction for the whole-runner mask. Meta documents SAM 2 as promptable with click, box, or mask inputs on an image or video frame, and its video predictor is designed to propagate a selected object through a video.
+Use SAM 3.1 as the current SAM-style whole-runner mask backend. The mask pass should run
+after target identity is seeded by the prompt and guarded by detector/tracker/ReID logic;
+it should not be treated as the identity engine by itself.
 
 Inputs:
 
@@ -22,11 +24,14 @@ Inputs:
 Outputs:
 
 - `runner_mask.mp4`
+- `masks.jsonl` once RLE mask storage is added
 - per-frame mask metadata: area, centroid, confidence/proxy score, dropped-frame reason
 
 ### Pose Features
 
-Use MediaPipe Pose Landmarker first because it is fast and already in the repo. The matching feature should be pose-sequence based, not mask-pixel based.
+Use RTMPose/RTMW through RTMLib as the preferred production pose path. Keep OpenPose and
+MediaPipe Pose Landmarker as baselines and fallback options. The matching feature should
+be pose-sequence based, not mask-pixel based.
 
 When `runner_mask.mp4` exists, pose extraction should treat it as a hard target constraint: black out non-runner pixels before MediaPipe inference, then prefer or reject pose candidates by overlap with the mask. This prevents crowded race footage from snapping to a clearer neighboring runner.
 
@@ -81,12 +86,13 @@ red/yellow questionable joints, and a confidence badge.
 
 2. Open `prompt_frame.jpg` and select the target runner.
 3. Write the selection into `person_prompt.json`.
-4. Run SAM 2.1 over `source_segment.mp4` to produce `runner_mask.mp4`.
-5. Run pose extraction on the segment, constrained by the runner mask when possible.
-6. Run DensePose on masked/cropped frames.
-7. Run the fused form stage.
-8. Render `fused_overlay.mp4`.
-9. Inspect the overlay before adding the clip to the scaled corpus.
+4. Run detector/tracker/ReID target seeding when available.
+5. Run SAM 3.1 over the target identity to produce `runner_mask.mp4`.
+6. Run pose extraction on the segment, constrained by the runner mask when possible.
+7. Run DensePose on masked/cropped frames.
+8. Run the fused form stage.
+9. Render `fused_overlay.mp4`.
+10. Inspect the overlay before adding the clip to the scaled corpus.
 
 ## Prompt Selection
 

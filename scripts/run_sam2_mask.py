@@ -12,7 +12,7 @@ from whodoirunlike.sam2_runner import run_sam2_mask
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Run SAM 2 whole-runner tracking for one CV run.")
+    parser = argparse.ArgumentParser(description="Run legacy SAM 2 whole-runner tracking for one CV run.")
     parser.add_argument("--candidate-id", required=True)
     parser.add_argument("--run-root", type=Path, default=DEFAULT_CV_RUN_ROOT)
     parser.add_argument("--checkpoint", type=Path, default=Path("models/sam2/sam2.1_hiera_tiny.pt"))

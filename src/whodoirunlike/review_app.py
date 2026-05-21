@@ -44,14 +44,25 @@ CV_ARTIFACT_LABELS = {
     "source_segment": "Source segment",
     "prompt_frame": "Prompt frame",
     "person_prompt": "Person prompt",
+    "target_prompt": "Target prompt",
+    "track_seed": "Track seed",
+    "view_bucket": "View bucket",
+    "tracklets": "Tracklets",
+    "reid": "ReID embeddings",
     "pose_landmarks": "Pose landmarks",
+    "poses": "Pose table",
     "runner_mask": "Runner mask",
+    "masks_jsonl": "Mask RLE",
+    "mask_logits": "Mask logits",
     "densepose": "DensePose",
+    "densepose_parquet": "DensePose table",
     "fused_form": "Fused form",
+    "fused_form_parquet": "Fused form table",
     "skeleton_render": "Skeleton render",
     "masked_runner": "Masked runner",
     "qa_overlay": "QA overlay",
     "fused_overlay": "Fused overlay",
+    "qc_metrics": "QC metrics",
     "features": "Features",
     "form_features": "Form features",
     "form_feature_arrays": "Feature arrays",
@@ -64,8 +75,8 @@ CV_ARTIFACT_LABELS = {
 SAM2_CHECKPOINT = Path("models/sam2/sam2.1_hiera_tiny.pt")
 SAM2_MODEL_CFG = "configs/sam2.1/sam2.1_hiera_t.yaml"
 MASK_BACKENDS = {
-    "sam2": "SAM 2.1 local",
     "sam31_mlx": "SAM 3.1 MLX",
+    "sam2": "Legacy SAM 2.1 local",
 }
 POSE_BACKENDS = {
     "openpose": "OpenPose BODY_25",
@@ -524,7 +535,7 @@ def _artifact_kind(path: Path) -> str:
         return "image"
     if suffix in {".mp4", ".webm", ".mov"}:
         return "video"
-    if suffix in {".json", ".jsonl"}:
+    if suffix in {".json", ".jsonl", ".parquet", ".npz", ".zarr"}:
         return "data"
     return "file"
 

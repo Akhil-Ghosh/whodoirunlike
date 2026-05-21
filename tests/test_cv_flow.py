@@ -69,12 +69,20 @@ def test_prepare_single_clip_cv_run_creates_artifact_scaffold(tmp_path: Path) ->
 
     run_dir = tmp_path / "cv_runs" / "clip-001"
     prompt_payload = json.loads((run_dir / "person_prompt.json").read_text(encoding="utf-8"))
+    track_seed = json.loads((run_dir / "track_seed.json").read_text(encoding="utf-8"))
+    view_bucket = json.loads((run_dir / "view_bucket.json").read_text(encoding="utf-8"))
 
     assert (run_dir / "source_segment.mp4").exists()
     assert (run_dir / "prompt_frame.jpg").exists()
     assert (run_dir / "cv_run_manifest.json").exists()
+    assert (run_dir / "track_seed.json").exists()
+    assert (run_dir / "view_bucket.json").exists()
     assert prompt_payload["selection"]["type"] == "unset"
+    assert track_seed["tracker"]["preferred"] == "BoT-SORT"
+    assert view_bucket["view_bucket"] == "side"
     assert prompt_payload["frame"]["width"] == 64
     assert manifest["review"]["camera_angle"] == "side"
+    assert manifest["paths"]["target_prompt"] == manifest["paths"]["person_prompt"]
+    assert manifest["stages"]["detector_tracker"]["status"] == "pending_prompt"
     assert manifest["stages"]["whole_runner_mask"]["status"] == "pending_prompt"
     assert manifest["stages"]["densepose"]["status"] == "pending_runner_mask"

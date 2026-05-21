@@ -341,7 +341,7 @@ function samStatusLabel(status) {
 
 function backendLabel(backend = state.maskBackend) {
   if (backend === "sam31_mlx") return "SAM 3.1 MLX";
-  return "SAM 2.1";
+  return "Legacy SAM 2.1";
 }
 
 function poseBackendLabel(backend = state.poseBackend) {

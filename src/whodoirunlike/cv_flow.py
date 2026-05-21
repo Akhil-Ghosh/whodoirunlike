@@ -208,26 +208,90 @@ def build_prompt_payload(clip: ReviewedClip, prompt_frame_path: Path, frame_meta
             "mask_path": None,
         },
         "instructions": (
-            "Select the target runner with one torso/hip positive point first. "
-            "Use a loose box only when multiple runners overlap."
+            "Select the target runner identity with one torso/hip positive point first. "
+            "Use a loose box and negative points only when nearby runners overlap."
+        ),
+        "updated_at": utc_now_iso(),
+    }
+
+
+def build_track_seed_payload(clip: ReviewedClip, prompt_path: Path) -> dict[str, Any]:
+    return {
+        "version": 1,
+        "candidate_id": clip.candidate_id,
+        "runner_name": clip.runner_name,
+        "status": "pending_detector_tracker",
+        "target_track_id": None,
+        "prompt_path": str(prompt_path),
+        "detector": {
+            "preferred": "YOLO11/YOLO26 person detector or segmenter",
+            "class_filter": ["person"],
+        },
+        "tracker": {
+            "preferred": "BoT-SORT",
+            "ab_test": ["Deep OC-SORT", "ByteTrack"],
+            "track_buffer": 45,
+            "high_thresh": 0.5,
+            "low_thresh": 0.1,
+            "new_track_thresh": 0.6,
+            "match_thresh": 0.8,
+        },
+        "reid": {
+            "preferred": "Torchreid OSNet-AIN x1.0",
+            "cosine_accept": 0.65,
+            "cosine_recover": 0.58,
+        },
+        "identity_risk_flags": [
+            "target similarity below recovery threshold",
+            "area jump above rolling median tolerance",
+            "centroid velocity spike after overlap",
+            "near-tied tracker candidates",
+        ],
+        "updated_at": utc_now_iso(),
+    }
+
+
+def build_view_bucket_payload(clip: ReviewedClip) -> dict[str, Any]:
+    return {
+        "version": 1,
+        "candidate_id": clip.candidate_id,
+        "runner_name": clip.runner_name,
+        "view_bucket": clip.camera_angle or "unknown",
+        "source": "human_review",
+        "multi_view_mode": "single_view_or_unsynchronized",
+        "notes": (
+            "Use geometry only for synchronized overlapping cameras. "
+            "For unrelated clips, treat angle matching as retrieval metadata."
         ),
         "updated_at": utc_now_iso(),
     }
 
 
 def build_cv_run_manifest(clip: ReviewedClip, run_dir: Path) -> dict[str, Any]:
+    prompt_path = run_dir / "person_prompt.json"
     paths = {
         "source_segment": str(run_dir / "source_segment.mp4"),
         "prompt_frame": str(run_dir / "prompt_frame.jpg"),
-        "person_prompt": str(run_dir / "person_prompt.json"),
+        "person_prompt": str(prompt_path),
+        "target_prompt": str(prompt_path),
+        "track_seed": str(run_dir / "track_seed.json"),
+        "view_bucket": str(run_dir / "view_bucket.json"),
+        "tracklets": str(run_dir / "tracklets.parquet"),
+        "reid": str(run_dir / "reid.parquet"),
+        "masks_jsonl": str(run_dir / "masks.jsonl"),
+        "mask_logits": str(run_dir / "mask_logits.zarr"),
+        "poses": str(run_dir / "poses.parquet"),
         "pose_landmarks": str(run_dir / "pose_landmarks.jsonl"),
         "runner_mask": str(run_dir / "runner_mask.mp4"),
         "densepose": str(run_dir / "densepose.jsonl"),
+        "densepose_parquet": str(run_dir / "densepose.parquet"),
         "fused_form": str(run_dir / "fused_form.jsonl"),
+        "fused_form_parquet": str(run_dir / "fused_form.parquet"),
         "skeleton_render": str(run_dir / "skeleton_render.mp4"),
         "masked_runner": str(run_dir / "masked_runner.mp4"),
         "qa_overlay": str(run_dir / "qa_overlay.mp4"),
         "fused_overlay": str(run_dir / "fused_overlay.mp4"),
+        "qc_metrics": str(run_dir / "qc_metrics.json"),
         "features": str(run_dir / "features.json"),
         "form_features": str(run_dir / "form_features.json"),
         "form_feature_arrays": str(run_dir / "form_features.npz"),
@@ -243,6 +307,7 @@ def build_cv_run_manifest(clip: ReviewedClip, run_dir: Path) -> dict[str, Any]:
         "candidate_id": clip.candidate_id,
         "runner_name": clip.runner_name,
         "runner_slug": clip.runner_slug,
+        "implementation_goal": "identity_stable_runner_clip",
         "source": {
             "platform": "youtube" if "youtube.com" in clip.source_url else "local",
             "url": clip.source_url,
@@ -262,27 +327,47 @@ def build_cv_run_manifest(clip: ReviewedClip, run_dir: Path) -> dict[str, Any]:
         "paths": paths,
         "stages": {
             "trim": {"status": "complete", "output": paths["source_segment"]},
-            "person_prompt": {"status": "needs_selection", "output": paths["person_prompt"]},
+            "clip_curation": {
+                "status": "manual_interval_selected",
+                "recommended_tool": "run_clip_curation.py ranked windows before review",
+            },
+            "person_prompt": {
+                "status": "needs_selection",
+                "recommended_tool": "single positive torso/hip click plus optional box/negative points",
+                "output": paths["person_prompt"],
+            },
+            "detector_tracker": {
+                "status": "pending_prompt",
+                "recommended_tool": "YOLO11/YOLO26 person detections + BoT-SORT + OSNet ReID",
+                "track_seed": paths["track_seed"],
+                "tracklets": paths["tracklets"],
+                "reid": paths["reid"],
+            },
             "whole_runner_mask": {
                 "status": "pending_prompt",
-                "recommended_tool": "SAM 2.1 video predictor",
+                "recommended_tool": "SAM 3.1 MLX now; Cutie planned after target track is known",
                 "output": paths["runner_mask"],
                 "metadata": str(run_dir / "runner_mask_metadata.jsonl"),
+                "masks_jsonl": paths["masks_jsonl"],
+                "gated_by": "detector_tracker",
             },
             "pose": {
                 "status": "pending",
-                "recommended_tool": "OpenPose default; RTMLib RTMW/RTMPose and MediaPipe selectable",
+                "recommended_tool": "RTMPose/RTMW via RTMLib preferred; OpenPose and MediaPipe as baselines",
                 "output": paths["pose_landmarks"],
+                "parquet": paths["poses"],
             },
             "densepose": {
                 "status": "pending_runner_mask",
                 "recommended_tool": "Detectron2 projects/DensePose",
                 "output": paths["densepose"],
+                "parquet": paths["densepose_parquet"],
             },
             "fused_form": {
                 "status": "pending_pose_and_densepose",
-                "recommended_tool": "MediaPipe + SAM mask + DensePose fusion",
+                "recommended_tool": "identity-gated mask + pose confidence + optional DensePose fusion",
                 "output": paths["fused_form"],
+                "parquet": paths["fused_form_parquet"],
                 "overlay": paths["fused_overlay"],
             },
             "renders": {
@@ -295,6 +380,11 @@ def build_cv_run_manifest(clip: ReviewedClip, run_dir: Path) -> dict[str, Any]:
                 ],
             },
             "features": {"status": "pending", "output": paths["features"]},
+            "qc_metrics": {
+                "status": "pending",
+                "recommended_tool": "TISR, occlusion recovery latency, mask churn, pose visibility",
+                "output": paths["qc_metrics"],
+            },
             "form_features": {
                 "status": "pending_fused_form",
                 "recommended_tool": "Pose sequence + fused confidence feature compiler",
@@ -311,12 +401,13 @@ def build_cv_run_manifest(clip: ReviewedClip, run_dir: Path) -> dict[str, Any]:
         "occlusion_policy": {
             "drop_frame_when": [
                 "target mask missing",
+                "target tracker missing or identity-risk flagged",
                 "pose_confidence_mean below threshold",
                 "visible key landmarks absent for more than a short gap",
                 "mask area jumps enough to imply target switch",
             ],
-            "short_gap_strategy": "interpolate pose only for short gaps; never synthesize masks",
-            "long_gap_strategy": "split into subsegments or request another prompt",
+            "short_gap_strategy": "interpolate pose only for short low-risk gaps; never interpolate through identity risk",
+            "long_gap_strategy": "split into subsegments, recover with ReID, or request another prompt",
             "matching_strategy": "weight similarity by per-frame confidence and ignore dropped frames",
         },
     }
@@ -347,6 +438,12 @@ def prepare_single_clip_cv_run(
     frame_meta = extract_prompt_frame(segment_path, prompt_frame_path, force=force)
     if force or not prompt_path.exists():
         write_json(prompt_path, build_prompt_payload(clip, prompt_frame_path, frame_meta))
+    track_seed_path = run_dir / "track_seed.json"
+    if force or not track_seed_path.exists():
+        write_json(track_seed_path, build_track_seed_payload(clip, prompt_path))
+    view_bucket_path = run_dir / "view_bucket.json"
+    if force or not view_bucket_path.exists():
+        write_json(view_bucket_path, build_view_bucket_payload(clip))
     manifest = build_cv_run_manifest(clip, run_dir)
     write_json(manifest_output_path, manifest)
     return manifest

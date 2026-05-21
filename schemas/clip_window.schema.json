@@ -1,0 +1,142 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://whodoirunlike.com/schemas/clip_window.schema.json",
+  "title": "Clip Window Curation Manifest",
+  "type": "object",
+  "required": ["version", "pipeline_goal", "videos", "windows"],
+  "properties": {
+    "version": { "const": 1 },
+    "created_at": { "type": "string" },
+    "pipeline_goal": { "const": "identity_stable_runner_clip_proposal" },
+    "videos": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/video_manifest" }
+    },
+    "windows": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/window" }
+    }
+  },
+  "$defs": {
+    "video_manifest": {
+      "type": "object",
+      "required": ["version", "source_video", "video", "settings", "shots", "windows"],
+      "properties": {
+        "version": { "const": 1 },
+        "created_at": { "type": "string" },
+        "pipeline_goal": { "const": "identity_stable_runner_clip_proposal" },
+        "source_video": { "type": "string" },
+        "video": {
+          "type": "object",
+          "required": ["path", "width", "height", "fps", "frame_count", "duration_seconds"],
+          "properties": {
+            "path": { "type": "string" },
+            "width": { "type": "integer", "minimum": 0 },
+            "height": { "type": "integer", "minimum": 0 },
+            "fps": { "type": "number", "minimum": 0 },
+            "frame_count": { "type": "integer", "minimum": 0 },
+            "duration_seconds": { "type": "number", "minimum": 0 }
+          }
+        },
+        "settings": {
+          "type": "object",
+          "required": [
+            "top_k",
+            "view_bucket",
+            "use_scenedetect",
+            "window_seconds",
+            "step_seconds",
+            "sample_fps",
+            "scoring_model",
+            "needs_detector_pose_rescore"
+          ],
+          "properties": {
+            "top_k": { "type": "integer", "minimum": 0 },
+            "view_bucket": {
+              "enum": ["side", "diagonal", "front", "rear", "mixed", "unknown"]
+            },
+            "use_scenedetect": { "type": "boolean" },
+            "window_seconds": { "type": "number", "exclusiveMinimum": 0 },
+            "step_seconds": { "type": "number", "exclusiveMinimum": 0 },
+            "sample_fps": { "type": "number", "exclusiveMinimum": 0 },
+            "scoring_model": { "type": "string" },
+            "needs_detector_pose_rescore": { "type": "boolean" }
+          }
+        },
+        "shots": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/shot" }
+        },
+        "windows_considered": { "type": "integer", "minimum": 0 },
+        "windows": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/window" }
+        }
+      }
+    },
+    "shot": {
+      "type": "object",
+      "required": ["start_seconds", "end_seconds", "source"],
+      "properties": {
+        "start_seconds": { "type": "number", "minimum": 0 },
+        "end_seconds": { "type": "number", "minimum": 0 },
+        "duration_seconds": { "type": "number", "minimum": 0 },
+        "source": { "type": "string" }
+      }
+    },
+    "window": {
+      "type": "object",
+      "required": [
+        "window_id",
+        "video_path",
+        "start_seconds",
+        "end_seconds",
+        "duration_seconds",
+        "shot_index",
+        "rank",
+        "score",
+        "score_components"
+      ],
+      "properties": {
+        "window_id": { "type": "string" },
+        "source_video": { "type": "string" },
+        "video_path": { "type": "string" },
+        "start_seconds": { "type": "number", "minimum": 0 },
+        "end_seconds": { "type": "number", "minimum": 0 },
+        "duration_seconds": { "type": "number", "minimum": 0 },
+        "shot_index": { "type": "integer", "minimum": 0 },
+        "rank": { "type": "integer", "minimum": 1 },
+        "score": { "type": "number", "minimum": 0, "maximum": 1 },
+        "thumbnail_path": { "type": ["string", "null"] },
+        "preview_path": { "type": ["string", "null"] },
+        "score_components": {
+          "type": "object",
+          "required": [
+            "visible_person_fraction",
+            "pose_visibility",
+            "track_continuity",
+            "runningness",
+            "side_view_prior",
+            "bbox_scale"
+          ],
+          "properties": {
+            "visible_person_fraction": { "type": "number", "minimum": 0, "maximum": 1 },
+            "pose_visibility": { "type": "number", "minimum": 0, "maximum": 1 },
+            "pose_visibility_blended": { "type": "number", "minimum": 0, "maximum": 1 },
+            "track_continuity": { "type": "number", "minimum": 0, "maximum": 1 },
+            "runningness": { "type": "number", "minimum": 0, "maximum": 1 },
+            "side_view_prior": { "type": "number", "minimum": 0, "maximum": 1 },
+            "bbox_scale": { "type": "number", "minimum": 0, "maximum": 1 },
+            "crowd_penalty": { "type": "number", "minimum": 0, "maximum": 1 },
+            "occlusion_penalty": { "type": "number", "minimum": 0, "maximum": 1 },
+            "replay_graphic_penalty": { "type": "number", "minimum": 0, "maximum": 1 },
+            "sampled_frames": { "type": "integer", "minimum": 0 },
+            "motion_mean": { "type": "number", "minimum": 0 },
+            "motion_area_mean": { "type": "number", "minimum": 0 },
+            "edge_density_mean": { "type": "number", "minimum": 0 }
+          }
+        }
+      }
+    }
+  }
+}

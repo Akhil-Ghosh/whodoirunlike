@@ -117,6 +117,22 @@ python scripts/evaluate_video_candidates.py \
 
 The CV pass downloads low-resolution source videos into `clips/raw/candidates`, samples frames, runs MediaPipe Pose Landmarker, and scores whether the clip appears to have usable full-body running footage. Treat this as triage, not final approval.
 
+Propose short review windows inside local source videos:
+
+```bash
+python scripts/run_clip_curation.py \
+  clips/raw/review_best/<candidate_id>.mp4 \
+  --out artifacts/curation/clip_windows.json \
+  --top-k 12 \
+  --write-thumbnails
+```
+
+This writes ranked 2-6 second windows using shot detection plus a cheap motion-proxy score.
+It is the first executable step toward the identity-stable runner pipeline in
+[`docs/identity-stable-runner-pipeline-plan.md`](docs/identity-stable-runner-pipeline-plan.md).
+Future scorer passes should enrich the same manifest with detector/pose runningness,
+track-continuity, and occlusion features.
+
 Download higher-quality copies for human review:
 
 ```bash
@@ -148,7 +164,27 @@ Open `http://127.0.0.1:8765`. The UI serves local candidate videos with byte-ran
 
 After preparing a CV run, open `http://127.0.0.1:8765/subject.html` to select the target runner on the prompt frame and inspect the run artifact slots.
 
-Run the first SAM 2 whole-runner mask after saving a subject prompt:
+Run the default SAM 3.1 whole-runner mask after saving a subject prompt:
+
+```bash
+python -m pip install -e ".[sam31]"
+
+python scripts/run_sam31_mlx_mask.py \
+  --candidate-id d6ee6cd75cd04b95 \
+  --model mlx-community/sam3.1-bf16 \
+  --quality-mode native \
+  --prompt "a runner" \
+  --prompt "a person"
+```
+
+The SAM 3.1 MLX path uses text prompts to detect runners on each frame, then uses the saved
+prompt box/points to choose the target runner identity and write `runner_mask.mp4`,
+`masked_runner.mp4`, `qa_overlay.mp4`, and `runner_mask_metadata.jsonl`. The first run
+downloads the MLX model from Hugging Face. Quality modes are `max` (source-sized square
+resolution, capped for sanity), `native` (`1008`, the SAM 3.1 default), and `fast` (`224`).
+
+Legacy SAM 2.1 local mask generation remains available as a fallback, but the pipeline plan
+does not depend on it:
 
 ```bash
 python -m pip install torch torchvision
@@ -164,25 +200,6 @@ python scripts/run_sam2_mask.py \
 ```
 
 This writes `runner_mask.mp4`, `masked_runner.mp4`, `qa_overlay.mp4`, and `runner_mask_metadata.jsonl` inside the CV run folder.
-
-Experimental SAM 3.1 on Apple Silicon via MLX:
-
-```bash
-python -m pip install -e ".[sam31]"
-
-python scripts/run_sam31_mlx_mask.py \
-  --candidate-id d6ee6cd75cd04b95 \
-  --model mlx-community/sam3.1-bf16 \
-  --quality-mode native \
-  --prompt "a runner" \
-  --prompt "a person"
-```
-
-The SAM 3.1 MLX path keeps the same artifact contract as SAM 2. It uses text prompts to
-detect runners on each frame, then uses the saved prompt box/points to choose the target
-runner identity and write the mask videos. The first run downloads the MLX model from
-Hugging Face. Quality modes are `max` (source-sized square resolution, capped for sanity),
-`native` (`1008`, the SAM 3.1 default), and `fast` (`224`).
 
 Run MediaPipe pose extraction after a mask pass:
 
@@ -256,13 +273,13 @@ Prepare one reviewed clip for the single-clip CV loop:
 python scripts/prepare_single_clip_cv_run.py --candidate-id <candidate_id>
 ```
 
-This creates `artifacts/cv_runs/<candidate_id>/source_segment.mp4`, a prompt frame, a `person_prompt.json` selection stub, and a `cv_run_manifest.json` describing the segmentation, pose, DensePose, render, and feature stages.
+This creates `artifacts/cv_runs/<candidate_id>/source_segment.mp4`, a prompt frame, a `person_prompt.json` target-selection stub, `track_seed.json`, `view_bucket.json`, and a `cv_run_manifest.json` describing the identity, segmentation, pose, DensePose, render, and feature stages.
 
-1. Upgrade candidate CV scoring from uniform sampling to best contiguous pose-window detection.
-2. Add the prompt-frame selection UI for `person_prompt.json`.
-3. Add SAM 2.1 whole-runner mask generation.
-4. Scale pose extraction over approved segments.
-5. Add Detectron2 DensePose as a secondary body-surface layer after target tracking is stable.
-6. Generate fused confidence-weighted form artifacts.
-7. Generate canonical body-map render videos.
+1. Use `run_clip_curation.py` to propose ranked windows before human review.
+2. Keep the prompt-frame UI focused on target identity, not manual masking.
+3. Add detector/tracker/ReID outputs: `tracklets.parquet`, `reid.parquet`, and identity-risk flags.
+4. Gate SAM 3.1 mask generation on the chosen target track.
+5. Scale RTMPose/RTMW pose extraction over approved identity-stable segments.
+6. Add Detectron2 DensePose as a secondary body-surface layer after target tracking is stable.
+7. Generate fused confidence-weighted form artifacts and `qc_metrics.json`.
 8. Compute pose-sequence similarities and Gemini render embeddings.

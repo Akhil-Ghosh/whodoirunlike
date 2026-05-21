@@ -9,6 +9,7 @@ import re
 import socket
 import tempfile
 import threading
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from http import HTTPStatus
@@ -54,6 +55,7 @@ CV_ARTIFACT_LABELS = {
     "features": "Features",
     "form_features": "Form features",
     "form_feature_arrays": "Feature arrays",
+    "mmpose_landmarks": "RTMW raw landmarks",
     "openpose_landmarks": "OpenPose landmarks",
     "openpose_skeleton_render": "OpenPose skeleton",
     "openpose_qa_overlay": "OpenPose QA overlay",
@@ -65,6 +67,15 @@ MASK_BACKENDS = {
     "sam2": "SAM 2.1 local",
     "sam31_mlx": "SAM 3.1 MLX",
 }
+POSE_BACKENDS = {
+    "openpose": "OpenPose BODY_25",
+    "mmpose_rtmw_l_384": "RTMLib RTMW-L 384",
+    "mmpose_rtmw_l_256": "RTMLib RTMW-L 256",
+    "mmpose_rtmw_m_256": "RTMLib RTMW-M 256",
+    "mmpose_rtmpose_l_384": "RTMLib RTMPose-L 384",
+    "mediapipe": "MediaPipe Pose",
+}
+DEFAULT_POSE_BACKEND = "openpose"
 MASK_QUALITY_MODES = {
     "max": "Highest quality",
     "native": "1008",
@@ -74,6 +85,8 @@ MASK_JOBS: dict[str, dict[str, Any]] = {}
 MASK_JOBS_LOCK = threading.Lock()
 CV_STAGE_JOBS: dict[str, dict[str, Any]] = {}
 CV_STAGE_JOBS_LOCK = threading.Lock()
+PIPELINE_JOBS: dict[str, dict[str, Any]] = {}
+PIPELINE_JOBS_LOCK = threading.Lock()
 CV_STAGE_VALUES = {"pose", "densepose", "fusion", "features", "openpose"}
 DENSEPOSE_CONFIG_ENV = "DENSEPOSE_CONFIG"
 DENSEPOSE_WEIGHTS_ENV = "DENSEPOSE_WEIGHTS"
@@ -724,6 +737,28 @@ def _validate_mask_backend(backend: str) -> str:
     return backend
 
 
+def _validate_pose_backend(backend: str | None) -> str:
+    backend = str(backend or DEFAULT_POSE_BACKEND).strip().lower()
+    if backend not in POSE_BACKENDS:
+        valid = ", ".join(sorted(POSE_BACKENDS))
+        raise ValueError(f"Pose backend must be one of: {valid}")
+    return backend
+
+
+def _is_mmpose_backend(backend: str | None) -> bool:
+    return str(backend or "").startswith("mmpose_")
+
+
+def _mmpose_setup_statuses() -> dict[str, Any]:
+    from whodoirunlike.mmpose_runner import mmpose_setup_status
+
+    return {
+        backend: mmpose_setup_status(backend)
+        for backend in POSE_BACKENDS
+        if _is_mmpose_backend(backend)
+    }
+
+
 def _mask_default_job(candidate_id: str) -> dict[str, Any]:
     return {
         "candidate_id": candidate_id,
@@ -768,8 +803,13 @@ def _manifest_stage_key(stage: str) -> str:
     return stage
 
 
-def _cv_stage_backend(stage: str) -> str:
+def _cv_stage_backend(stage: str, options: dict[str, Any] | None = None) -> str:
     if stage == "pose":
+        pose_backend = _validate_pose_backend((options or {}).get("pose_backend"))
+        if pose_backend == "openpose":
+            return "openpose_body25"
+        if _is_mmpose_backend(pose_backend):
+            return pose_backend
         return "mediapipe_pose"
     if stage == "densepose":
         return "detectron2_densepose"
@@ -1000,7 +1040,7 @@ def start_mask_job(
     config: ReviewAppConfig,
     candidate_id: str,
     *,
-    backend: str = "sam2",
+    backend: str = "sam31_mlx",
     options: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     backend = _validate_mask_backend(backend)
@@ -1048,23 +1088,46 @@ def start_sam2_job(config: ReviewAppConfig, candidate_id: str) -> dict[str, Any]
     return start_mask_job(config, candidate_id, backend="sam2")
 
 
-def _run_cv_stage_job(config: ReviewAppConfig, candidate_id: str, stage: str) -> None:
+def _run_cv_stage_job(
+    config: ReviewAppConfig,
+    candidate_id: str,
+    stage: str,
+    options: dict[str, Any] | None = None,
+) -> None:
     stage = _validate_cv_stage(stage)
+    options = options or {}
 
     def publish_progress(progress: dict[str, Any]) -> None:
         _set_cv_stage_job(stage, candidate_id, {"progress": {**progress, "stage": stage}})
 
-    backend = _cv_stage_backend(stage)
+    backend = _cv_stage_backend(stage, options)
     try:
         if stage == "pose":
-            from whodoirunlike.pose_runner import run_pose_landmarks
+            pose_backend = _validate_pose_backend(options.get("pose_backend"))
+            if pose_backend == "openpose":
+                from whodoirunlike.openpose_runner import run_openpose_pose
 
-            result = run_pose_landmarks(
-                run_dir=_cv_run_dir(config, candidate_id),
-                model_variant="heavy",
-                input_mode="auto",
-                progress_callback=publish_progress,
-            )
+                result = run_openpose_pose(
+                    run_dir=_cv_run_dir(config, candidate_id),
+                    progress_callback=publish_progress,
+                )
+            elif _is_mmpose_backend(pose_backend):
+                from whodoirunlike.mmpose_runner import run_mmpose_pose
+
+                result = run_mmpose_pose(
+                    run_dir=_cv_run_dir(config, candidate_id),
+                    model_id=pose_backend,
+                    progress_callback=publish_progress,
+                )
+            else:
+                from whodoirunlike.pose_runner import run_pose_landmarks
+
+                result = run_pose_landmarks(
+                    run_dir=_cv_run_dir(config, candidate_id),
+                    model_variant="heavy",
+                    input_mode="auto",
+                    progress_callback=publish_progress,
+                )
         elif stage == "densepose":
             from whodoirunlike.densepose_runner import run_densepose
 
@@ -1133,11 +1196,40 @@ def _run_cv_stage_job(config: ReviewAppConfig, candidate_id: str, stage: str) ->
 
 
 def start_cv_stage_job(config: ReviewAppConfig, candidate_id: str, stage: str) -> dict[str, Any]:
+    return _start_cv_stage_job(config, candidate_id, stage, options=None)
+
+
+def _start_cv_stage_job(
+    config: ReviewAppConfig,
+    candidate_id: str,
+    stage: str,
+    *,
+    options: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     stage = _validate_cv_stage(stage)
+    options = options or {}
     candidate_id = _safe_candidate_id(candidate_id)
     run_dir = _cv_run_dir(config, candidate_id)
     if not (run_dir / "cv_run_manifest.json").exists():
         raise FileNotFoundError(f"CV run not found: {candidate_id}")
+    if stage == "pose":
+        pose_backend = _validate_pose_backend(options.get("pose_backend"))
+        if pose_backend == "openpose":
+            from whodoirunlike.openpose_runner import openpose_setup_status
+
+            if not (run_dir / "runner_mask.mp4").exists():
+                raise FileNotFoundError("Runner mask not found; run SAM 3.1 before OpenPose")
+            setup = openpose_setup_status()
+            if not setup["ready"]:
+                raise ValueError("OpenPose is not configured: " + "; ".join(setup["reasons"]))
+        elif _is_mmpose_backend(pose_backend):
+            from whodoirunlike.mmpose_runner import mmpose_setup_status
+
+            if not (run_dir / "runner_mask.mp4").exists():
+                raise FileNotFoundError("Runner mask not found; run SAM 3.1 before RTMW/RTMPose")
+            setup = mmpose_setup_status(pose_backend)
+            if not setup["ready"]:
+                raise ValueError("RTMW/RTMPose is not configured: " + "; ".join(setup["reasons"]))
     if stage == "densepose" and not (run_dir / "runner_mask.mp4").exists():
         raise FileNotFoundError("Runner mask not found; run a mask backend before DensePose")
     if stage == "fusion":
@@ -1164,7 +1256,7 @@ def start_cv_stage_job(config: ReviewAppConfig, candidate_id: str, stage: str) -
     if existing["status"] == "running":
         return existing
 
-    backend = _cv_stage_backend(stage)
+    backend = _cv_stage_backend(stage, options)
     _set_cv_stage_status(config, candidate_id, stage, "running", backend=backend)
     _set_cv_stage_job(
         stage,
@@ -1178,12 +1270,13 @@ def start_cv_stage_job(config: ReviewAppConfig, candidate_id: str, stage: str) -
             "completed_at": None,
             "error": None,
             "result": None,
+            "options": options,
             "progress": _initial_cv_stage_progress(stage),
         },
     )
     thread = threading.Thread(
         target=_run_cv_stage_job,
-        args=(config, candidate_id, stage),
+        args=(config, candidate_id, stage, options),
         name=f"{stage}-{candidate_id}",
         daemon=True,
     )
@@ -1211,8 +1304,18 @@ def openpose_job_status(candidate_id: str) -> dict[str, Any]:
     return cv_stage_job_status("openpose", candidate_id)
 
 
-def start_pose_job(config: ReviewAppConfig, candidate_id: str) -> dict[str, Any]:
-    return start_cv_stage_job(config, candidate_id, "pose")
+def start_pose_job(
+    config: ReviewAppConfig,
+    candidate_id: str,
+    *,
+    pose_backend: str = DEFAULT_POSE_BACKEND,
+) -> dict[str, Any]:
+    return _start_cv_stage_job(
+        config,
+        candidate_id,
+        "pose",
+        options={"pose_backend": _validate_pose_backend(pose_backend)},
+    )
 
 
 def start_densepose_job(config: ReviewAppConfig, candidate_id: str) -> dict[str, Any]:
@@ -1229,6 +1332,235 @@ def start_features_job(config: ReviewAppConfig, candidate_id: str) -> dict[str, 
 
 def start_openpose_job(config: ReviewAppConfig, candidate_id: str) -> dict[str, Any]:
     return start_cv_stage_job(config, candidate_id, "openpose")
+
+
+def _pipeline_default_job(candidate_id: str) -> dict[str, Any]:
+    return {
+        "candidate_id": candidate_id,
+        "status": "idle",
+        "started_at": None,
+        "completed_at": None,
+        "error": None,
+        "result": None,
+        "options": {},
+        "progress": None,
+    }
+
+
+def pipeline_job_status(candidate_id: str) -> dict[str, Any]:
+    candidate_id = _safe_candidate_id(candidate_id)
+    with PIPELINE_JOBS_LOCK:
+        return dict(PIPELINE_JOBS.get(candidate_id, _pipeline_default_job(candidate_id)))
+
+
+def _set_pipeline_job(candidate_id: str, updates: dict[str, Any]) -> dict[str, Any]:
+    candidate_id = _safe_candidate_id(candidate_id)
+    with PIPELINE_JOBS_LOCK:
+        current = PIPELINE_JOBS.get(candidate_id, _pipeline_default_job(candidate_id))
+        PIPELINE_JOBS[candidate_id] = {**current, **updates}
+        return dict(PIPELINE_JOBS[candidate_id])
+
+
+def _pipeline_progress(
+    *,
+    phase: str,
+    stage: str,
+    step_index: int,
+    step_count: int,
+    stage_job: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    stage_progress = (stage_job or {}).get("progress") or {}
+    stage_percent = _as_float(stage_progress.get("percent"), 0.0)
+    overall = (max(0, step_index) + max(0.0, min(1.0, stage_percent))) / max(step_count, 1)
+    return {
+        "phase": phase,
+        "stage": stage,
+        "step_index": step_index,
+        "step_count": step_count,
+        "percent": round(max(0.0, min(1.0, overall)), 4),
+        "stage_progress": stage_progress,
+    }
+
+
+def _wait_for_pipeline_child(
+    candidate_id: str,
+    *,
+    stage: str,
+    step_index: int,
+    step_count: int,
+    status_fn: Any,
+) -> dict[str, Any]:
+    while True:
+        job = status_fn(candidate_id)
+        _set_pipeline_job(
+            candidate_id,
+            {
+                "progress": _pipeline_progress(
+                    phase="running",
+                    stage=stage,
+                    step_index=step_index,
+                    step_count=step_count,
+                    stage_job=job,
+                )
+            },
+        )
+        if job.get("status") != "running":
+            return job
+        time.sleep(1.0)
+
+
+def _run_pipeline_job(config: ReviewAppConfig, candidate_id: str, options: dict[str, Any]) -> None:
+    steps = [
+        ("mask", "sam31_mlx"),
+        ("pose", _validate_pose_backend(options.get("pose_backend"))),
+        ("densepose", "detectron2_densepose"),
+        ("fusion", "form_fusion"),
+        ("features", "form_feature_compiler"),
+    ]
+    step_count = len(steps)
+    try:
+        mask_quality_mode = str(options.get("mask_quality_mode") or "native")
+        _set_pipeline_job(
+            candidate_id,
+            {"progress": _pipeline_progress(phase="starting", stage="mask", step_index=0, step_count=step_count)},
+        )
+        start_mask_job(
+            config,
+            candidate_id,
+            backend="sam31_mlx",
+            options={"quality_mode": mask_quality_mode},
+        )
+        mask_job = _wait_for_pipeline_child(
+            candidate_id,
+            stage="mask",
+            step_index=0,
+            step_count=step_count,
+            status_fn=mask_job_status,
+        )
+        if mask_job.get("status") != "completed":
+            raise RuntimeError(mask_job.get("error") or "SAM 3.1 mask failed")
+
+        pose_backend = _validate_pose_backend(options.get("pose_backend"))
+        start_pose_job(config, candidate_id, pose_backend=pose_backend)
+        pose_job = _wait_for_pipeline_child(
+            candidate_id,
+            stage="pose",
+            step_index=1,
+            step_count=step_count,
+            status_fn=pose_job_status,
+        )
+        if pose_job.get("status") != "completed":
+            raise RuntimeError(pose_job.get("error") or "Pose estimation failed")
+
+        start_densepose_job(config, candidate_id)
+        densepose_job = _wait_for_pipeline_child(
+            candidate_id,
+            stage="densepose",
+            step_index=2,
+            step_count=step_count,
+            status_fn=densepose_job_status,
+        )
+        if densepose_job.get("status") != "completed":
+            raise RuntimeError(densepose_job.get("error") or "DensePose failed")
+
+        start_fusion_job(config, candidate_id)
+        fusion_job = _wait_for_pipeline_child(
+            candidate_id,
+            stage="fusion",
+            step_index=3,
+            step_count=step_count,
+            status_fn=fusion_job_status,
+        )
+        if fusion_job.get("status") != "completed":
+            raise RuntimeError(fusion_job.get("error") or "Fusion failed")
+
+        start_features_job(config, candidate_id)
+        features_job = _wait_for_pipeline_child(
+            candidate_id,
+            stage="features",
+            step_index=4,
+            step_count=step_count,
+            status_fn=features_job_status,
+        )
+        if features_job.get("status") != "completed":
+            raise RuntimeError(features_job.get("error") or "Feature compilation failed")
+
+        _set_pipeline_job(
+            candidate_id,
+            {
+                "status": "completed",
+                "completed_at": utc_now_iso(),
+                "error": None,
+                "result": {
+                    "steps": steps,
+                    "pose_backend": pose_backend,
+                    "mask_quality_mode": mask_quality_mode,
+                },
+                "progress": {
+                    "phase": "completed",
+                    "stage": "features",
+                    "step_index": step_count,
+                    "step_count": step_count,
+                    "percent": 1.0,
+                    "stage_progress": features_job.get("progress") or {},
+                },
+            },
+        )
+    except Exception as exc:  # noqa: BLE001 - surfaced to the local review UI.
+        progress = pipeline_job_status(candidate_id).get("progress") or {}
+        _set_pipeline_job(
+            candidate_id,
+            {
+                "status": "failed",
+                "completed_at": utc_now_iso(),
+                "error": str(exc),
+                "result": None,
+                "progress": {**progress, "phase": "failed"},
+            },
+        )
+
+
+def start_pipeline_job(
+    config: ReviewAppConfig,
+    candidate_id: str,
+    *,
+    pose_backend: str = DEFAULT_POSE_BACKEND,
+    mask_quality_mode: str = "native",
+) -> dict[str, Any]:
+    candidate_id = _safe_candidate_id(candidate_id)
+    run_dir = _cv_run_dir(config, candidate_id)
+    if not (run_dir / "cv_run_manifest.json").exists():
+        raise FileNotFoundError(f"CV run not found: {candidate_id}")
+    prompt = _read_json(run_dir / "person_prompt.json", {})
+    if prompt.get("selection", {}).get("type") in (None, "", "unset"):
+        raise ValueError("Select and save the runner before starting the pipeline")
+    pose_backend = _validate_pose_backend(pose_backend)
+    mask_quality_mode = str(_sanitize_mask_options({"quality_mode": mask_quality_mode})["quality_mode"])
+    existing = pipeline_job_status(candidate_id)
+    if existing["status"] == "running":
+        return existing
+    options = {"pose_backend": pose_backend, "mask_quality_mode": mask_quality_mode}
+    _set_pipeline_job(
+        candidate_id,
+        {
+            "candidate_id": candidate_id,
+            "status": "running",
+            "started_at": utc_now_iso(),
+            "completed_at": None,
+            "error": None,
+            "result": None,
+            "options": options,
+            "progress": _pipeline_progress(phase="queued", stage="mask", step_index=0, step_count=5),
+        },
+    )
+    thread = threading.Thread(
+        target=_run_pipeline_job,
+        args=(config, candidate_id, options),
+        name=f"pipeline-{candidate_id}",
+        daemon=True,
+    )
+    thread.start()
+    return pipeline_job_status(candidate_id)
 
 
 def _subject_candidates_path(run_dir: Path, quality_mode: str) -> Path:
@@ -1327,6 +1659,9 @@ class ReviewRequestHandler(BaseHTTPRequestHandler):
         if parsed.path.startswith("/api/cv-runs/") and parsed.path.endswith("/openpose"):
             self._handle_get_openpose_job(parsed.path)
             return
+        if parsed.path.startswith("/api/cv-runs/") and parsed.path.endswith("/pipeline"):
+            self._handle_get_pipeline_job(parsed.path)
+            return
         if parsed.path.startswith("/api/cv-runs/"):
             self._handle_get_cv_run(parsed.path)
             return
@@ -1366,6 +1701,9 @@ class ReviewRequestHandler(BaseHTTPRequestHandler):
             return
         if parsed.path.startswith("/api/cv-runs/") and parsed.path.endswith("/openpose"):
             self._handle_start_openpose_job(parsed.path)
+            return
+        if parsed.path.startswith("/api/cv-runs/") and parsed.path.endswith("/pipeline"):
+            self._handle_start_pipeline_job(parsed.path)
             return
         if parsed.path.startswith("/api/cv-runs/") and parsed.path.endswith("/prepare"):
             self._handle_prepare_cv_run(parsed.path)
@@ -1467,17 +1805,42 @@ class ReviewRequestHandler(BaseHTTPRequestHandler):
     def _handle_get_pose_job(self, path: str) -> None:
         candidate_id = unquote(path.removeprefix("/api/cv-runs/").removesuffix("/pose")).strip("/")
         try:
+            from whodoirunlike.openpose_runner import openpose_setup_status
+
             run_dir = _cv_run_dir(self.config, candidate_id)
             if not (run_dir / "cv_run_manifest.json").exists():
                 raise FileNotFoundError(f"CV run not found: {candidate_id}")
-            self._send_json({"job": pose_job_status(candidate_id)})
+            self._send_json(
+                {
+                    "job": pose_job_status(candidate_id),
+                    "pose_backends": POSE_BACKENDS,
+                    "default_pose_backend": DEFAULT_POSE_BACKEND,
+                    "openpose_setup": openpose_setup_status(),
+                    "mmpose_setup": _mmpose_setup_statuses(),
+                }
+            )
         except (FileNotFoundError, ValueError) as exc:
             self._send_json({"error": str(exc)}, status=HTTPStatus.NOT_FOUND)
 
     def _handle_start_pose_job(self, path: str) -> None:
         candidate_id = unquote(path.removeprefix("/api/cv-runs/").removesuffix("/pose")).strip("/")
         try:
-            self._send_json({"job": start_pose_job(self.config, candidate_id)})
+            from whodoirunlike.openpose_runner import openpose_setup_status
+
+            length = min(int(self.headers.get("Content-Length", "0")), 64_000)
+            data = json.loads(self.rfile.read(length).decode("utf-8")) if length else {}
+            pose_backend = _validate_pose_backend(data.get("backend") or data.get("pose_backend"))
+            self._send_json(
+                {
+                    "job": start_pose_job(self.config, candidate_id, pose_backend=pose_backend),
+                    "pose_backends": POSE_BACKENDS,
+                    "default_pose_backend": DEFAULT_POSE_BACKEND,
+                    "openpose_setup": openpose_setup_status(),
+                    "mmpose_setup": _mmpose_setup_statuses(),
+                }
+            )
+        except json.JSONDecodeError as exc:
+            self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
         except FileNotFoundError as exc:
             self._send_json({"error": str(exc)}, status=HTTPStatus.NOT_FOUND)
         except ValueError as exc:
@@ -1595,6 +1958,67 @@ class ReviewRequestHandler(BaseHTTPRequestHandler):
         except ValueError as exc:
             self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
 
+    def _handle_get_pipeline_job(self, path: str) -> None:
+        candidate_id = unquote(
+            path.removeprefix("/api/cv-runs/").removesuffix("/pipeline")
+        ).strip("/")
+        try:
+            from whodoirunlike.openpose_runner import openpose_setup_status
+
+            run_dir = _cv_run_dir(self.config, candidate_id)
+            if not (run_dir / "cv_run_manifest.json").exists():
+                raise FileNotFoundError(f"CV run not found: {candidate_id}")
+            self._send_json(
+                {
+                    "job": pipeline_job_status(candidate_id),
+                    "jobs": {
+                        "mask": mask_job_status(candidate_id),
+                        "pose": pose_job_status(candidate_id),
+                        "densepose": densepose_job_status(candidate_id),
+                        "fusion": fusion_job_status(candidate_id),
+                        "features": features_job_status(candidate_id),
+                    },
+                    "pose_backends": POSE_BACKENDS,
+                    "default_pose_backend": DEFAULT_POSE_BACKEND,
+                    "openpose_setup": openpose_setup_status(),
+                    "mmpose_setup": _mmpose_setup_statuses(),
+                    "quality_modes": MASK_QUALITY_MODES,
+                }
+            )
+        except (FileNotFoundError, ValueError) as exc:
+            self._send_json({"error": str(exc)}, status=HTTPStatus.NOT_FOUND)
+
+    def _handle_start_pipeline_job(self, path: str) -> None:
+        candidate_id = unquote(
+            path.removeprefix("/api/cv-runs/").removesuffix("/pipeline")
+        ).strip("/")
+        try:
+            from whodoirunlike.openpose_runner import openpose_setup_status
+
+            length = min(int(self.headers.get("Content-Length", "0")), 64_000)
+            data = json.loads(self.rfile.read(length).decode("utf-8")) if length else {}
+            self._send_json(
+                {
+                    "job": start_pipeline_job(
+                        self.config,
+                        candidate_id,
+                        pose_backend=_validate_pose_backend(data.get("pose_backend")),
+                        mask_quality_mode=str(data.get("mask_quality_mode") or "native"),
+                    ),
+                    "pose_backends": POSE_BACKENDS,
+                    "default_pose_backend": DEFAULT_POSE_BACKEND,
+                    "openpose_setup": openpose_setup_status(),
+                    "mmpose_setup": _mmpose_setup_statuses(),
+                    "quality_modes": MASK_QUALITY_MODES,
+                }
+            )
+        except json.JSONDecodeError as exc:
+            self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+        except FileNotFoundError as exc:
+            self._send_json({"error": str(exc)}, status=HTTPStatus.NOT_FOUND)
+        except ValueError as exc:
+            self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+
     def _handle_prepare_cv_run(self, path: str) -> None:
         candidate_id = unquote(path.removeprefix("/api/cv-runs/").removesuffix("/prepare")).strip("/")
         try:
@@ -1656,7 +2080,7 @@ class ReviewRequestHandler(BaseHTTPRequestHandler):
         try:
             length = min(int(self.headers.get("Content-Length", "0")), 64_000)
             data = json.loads(self.rfile.read(length).decode("utf-8")) if length else {}
-            backend = str(data.get("backend") or "sam2")
+            backend = str(data.get("backend") or "sam31_mlx")
             options = _sanitize_mask_options(data) if backend == "sam31_mlx" else {}
             self._send_json(
                 {

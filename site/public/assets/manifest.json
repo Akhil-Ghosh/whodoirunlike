@@ -1,0 +1,44 @@
+{
+  "name": "Who Do I Run Like site asset pack",
+  "version": "1.0.0",
+  "assets": {
+    "brand": {
+      "logoLockup": "assets/brand/logo-lockup.svg",
+      "logoIcon": "assets/brand/logo-icon.svg",
+      "logoWordmark": "assets/brand/logo-wordmark.svg",
+      "favicon": "assets/brand/favicon.svg",
+      "referencePng": "assets/reference/brand-reference.png"
+    },
+    "hero": {
+      "runnerColor": "assets/hero/runner-color.png",
+      "runnerGray": "assets/hero/runner-gray.png",
+      "runnerColorOriginal": "assets/hero/runner-color-original.png",
+      "runnerGrayOriginal": "assets/hero/runner-gray-original.png"
+    },
+    "athletes": {
+      "moFarah": "assets/athletes/mo-farah-card.png",
+      "jakobIngebrigtsen": "assets/athletes/jakob-ingebrigtsen-card.png",
+      "sydneyMcLaughlin": "assets/athletes/sydney-mclaughlin-card.png"
+    },
+    "ui": {
+      "underline": "assets/ui/scribble-underline.svg",
+      "youArrow": "assets/ui/hand-arrow-you.svg",
+      "athleteArrow": "assets/ui/hand-arrow-athlete.svg",
+      "accentRays": "assets/ui/accent-rays.svg"
+    }
+  },
+  "colors": {
+    "paper": "#F8F7F4",
+    "paperClean": "#FBFAF7",
+    "ink": "#171719",
+    "muted": "#5C5A57",
+    "line": "#E7E2D8",
+    "accent": "#AF9272",
+    "charcoal": "#101113"
+  },
+  "notes": [
+    "Hero color and gray images are derived from the five generated images already created in this chat.",
+    "The processed hero PNGs include true alpha transparency for browser overlay compositing.",
+    "Athlete card copy is starter copy. Review facts, likeness rights, and approvals before a public launch."
+  ]
+}

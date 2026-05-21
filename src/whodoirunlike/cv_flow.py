@@ -231,6 +231,7 @@ def build_cv_run_manifest(clip: ReviewedClip, run_dir: Path) -> dict[str, Any]:
         "features": str(run_dir / "features.json"),
         "form_features": str(run_dir / "form_features.json"),
         "form_feature_arrays": str(run_dir / "form_features.npz"),
+        "mmpose_landmarks": str(run_dir / "mmpose_landmarks.jsonl"),
         "openpose_landmarks": str(run_dir / "openpose_landmarks.jsonl"),
         "openpose_skeleton_render": str(run_dir / "openpose_skeleton_render.mp4"),
         "openpose_qa_overlay": str(run_dir / "openpose_qa_overlay.mp4"),
@@ -270,7 +271,7 @@ def build_cv_run_manifest(clip: ReviewedClip, run_dir: Path) -> dict[str, Any]:
             },
             "pose": {
                 "status": "pending",
-                "recommended_tool": "MediaPipe Pose Landmarker first pass",
+                "recommended_tool": "OpenPose default; RTMLib RTMW/RTMPose and MediaPipe selectable",
                 "output": paths["pose_landmarks"],
             },
             "densepose": {

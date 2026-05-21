@@ -7,12 +7,15 @@ const state = {
   fusionJob: null,
   featuresJob: null,
   openposeJob: null,
+  pipelineJob: null,
   denseposeSetup: null,
   openposeSetup: null,
+  mmposeSetup: null,
   prepCandidates: [],
   prepStatus: "idle",
-  maskBackend: "sam2",
+  maskBackend: "sam31_mlx",
   maskQualityMode: "native",
+  poseBackend: "openpose",
   subjectCandidates: [],
   subjectCandidatesStatus: "idle",
   selection: {
@@ -33,6 +36,7 @@ const state = {
   fusionPollTimer: 0,
   featuresPollTimer: 0,
   openposePollTimer: 0,
+  pipelinePollTimer: 0,
 };
 
 const svgNS = "http://www.w3.org/2000/svg";
@@ -69,9 +73,11 @@ const els = {
   fusionJobState: document.querySelector("#fusionJobState"),
   featuresJobState: document.querySelector("#featuresJobState"),
   openposeJobState: document.querySelector("#openposeJobState"),
-  maskBackendSelect: document.querySelector("#maskBackendSelect"),
+  pipelineJobState: document.querySelector("#pipelineJobState"),
+  poseBackendSelect: document.querySelector("#poseBackendSelect"),
   maskQualityLabel: document.querySelector("#maskQualityLabel"),
   maskQualitySelect: document.querySelector("#maskQualitySelect"),
+  runPipelineButton: document.querySelector("#runPipelineButton"),
   runSamButton: document.querySelector("#runSamButton"),
   runPoseButton: document.querySelector("#runPoseButton"),
   runDenseposeButton: document.querySelector("#runDenseposeButton"),
@@ -108,6 +114,11 @@ const els = {
   openposeProgressEta: document.querySelector("#openposeProgressEta"),
   openposeProgressBar: document.querySelector("#openposeProgressBar"),
   openposeProgressMeta: document.querySelector("#openposeProgressMeta"),
+  pipelineProgress: document.querySelector("#pipelineProgress"),
+  pipelineProgressLabel: document.querySelector("#pipelineProgressLabel"),
+  pipelineProgressEta: document.querySelector("#pipelineProgressEta"),
+  pipelineProgressBar: document.querySelector("#pipelineProgressBar"),
+  pipelineProgressMeta: document.querySelector("#pipelineProgressMeta"),
   stageList: document.querySelector("#stageList"),
   artifactGrid: document.querySelector("#artifactGrid"),
   promptJson: document.querySelector("#promptJson"),
@@ -284,6 +295,11 @@ function clearCvPoll(kind) {
   state[timerKey] = 0;
 }
 
+function clearPipelinePoll() {
+  window.clearTimeout(state.pipelinePollTimer);
+  state.pipelinePollTimer = 0;
+}
+
 function clearAllCvPolls() {
   clearSamPoll();
   clearCvPoll("pose");
@@ -291,6 +307,7 @@ function clearAllCvPolls() {
   clearCvPoll("fusion");
   clearCvPoll("features");
   clearCvPoll("openpose");
+  clearPipelinePoll();
 }
 
 function scheduleSamPoll() {
@@ -307,6 +324,13 @@ function scheduleCvPoll(kind) {
   }, 2000);
 }
 
+function schedulePipelinePoll() {
+  clearPipelinePoll();
+  state.pipelinePollTimer = window.setTimeout(() => {
+    refreshPipelineJobStatus({ reloadOnComplete: true });
+  }, 2000);
+}
+
 function samStatusLabel(status) {
   if (status === "completed") return "Complete";
   if (status === "failed") return "Failed";
@@ -318,6 +342,15 @@ function samStatusLabel(status) {
 function backendLabel(backend = state.maskBackend) {
   if (backend === "sam31_mlx") return "SAM 3.1 MLX";
   return "SAM 2.1";
+}
+
+function poseBackendLabel(backend = state.poseBackend) {
+  if (backend === "mediapipe") return "MediaPipe";
+  if (backend === "mmpose_rtmw_l_384") return "RTMW-L 384";
+  if (backend === "mmpose_rtmw_l_256") return "RTMW-L 256";
+  if (backend === "mmpose_rtmw_m_256") return "RTMW-M 256";
+  if (backend === "mmpose_rtmpose_l_384") return "RTMPose-L";
+  return "OpenPose";
 }
 
 function qualityLabel(mode = state.maskQualityMode) {
@@ -332,6 +365,10 @@ function phaseLabel(phase = "") {
   if (phase === "detecting_pose") return "Estimating pose";
   if (phase === "estimating_pose") return "Estimating pose";
   if (phase === "running_pose") return "Estimating pose";
+  if (phase === "loading_mmpose_model") return "Loading RTMW";
+  if (phase === "loading_rtmw_model") return "Loading RTMW";
+  if (phase === "running_mmpose") return "Running RTMW";
+  if (phase === "running_rtmw") return "Running RTMW";
   if (phase === "running_densepose") return "Running DensePose";
   if (phase === "fusing_form") return "Fusing form";
   if (phase === "reading_inputs") return "Reading inputs";
@@ -340,6 +377,8 @@ function phaseLabel(phase = "") {
   if (phase === "preparing_openpose_frames") return "Preparing OpenPose frames";
   if (phase === "running_openpose") return "Running OpenPose";
   if (phase === "reading_openpose_results") return "Reading OpenPose";
+  if (phase === "starting") return "Starting pipeline";
+  if (phase === "running") return "Running pipeline";
   if (phase === "writing_outputs") return "Writing outputs";
   if (phase === "completed") return "Complete";
   if (phase === "failed") return "Failed";
@@ -424,6 +463,64 @@ function renderCvProgress(kind, job) {
     total > 0 ? `${processed}/${total} frames · elapsed ${elapsed}` : `elapsed ${elapsed}`;
 }
 
+function renderPipelineProgress(job = state.pipelineJob) {
+  const progress = job?.progress;
+  const isRunning = job?.status === "running";
+  if (!isRunning || !progress) {
+    els.pipelineProgress.classList.add("is-hidden");
+    els.pipelineProgressBar.style.width = "0%";
+    return;
+  }
+  const percent = progressPercent(progress);
+  const stage = progress.stage || "mask";
+  const stageProgress = progress.stage_progress || {};
+  const stagePercent =
+    stageProgress.percent == null ? "" : ` · ${Math.round(progressPercent(stageProgress) * 100)}% stage`;
+  const stepIndex = Number(progress.step_index || 0) + 1;
+  const stepCount = Number(progress.step_count || 5);
+  els.pipelineProgress.classList.remove("is-hidden");
+  els.pipelineProgressLabel.textContent = `${phaseLabel(progress.phase)} · ${Math.round(percent * 100)}%`;
+  els.pipelineProgressEta.textContent = `${stepIndex}/${stepCount}`;
+  els.pipelineProgressBar.style.width = `${Math.round(percent * 100)}%`;
+  els.pipelineProgressMeta.textContent = `${stage.replaceAll("_", " ")}${stagePercent}`;
+}
+
+function renderPipelineJobStatus(job = state.pipelineJob) {
+  state.pipelineJob = job || { status: "idle" };
+  const status = state.pipelineJob.status || "idle";
+  const selection = normalizedSelection();
+  const hasPrompt = selection.type !== "unset";
+  const isRunning = status === "running";
+  const isOpenPose = state.poseBackend === "openpose";
+  const isMMPose = state.poseBackend.startsWith("mmpose_");
+  const selectedMmposeSetup = isMMPose ? state.mmposeSetup?.[state.poseBackend] : null;
+  const setupWarning =
+    isOpenPose && state.openposeSetup && !state.openposeSetup.ready
+      ? state.openposeSetup.reasons?.[0] || "OpenPose is not configured"
+      : isMMPose && selectedMmposeSetup && !selectedMmposeSetup.ready
+        ? selectedMmposeSetup.reasons?.[0] || "RTMW is not configured"
+        : "";
+  const label =
+    isRunning && state.pipelineJob.progress
+      ? `Pipeline ${Math.round(progressPercent(state.pipelineJob.progress) * 100)}%`
+      : `Pipeline ${samStatusLabel(status).toLowerCase()}`;
+
+  renderPipelineProgress(state.pipelineJob);
+  els.pipelineJobState.textContent = label;
+  els.pipelineJobState.className = `rank-pill cv-job-state ${
+    isRunning ? "is-running" : status === "completed" ? "is-complete" : ""
+  } ${status === "failed" ? "is-error" : ""}`.trim();
+  els.runPipelineButton.disabled = !state.current || !hasPrompt || isRunning || Boolean(setupWarning);
+  els.runPipelineButton.textContent = isRunning
+    ? "Running Pipeline..."
+    : `Run Full Pipeline`;
+  els.runPipelineButton.title = setupWarning
+    ? setupWarning
+    : hasPrompt
+      ? `Run SAM 3.1, ${poseBackendLabel()}, DensePose, Fusion, and Features`
+    : "Select and save the runner first";
+}
+
 function renderSamJobStatus(job = state.samJob) {
   state.samJob = job || { status: "idle" };
   const status = state.samJob.status || "idle";
@@ -439,7 +536,7 @@ function renderSamJobStatus(job = state.samJob) {
       ? `${backendLabel(state.samJob.backend)} ${Math.round(progressPercent(progress) * 100)}%`
       : `${backendLabel(state.samJob.backend)} running`;
   }
-  els.maskQualityLabel.classList.toggle("is-hidden", state.maskBackend !== "sam31_mlx");
+  els.maskQualityLabel.classList.remove("is-hidden");
   renderMaskProgress(state.samJob);
 
   els.samJobState.textContent = statusLabel;
@@ -452,10 +549,10 @@ function renderSamJobStatus(job = state.samJob) {
   els.runSamButton.textContent = isRunning
     ? "Running..."
     : artifactsReady || status === "completed"
-      ? `Run ${backendLabel()}${state.maskBackend === "sam31_mlx" ? ` ${qualityLabel()}` : ""} Again`
-      : `Run ${backendLabel()}${state.maskBackend === "sam31_mlx" ? ` ${qualityLabel()}` : ""}`;
+      ? `Run ${backendLabel()} ${qualityLabel()} Again`
+      : `Run ${backendLabel()} ${qualityLabel()}`;
   els.runSamButton.title = hasPrompt
-    ? `Run ${backendLabel()}${state.maskBackend === "sam31_mlx" ? ` ${qualityLabel()} mode` : ""} on the saved subject prompt`
+    ? `Run ${backendLabel()} ${qualityLabel()} mode on the saved subject prompt`
     : "Select the runner first";
 }
 
@@ -516,14 +613,31 @@ function cvJobConfig(kind) {
         : state.openposeSetup?.reasons?.[0] || "OpenPose is not configured",
     };
   }
+  const isOpenPose = state.poseBackend === "openpose";
+  const isMMPose = state.poseBackend.startsWith("mmpose_");
+  const hasMask = artifactExists("runner_mask");
+  const openposeReady = state.openposeSetup ? Boolean(state.openposeSetup.ready) : true;
+  const selectedMmposeSetup = isMMPose ? state.mmposeSetup?.[state.poseBackend] : null;
+  const mmposeReady = selectedMmposeSetup ? Boolean(selectedMmposeSetup.ready) : true;
+  const setupReady = isOpenPose ? openposeReady : isMMPose ? mmposeReady : true;
+  const setupReason = isOpenPose
+    ? state.openposeSetup?.reasons?.[0] || "OpenPose is not configured"
+    : selectedMmposeSetup?.reasons?.[0] || "RTMW is not configured";
+  const needsMask = isOpenPose || isMMPose;
   return {
-    label: "Pose",
+    label: poseBackendLabel(),
     stateKey: "poseJob",
     stateEl: els.poseJobState,
     buttonEl: els.runPoseButton,
     ready: artifactExists("pose_landmarks") || artifactExists("skeleton_render"),
-    canRun: Boolean(state.current),
-    blockedTitle: "Load a CV run first",
+    canRun: Boolean(state.current) && (!needsMask || hasMask) && setupReady,
+    blockedTitle:
+      needsMask && !hasMask
+        ? "Run SAM 3.1 first"
+        : !setupReady
+          ? setupReason
+          : "Load a CV run first",
+    setupWarning: !setupReady ? setupReason : "",
   };
 }
 
@@ -674,6 +788,7 @@ function renderArtifacts(artifacts) {
     "features",
     "form_features",
     "form_feature_arrays",
+    "mmpose_landmarks",
     "openpose_landmarks",
     "openpose_skeleton_render",
     "openpose_qa_overlay",
@@ -717,6 +832,8 @@ function renderRun() {
   };
   state.subjectCandidates = [];
   state.subjectCandidatesStatus = "idle";
+  els.poseBackendSelect.value = state.poseBackend;
+  els.maskQualitySelect.value = state.maskQualityMode;
 
   els.runBucket.textContent = review.primary_bucket || "CV run";
   els.runTitle.textContent = source.title || "Untitled run";
@@ -755,6 +872,7 @@ function renderRun() {
   renderCvJobStatus("fusion");
   renderCvJobStatus("features");
   renderCvJobStatus("openpose");
+  renderPipelineJobStatus();
   setSaveState("Ready");
 }
 
@@ -770,6 +888,7 @@ async function loadRun(candidateId, options = {}) {
       state.fusionJob = null;
       state.featuresJob = null;
       state.openposeJob = null;
+      state.pipelineJob = null;
     }
     state.current = await fetchJson(`/api/cv-runs/${candidateId}`);
     renderRun();
@@ -780,6 +899,7 @@ async function loadRun(candidateId, options = {}) {
       await refreshCvJobStatus("fusion");
       await refreshCvJobStatus("features");
       await refreshCvJobStatus("openpose");
+      await refreshPipelineJobStatus();
     }
     await loadSubjectCandidateCache(candidateId);
   } catch (error) {
@@ -972,6 +1092,12 @@ async function refreshCvJobStatus(kind, options = {}) {
     if (kind === "densepose" && payload.setup) {
       state.denseposeSetup = payload.setup;
     }
+    if (kind === "pose" && payload.openpose_setup) {
+      state.openposeSetup = payload.openpose_setup;
+    }
+    if (kind === "pose" && payload.mmpose_setup) {
+      state.mmposeSetup = payload.mmpose_setup;
+    }
     if (kind === "openpose" && payload.setup) {
       state.openposeSetup = payload.setup;
     }
@@ -998,6 +1124,44 @@ async function refreshCvJobStatus(kind, options = {}) {
     clearCvPoll(kind);
     config.stateEl.textContent = `${config.label} unavailable`;
     config.stateEl.className = "rank-pill cv-job-state is-error";
+    els.runMeta.textContent = String(error);
+    return null;
+  }
+}
+
+async function refreshPipelineJobStatus(options = {}) {
+  const { reloadOnComplete = false } = options;
+  if (!state.current) return null;
+  const candidateId = state.current.candidate_id;
+  try {
+    const payload = await fetchJson(`/api/cv-runs/${candidateId}/pipeline`);
+    const job = payload.job || { status: "idle" };
+    if (payload.openpose_setup) state.openposeSetup = payload.openpose_setup;
+    if (payload.mmpose_setup) state.mmposeSetup = payload.mmpose_setup;
+    renderPipelineJobStatus(job);
+    if (payload.jobs?.mask) renderSamJobStatus(payload.jobs.mask);
+    if (payload.jobs?.pose) renderCvJobStatus("pose", payload.jobs.pose);
+    if (payload.jobs?.densepose) renderCvJobStatus("densepose", payload.jobs.densepose);
+    if (payload.jobs?.fusion) renderCvJobStatus("fusion", payload.jobs.fusion);
+    if (payload.jobs?.features) renderCvJobStatus("features", payload.jobs.features);
+    if (job.status === "running") {
+      schedulePipelinePoll();
+    } else {
+      clearPipelinePoll();
+      if (reloadOnComplete && job.status === "completed" && state.current?.candidate_id === candidateId) {
+        await loadRun(candidateId, { refreshJob: false, preservePolls: true });
+        renderPipelineJobStatus(job);
+        setSaveState("Pipeline complete");
+      }
+      if (job.status === "failed") {
+        setSaveState("Pipeline failed", "is-error");
+      }
+    }
+    return job;
+  } catch (error) {
+    clearPipelinePoll();
+    els.pipelineJobState.textContent = "Pipeline unavailable";
+    els.pipelineJobState.className = "rank-pill cv-job-state is-error";
     els.runMeta.textContent = String(error);
     return null;
   }
@@ -1032,6 +1196,39 @@ async function startSamRun() {
   }
 }
 
+async function startPipelineRun() {
+  if (!state.current) return;
+  if (normalizedSelection().type === "unset") {
+    setSaveState("Select target first", "is-error");
+    renderPipelineJobStatus();
+    return;
+  }
+  const candidateId = state.current.candidate_id;
+  const savedRun = await savePrompt({ rerender: false, flash: false });
+  if (!savedRun || state.current?.candidate_id !== candidateId) return;
+
+  try {
+    setSaveState("Starting pipeline", "is-saving");
+    const payload = await fetchJson(`/api/cv-runs/${candidateId}/pipeline`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        pose_backend: state.poseBackend,
+        mask_quality_mode: state.maskQualityMode,
+      }),
+    });
+    if (payload.openpose_setup) state.openposeSetup = payload.openpose_setup;
+    if (payload.mmpose_setup) state.mmposeSetup = payload.mmpose_setup;
+    renderPipelineJobStatus(payload.job);
+    setSaveState("Pipeline running", "is-saving");
+    schedulePipelinePoll();
+  } catch (error) {
+    setSaveState("Start failed", "is-error");
+    els.runMeta.textContent = String(error);
+    await refreshPipelineJobStatus();
+  }
+}
+
 async function startCvRun(kind) {
   if (!state.current) return;
   const candidateId = state.current.candidate_id;
@@ -1047,9 +1244,16 @@ async function startCvRun(kind) {
     const payload = await fetchJson(`/api/cv-runs/${candidateId}/${kind}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(kind === "pose" ? { backend: state.poseBackend } : {}),
     });
     if (kind === "densepose" && payload.setup) {
       state.denseposeSetup = payload.setup;
+    }
+    if (kind === "pose" && payload.openpose_setup) {
+      state.openposeSetup = payload.openpose_setup;
+    }
+    if (kind === "pose" && payload.mmpose_setup) {
+      state.mmposeSetup = payload.mmpose_setup;
     }
     if (kind === "openpose" && payload.setup) {
       state.openposeSetup = payload.setup;
@@ -1154,14 +1358,17 @@ els.promptOverlay.addEventListener("pointerup", (event) => {
 els.undoButton.addEventListener("click", undoSelection);
 els.clearButton.addEventListener("click", clearSelection);
 els.savePromptButton.addEventListener("click", savePrompt);
-els.maskBackendSelect.addEventListener("change", () => {
-  state.maskBackend = els.maskBackendSelect.value;
-  renderSamJobStatus();
+els.poseBackendSelect.addEventListener("change", () => {
+  state.poseBackend = els.poseBackendSelect.value;
+  renderCvJobStatus("pose");
+  renderPipelineJobStatus();
 });
 els.maskQualitySelect.addEventListener("change", () => {
   state.maskQualityMode = els.maskQualitySelect.value;
   renderSamJobStatus();
+  renderPipelineJobStatus();
 });
+els.runPipelineButton.addEventListener("click", startPipelineRun);
 els.runSamButton.addEventListener("click", startSamRun);
 els.runPoseButton.addEventListener("click", () => startCvRun("pose"));
 els.runDenseposeButton.addEventListener("click", () => startCvRun("densepose"));

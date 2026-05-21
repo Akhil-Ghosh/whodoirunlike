@@ -48,6 +48,20 @@ python -m pip install -e ".[dev]"
 python -m camoufox fetch
 ```
 
+## Landing Site Prototype
+
+The public-facing website prototype lives in `site/`, separate from the internal clip
+review UI and CV pipeline tools. It is a Next.js app that uses the generated asset pack
+for the hero comparison, upload card, brand marks, and athlete cards.
+
+```bash
+cd site
+npm install
+npm run dev
+```
+
+Open `http://127.0.0.1:4173`.
+
 ## Discover Candidate YouTube Videos
 
 Start small while we tune queries:

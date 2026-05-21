@@ -6,6 +6,7 @@ from typing import Any
 
 from whodoirunlike.openpose_runner import (
     BODY25_NAMES,
+    body25_row_to_pose_row,
     compare_openpose_to_mediapipe,
     openpose_setup_status,
     run_openpose_comparison,
@@ -32,6 +33,14 @@ def _write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
 def test_openpose_setup_status_reports_missing_binary(monkeypatch: Any) -> None:
     monkeypatch.delenv("OPENPOSE_BIN", raising=False)
     monkeypatch.delenv("OPENPOSE_MODEL_FOLDER", raising=False)
+    monkeypatch.setattr(
+        "whodoirunlike.openpose_runner.DEFAULT_OPENPOSE_BIN",
+        Path("/tmp/whodoirunlike-missing-openpose.bin"),
+    )
+    monkeypatch.setattr(
+        "whodoirunlike.openpose_runner.DEFAULT_OPENPOSE_MODEL_FOLDER",
+        Path("/tmp/whodoirunlike-missing-openpose-models"),
+    )
     monkeypatch.setattr("whodoirunlike.openpose_runner.shutil.which", lambda _: None)
 
     status = openpose_setup_status()
@@ -57,6 +66,38 @@ def test_select_openpose_person_prefers_runner_mask_overlap() -> None:
     assert selected_index == 1
     assert bbox is not None
     assert mask_iou > 0
+
+
+def test_body25_row_to_pose_row_maps_openpose_to_canonical_pose() -> None:
+    row = {
+        "frame_index": 3,
+        "time_seconds": 0.1,
+        "frame_width": 100,
+        "frame_height": 200,
+        "usable": True,
+        "bbox": {"x": 0.1, "y": 0.2, "width": 0.3, "height": 0.5},
+        "landmarks": [
+            {
+                "index": index,
+                "name": name,
+                "x": 0.2 + index * 0.001,
+                "y": 0.3 + index * 0.001,
+                "score": 0.8,
+            }
+            for index, name in enumerate(BODY25_NAMES)
+        ],
+    }
+
+    mapped = body25_row_to_pose_row(row)
+
+    assert mapped["source_pose_backend"] == "openpose_body25"
+    assert mapped["landmarks"][11]["source_name"] == "left_shoulder"
+    assert mapped["landmarks"][12]["source_name"] == "right_shoulder"
+    assert mapped["landmarks"][29]["source_name"] == "left_heel"
+    assert mapped["landmarks"][30]["source_name"] == "right_heel"
+    assert mapped["landmarks"][17]["source_name"] == "left_wrist"
+    assert mapped["landmarks"][17]["synthetic"] is True
+    assert mapped["visibility_mean"] > 0.0
 
 
 def test_compare_openpose_to_mediapipe_writes_summary(tmp_path: Path) -> None:
@@ -113,6 +154,15 @@ def test_run_openpose_comparison_marks_manifest_unavailable(
     monkeypatch: Any,
 ) -> None:
     monkeypatch.delenv("OPENPOSE_BIN", raising=False)
+    monkeypatch.delenv("OPENPOSE_MODEL_FOLDER", raising=False)
+    monkeypatch.setattr(
+        "whodoirunlike.openpose_runner.DEFAULT_OPENPOSE_BIN",
+        tmp_path / "missing-openpose.bin",
+    )
+    monkeypatch.setattr(
+        "whodoirunlike.openpose_runner.DEFAULT_OPENPOSE_MODEL_FOLDER",
+        tmp_path / "missing-openpose-models",
+    )
     monkeypatch.setattr("whodoirunlike.openpose_runner.shutil.which", lambda _: None)
     run_dir = tmp_path / "candidate-1"
     manifest_path = run_dir / "cv_run_manifest.json"

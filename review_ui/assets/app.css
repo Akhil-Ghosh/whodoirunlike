@@ -880,6 +880,7 @@ textarea {
   color: var(--bad);
 }
 
+.run-pipeline-button,
 .run-sam-button,
 .run-cv-button {
   white-space: nowrap;

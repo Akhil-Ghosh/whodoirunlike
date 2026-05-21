@@ -122,23 +122,31 @@
               <span class="rank-pill cv-job-state" id="fusionJobState">Fusion idle</span>
               <span class="rank-pill cv-job-state" id="featuresJobState">Features idle</span>
               <span class="rank-pill cv-job-state" id="openposeJobState">OpenPose idle</span>
-              <label class="backend-select-label" for="maskBackendSelect">
-                <span>Backend</span>
-                <select id="maskBackendSelect">
-                  <option value="sam2">SAM 2.1</option>
-                  <option value="sam31_mlx">SAM 3.1 MLX</option>
+              <span class="rank-pill cv-job-state" id="pipelineJobState">Pipeline idle</span>
+              <label class="backend-select-label" for="poseBackendSelect">
+                <span>Pose</span>
+                <select id="poseBackendSelect">
+                  <option value="openpose" selected>OpenPose</option>
+                  <option value="mmpose_rtmw_l_384">RTMW-L 384 best</option>
+                  <option value="mmpose_rtmw_l_256">RTMW-L 256 fast</option>
+                  <option value="mmpose_rtmw_m_256">RTMW-M 256 lite</option>
+                  <option value="mmpose_rtmpose_l_384">RTMPose-L 384</option>
+                  <option value="mediapipe">MediaPipe</option>
                 </select>
               </label>
-              <label class="backend-select-label quality-select-label is-hidden" id="maskQualityLabel" for="maskQualitySelect">
-                <span>Mode</span>
+              <label class="backend-select-label quality-select-label" id="maskQualityLabel" for="maskQualitySelect">
+                <span>Mask</span>
                 <select id="maskQualitySelect">
                   <option value="max">Highest quality</option>
                   <option value="native" selected>1008</option>
                   <option value="fast">224 fast</option>
                 </select>
               </label>
+              <button class="primary-button run-pipeline-button" id="runPipelineButton" type="button">
+                Run Full Pipeline
+              </button>
               <button class="primary-button run-sam-button" id="runSamButton" type="button">
-                Run mask
+                Run SAM 3.1
               </button>
               <button class="ghost-button run-cv-button" id="runPoseButton" type="button">
                 Run Pose
@@ -156,6 +164,17 @@
                 Compare OpenPose
               </button>
             </div>
+          </div>
+
+          <div class="mask-progress cv-progress is-hidden" id="pipelineProgress">
+            <div class="mask-progress-top">
+              <span id="pipelineProgressLabel">Preparing full pipeline</span>
+              <strong id="pipelineProgressEta">ETA --</strong>
+            </div>
+            <div class="mask-progress-track" aria-hidden="true">
+              <span id="pipelineProgressBar"></span>
+            </div>
+            <div class="mask-progress-meta" id="pipelineProgressMeta">Waiting for stages</div>
           </div>
 
           <div class="mask-progress is-hidden" id="maskProgress">

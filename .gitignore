@@ -7,6 +7,10 @@ __pycache__/
 .mypy_cache/
 .venv/
 venv/
+node_modules/
+.next/
+out/
+*.tsbuildinfo
 
 # Generated / local media artifacts
 artifacts/**

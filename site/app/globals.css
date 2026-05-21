@@ -1,0 +1,86 @@
+@import "tailwindcss";
+
+:root {
+  --paper: #fbfaf7;
+  --paper-soft: #f8f7f4;
+  --ink: #171719;
+  --muted: #5c5a57;
+  --line: #e7e2d8;
+  --accent: #af9272;
+  --accent-deep: #9f7f5d;
+  --charcoal: #101113;
+  --charcoal-2: #191a1d;
+  --hand-font: "Segoe Print", "Bradley Hand", "Comic Sans MS", cursive;
+}
+
+@theme {
+  --font-sans: var(--font-geist), ui-sans-serif, system-ui, sans-serif;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html {
+  scroll-behavior: smooth;
+}
+
+body {
+  margin: 0;
+  overflow-x: hidden;
+}
+
+button,
+input {
+  font: inherit;
+}
+
+button {
+  cursor: pointer;
+}
+
+img {
+  max-width: 100%;
+}
+
+.hand-font {
+  font-family: var(--hand-font);
+}
+
+.hero-field {
+  background:
+    radial-gradient(circle at 50% 0%, rgba(255, 255, 255, 0.98), rgba(255, 255, 255, 0) 30rem),
+    linear-gradient(180deg, #fbfaf7 0%, #fbfaf7 72%, #f6f4ef 100%);
+}
+
+.runner-ground {
+  background: radial-gradient(ellipse at center, rgba(23, 23, 25, 0.2), rgba(23, 23, 25, 0) 64%);
+  filter: blur(5px);
+}
+
+.upload-glass {
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.86),
+    0 26px 70px rgba(28, 24, 18, 0.12);
+}
+
+.dark-band {
+  background:
+    radial-gradient(circle at 23% 34%, rgba(255, 255, 255, 0.05), transparent 18rem),
+    linear-gradient(120deg, #111214 0%, #17191d 56%, #0d0e10 100%);
+}
+
+.athlete-vignette {
+  background:
+    linear-gradient(90deg, rgba(0, 0, 0, 0.04) 0%, rgba(0, 0, 0, 0.56) 54%, rgba(0, 0, 0, 0.74) 100%),
+    linear-gradient(180deg, rgba(0, 0, 0, 0) 45%, rgba(0, 0, 0, 0.3) 100%);
+}
+
+.focus-ring {
+  outline: 2px solid transparent;
+  outline-offset: 3px;
+}
+
+.focus-ring:focus-visible {
+  outline-color: rgba(175, 146, 114, 0.8);
+}

@@ -12,7 +12,7 @@ import cv2
 import numpy as np
 
 from whodoirunlike.cv_flow import utc_now_iso
-from whodoirunlike.pose_runner import hard_mask_frame
+from whodoirunlike.pose_runner import LANDMARK_NAMES, hard_mask_frame
 from whodoirunlike.sam2_runner import inspect_video, read_json, write_json
 from whodoirunlike.video_io import make_browser_playable_mp4s
 
@@ -20,6 +20,11 @@ from whodoirunlike.video_io import make_browser_playable_mp4s
 OPENPOSE_BIN_ENV = "OPENPOSE_BIN"
 OPENPOSE_MODEL_FOLDER_ENV = "OPENPOSE_MODEL_FOLDER"
 OpenPoseProgressCallback = Callable[[dict[str, Any]], None]
+REPO_ROOT = Path(__file__).resolve().parents[2]
+DEFAULT_OPENPOSE_ROOT = REPO_ROOT / "models/openpose/openpose-with-caffe-for-MacM1"
+DEFAULT_OPENPOSE_BIN = DEFAULT_OPENPOSE_ROOT / "build/examples/openpose/openpose.bin"
+DEFAULT_OPENPOSE_MODEL_FOLDER = DEFAULT_OPENPOSE_ROOT / "models"
+DEFAULT_BODY25_MODEL = DEFAULT_OPENPOSE_MODEL_FOLDER / "pose/body_25/pose_iter_584000.caffemodel"
 
 BODY25_NAMES = [
     "nose",
@@ -73,6 +78,10 @@ BODY25_CONNECTIONS = [
 
 BODY25_TO_MEDIAPIPE = {
     0: 0,
+    15: 5,
+    16: 2,
+    17: 8,
+    18: 7,
     2: 12,
     3: 14,
     4: 16,
@@ -86,8 +95,27 @@ BODY25_TO_MEDIAPIPE = {
     13: 25,
     14: 27,
     19: 31,
+    21: 29,
     22: 32,
+    24: 30,
 }
+
+MEDIAPIPE_SYNTHETIC_FROM_BODY25 = {
+    1: 16,  # left_eye_inner
+    3: 16,  # left_eye_outer
+    4: 15,  # right_eye_inner
+    6: 15,  # right_eye_outer
+    9: 0,  # mouth_left
+    10: 0,  # mouth_right
+    17: 7,  # left_pinky
+    19: 7,  # left_index
+    21: 7,  # left_thumb
+    18: 4,  # right_pinky
+    20: 4,  # right_index
+    22: 4,  # right_thumb
+}
+
+MEDIAPIPE_CORE_INDICES = {11, 12, 13, 14, 15, 16, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32}
 
 
 def build_openpose_progress(
@@ -125,7 +153,13 @@ def openpose_setup_status(
     model_folder: str | Path | None = None,
 ) -> dict[str, Any]:
     binary_value = str(binary_path or os.environ.get(OPENPOSE_BIN_ENV, "")).strip()
-    resolved_binary = binary_value or shutil.which("openpose") or shutil.which("openpose.bin")
+    local_binary = str(DEFAULT_OPENPOSE_BIN) if DEFAULT_OPENPOSE_BIN.exists() else None
+    resolved_binary = (
+        binary_value
+        or local_binary
+        or shutil.which("openpose")
+        or shutil.which("openpose.bin")
+    )
     reasons: list[str] = []
     if not resolved_binary:
         reasons.append(
@@ -135,14 +169,22 @@ def openpose_setup_status(
         reasons.append(f"{OPENPOSE_BIN_ENV} does not exist: {resolved_binary}")
 
     model_value = str(model_folder or os.environ.get(OPENPOSE_MODEL_FOLDER_ENV, "")).strip()
-    if model_value and not Path(model_value).expanduser().exists():
-        reasons.append(f"{OPENPOSE_MODEL_FOLDER_ENV} does not exist: {model_value}")
+    local_model_folder = (
+        str(DEFAULT_OPENPOSE_MODEL_FOLDER) if DEFAULT_OPENPOSE_MODEL_FOLDER.exists() else ""
+    )
+    resolved_model_folder = model_value or local_model_folder
+    if resolved_model_folder and not Path(resolved_model_folder).expanduser().exists():
+        reasons.append(f"{OPENPOSE_MODEL_FOLDER_ENV} does not exist: {resolved_model_folder}")
+    elif resolved_model_folder:
+        body25_model = Path(resolved_model_folder).expanduser() / "pose/body_25/pose_iter_584000.caffemodel"
+        if not body25_model.exists() or body25_model.stat().st_size == 0:
+            reasons.append(f"OpenPose BODY_25 model not found or empty: {body25_model}")
 
     return {
         "ready": not reasons,
         "reasons": reasons,
         "binary": resolved_binary,
-        "model_folder": model_value or None,
+        "model_folder": resolved_model_folder or None,
         "env": {
             "binary": OPENPOSE_BIN_ENV,
             "model_folder": OPENPOSE_MODEL_FOLDER_ENV,
@@ -245,6 +287,111 @@ def _landmarks_from_body25(points: np.ndarray, width: int, height: int) -> list[
             }
         )
     return landmarks
+
+
+def _empty_canonical_landmark(index: int) -> dict[str, Any]:
+    return {
+        "index": index,
+        "name": LANDMARK_NAMES[index],
+        "x": 0.0,
+        "y": 0.0,
+        "z": 0.0,
+        "visibility": 0.0,
+        "presence": 0.0,
+        "source": "openpose_body25",
+        "source_index": None,
+        "source_name": None,
+        "synthetic": False,
+        "missing": True,
+    }
+
+
+def _copy_body25_landmark(
+    target: list[dict[str, Any]],
+    *,
+    media_index: int,
+    source: dict[str, Any],
+    synthetic: bool = False,
+) -> None:
+    score = round(float(source.get("score") or 0.0) * (0.35 if synthetic else 1.0), 6)
+    target[media_index] = {
+        "index": media_index,
+        "name": LANDMARK_NAMES[media_index],
+        "x": round(float(source.get("x") or 0.0), 6),
+        "y": round(float(source.get("y") or 0.0), 6),
+        "z": 0.0,
+        "visibility": score,
+        "presence": score,
+        "source": "openpose_body25",
+        "source_index": int(source.get("index") or 0),
+        "source_name": str(source.get("name") or ""),
+        "synthetic": synthetic,
+        "missing": False,
+    }
+
+
+def body25_row_to_pose_row(row: dict[str, Any]) -> dict[str, Any]:
+    """Map OpenPose BODY_25 output into the canonical 33-landmark pose contract."""
+    body25_landmarks = row.get("landmarks") or []
+    canonical = [_empty_canonical_landmark(index) for index in range(len(LANDMARK_NAMES))]
+
+    for body25_index, media_index in BODY25_TO_MEDIAPIPE.items():
+        if body25_index < len(body25_landmarks):
+            _copy_body25_landmark(
+                canonical,
+                media_index=media_index,
+                source=body25_landmarks[body25_index],
+            )
+
+    for media_index, body25_index in MEDIAPIPE_SYNTHETIC_FROM_BODY25.items():
+        if body25_index < len(body25_landmarks) and canonical[media_index]["missing"]:
+            _copy_body25_landmark(
+                canonical,
+                media_index=media_index,
+                source=body25_landmarks[body25_index],
+                synthetic=True,
+            )
+
+    core_scores = [
+        float(landmark.get("visibility") or 0.0)
+        for landmark in canonical
+        if int(landmark["index"]) in MEDIAPIPE_CORE_INDICES and not landmark.get("missing")
+    ]
+    visibility_mean = float(np.mean(core_scores)) if core_scores else 0.0
+    usable = bool(row.get("usable")) and visibility_mean >= 0.05
+    return {
+        "frame_index": int(row.get("frame_index") or 0),
+        "time_seconds": row.get("time_seconds"),
+        "frame_width": row.get("frame_width"),
+        "frame_height": row.get("frame_height"),
+        "usable": usable,
+        "drop_reason": None if usable else row.get("drop_reason") or "openpose_missing_or_off_mask",
+        "visibility_mean": round(visibility_mean, 6),
+        "presence_mean": round(visibility_mean, 6),
+        "bbox": row.get("bbox"),
+        "selected_pose_index": row.get("selected_pose_index"),
+        "candidate_count": row.get("candidate_count"),
+        "mask_iou": row.get("mask_iou"),
+        "source_pose_backend": "openpose_body25",
+        "landmarks": canonical,
+        "world_landmarks": [],
+    }
+
+
+def _summarize_canonical_pose(rows: Sequence[dict[str, Any]], raw_summary: dict[str, Any]) -> dict[str, Any]:
+    visibility_values = [float(row.get("visibility_mean") or 0.0) for row in rows]
+    usable_frames = sum(1 for row in rows if row.get("usable"))
+    frame_count = len(rows)
+    return {
+        "quality": {
+            "pose_hit_rate": raw_summary.get("pose_hit_rate", 0.0),
+            "usable_rate": round(usable_frames / frame_count, 4) if frame_count else 0.0,
+            "visibility_mean": round(float(np.mean(visibility_values)), 6) if visibility_values else 0.0,
+            "landmark_count": len(LANDMARK_NAMES),
+            "source_landmark_count": len(BODY25_NAMES),
+        },
+        "raw_openpose": raw_summary,
+    }
 
 
 def select_openpose_person(
@@ -358,6 +505,9 @@ def _run_openpose_binary(
     input_dir: Path,
     output_dir: Path,
     model_folder: str | None,
+    total_frames: int = 0,
+    progress_callback: OpenPoseProgressCallback | None = None,
+    started_at: float | None = None,
 ) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     for old in output_dir.glob("*.json"):
@@ -377,7 +527,31 @@ def _run_openpose_binary(
     ]
     if model_folder:
         command.extend(["--model_folder", model_folder])
-    subprocess.run(command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    stdout_path = output_dir.parent / "openpose_stdout.log"
+    stderr_path = output_dir.parent / "openpose_stderr.log"
+    started = started_at if started_at is not None else time.monotonic()
+    with stdout_path.open("w", encoding="utf-8") as stdout, stderr_path.open(
+        "w", encoding="utf-8"
+    ) as stderr:
+        process = subprocess.Popen(command, stdout=stdout, stderr=stderr, text=True)
+        while True:
+            return_code = process.poll()
+            if progress_callback and total_frames:
+                processed_frames = len(list(output_dir.glob("*_keypoints.json")))
+                progress_callback(
+                    build_openpose_progress(
+                        phase="running_openpose",
+                        processed_frames=processed_frames,
+                        total_frames=total_frames,
+                        elapsed_seconds=time.monotonic() - started,
+                    )
+                )
+            if return_code is not None:
+                break
+            time.sleep(1.0)
+    if return_code != 0:
+        stderr_tail = stderr_path.read_text(encoding="utf-8", errors="replace")[-4000:]
+        raise RuntimeError(f"OpenPose failed with exit code {return_code}: {stderr_tail}")
 
 
 def _openpose_json_for_frame(output_dir: Path, frame_index: int) -> Path:
@@ -435,6 +609,8 @@ def _rows_from_openpose_json(
             row = {
                 "frame_index": frame_index,
                 "time_seconds": round(frame_index / fps, 3) if fps else None,
+                "frame_width": width,
+                "frame_height": height,
                 "detected": bool(people),
                 "usable": usable,
                 "drop_reason": None if usable else "openpose_missing_or_off_mask",
@@ -557,6 +733,184 @@ def update_manifest_openpose(
     write_json(manifest_path, manifest)
 
 
+def update_manifest_openpose_pose(
+    manifest_path: Path,
+    *,
+    pose_landmarks_path: Path,
+    raw_openpose_landmarks_path: Path,
+    skeleton_render_path: Path,
+    qa_overlay_path: Path,
+    features_path: Path,
+    result: dict[str, Any],
+) -> None:
+    manifest = read_json(manifest_path)
+    paths = manifest.setdefault("paths", {})
+    paths["pose_landmarks"] = str(pose_landmarks_path)
+    paths["openpose_landmarks"] = str(raw_openpose_landmarks_path)
+    paths["skeleton_render"] = str(skeleton_render_path)
+    paths["qa_overlay"] = str(qa_overlay_path)
+    paths["openpose_skeleton_render"] = str(skeleton_render_path)
+    paths["openpose_qa_overlay"] = str(qa_overlay_path)
+    paths["features"] = str(features_path)
+    stages = manifest.setdefault("stages", {})
+    quality = result.get("quality", {})
+    stages["pose"] = {
+        "status": "complete",
+        "backend": "openpose_body25",
+        "recommended_tool": "OpenPose BODY_25 canonical pose",
+        "output": str(pose_landmarks_path),
+        "raw_output": str(raw_openpose_landmarks_path),
+        "summary": {
+            "pose_hit_rate": quality.get("pose_hit_rate"),
+            "usable_rate": quality.get("usable_rate"),
+            "visibility_mean": quality.get("visibility_mean"),
+        },
+    }
+    stages.setdefault("renders", {})["status"] = "partial_complete"
+    stages["renders"]["skeleton_render"] = str(skeleton_render_path)
+    stages.setdefault("features", {})["status"] = "complete"
+    stages["features"]["output"] = str(features_path)
+    manifest["updated_at"] = utc_now_iso()
+    write_json(manifest_path, manifest)
+
+
+def run_openpose_pose(
+    *,
+    run_dir: Path,
+    binary_path: str | Path | None = None,
+    model_folder: str | Path | None = None,
+    progress_callback: OpenPoseProgressCallback | None = None,
+) -> dict[str, Any]:
+    started_at = time.monotonic()
+    manifest_path = run_dir / "cv_run_manifest.json"
+    manifest = read_json(manifest_path)
+    paths = manifest["paths"]
+    source_segment = Path(str(paths["source_segment"]))
+    runner_mask = Path(str(paths.get("runner_mask") or ""))
+    raw_landmarks_path = Path(str(paths.get("openpose_landmarks") or run_dir / "openpose_landmarks.jsonl"))
+    pose_landmarks_path = Path(str(paths.get("pose_landmarks") or run_dir / "pose_landmarks.jsonl"))
+    skeleton_render_path = Path(str(paths.get("skeleton_render") or run_dir / "skeleton_render.mp4"))
+    qa_overlay_path = Path(str(paths.get("qa_overlay") or run_dir / "qa_overlay.mp4"))
+    features_path = Path(str(paths.get("features") or run_dir / "features.json"))
+
+    setup = openpose_setup_status(binary_path=binary_path, model_folder=model_folder)
+    if not setup["ready"]:
+        error = "; ".join(setup["reasons"])
+        update_manifest_openpose(
+            manifest_path,
+            status="unavailable",
+            landmarks_path=raw_landmarks_path,
+            comparison_path=Path(str(paths.get("pose_comparison") or run_dir / "pose_comparison.json")),
+            skeleton_render_path=skeleton_render_path,
+            qa_overlay_path=qa_overlay_path,
+            error=error,
+        )
+        return {
+            "candidate_id": manifest.get("candidate_id"),
+            "backend": "openpose_body25",
+            "status": "unavailable",
+            "error": error,
+            "setup": setup,
+            "frame_count": 0,
+            "elapsed_seconds": round(time.monotonic() - started_at, 3),
+        }
+
+    if progress_callback:
+        progress_callback(
+            build_openpose_progress(
+                phase="preparing_openpose_frames",
+                processed_frames=0,
+                total_frames=0,
+                elapsed_seconds=0.0,
+            )
+        )
+    input_dir = run_dir / "openpose_input_frames"
+    output_dir = run_dir / "openpose_json"
+    meta = _prepare_openpose_input_frames(
+        source_segment=source_segment,
+        runner_mask=runner_mask if runner_mask.exists() else None,
+        input_dir=input_dir,
+        progress_callback=progress_callback,
+        started_at=started_at,
+    )
+    if progress_callback:
+        progress_callback(
+            build_openpose_progress(
+                phase="running_openpose",
+                processed_frames=0,
+                total_frames=int(meta.get("frame_count") or 0),
+                elapsed_seconds=time.monotonic() - started_at,
+            )
+        )
+    try:
+        _run_openpose_binary(
+            binary=str(setup["binary"]),
+            input_dir=input_dir,
+            output_dir=output_dir,
+            model_folder=str(setup["model_folder"]) if setup.get("model_folder") else None,
+            total_frames=int(meta.get("frame_count") or 0),
+            progress_callback=progress_callback,
+            started_at=started_at,
+        )
+        raw_summary = _rows_from_openpose_json(
+            output_dir=output_dir,
+            source_segment=source_segment,
+            runner_mask=runner_mask if runner_mask.exists() else None,
+            landmarks_path=raw_landmarks_path,
+            skeleton_render_path=skeleton_render_path,
+            qa_overlay_path=qa_overlay_path,
+            progress_callback=progress_callback,
+            started_at=started_at,
+        )
+        raw_rows = read_jsonl(raw_landmarks_path)
+        pose_rows = [body25_row_to_pose_row(row) for row in raw_rows]
+        write_jsonl(pose_landmarks_path, pose_rows)
+        summary = _summarize_canonical_pose(pose_rows, raw_summary)
+        features = {
+            "version": 1,
+            "created_at": utc_now_iso(),
+            "backend": "openpose_body25",
+            "model_pose": "BODY_25",
+            "input_video": str(source_segment),
+            "frame_count": len(pose_rows),
+            **summary,
+        }
+        write_json(features_path, features)
+        update_manifest_openpose_pose(
+            manifest_path,
+            pose_landmarks_path=pose_landmarks_path,
+            raw_openpose_landmarks_path=raw_landmarks_path,
+            skeleton_render_path=skeleton_render_path,
+            qa_overlay_path=qa_overlay_path,
+            features_path=features_path,
+            result=summary,
+        )
+        return {
+            "candidate_id": manifest.get("candidate_id"),
+            "backend": "openpose_body25",
+            "status": "complete",
+            "frame_count": len(pose_rows),
+            "elapsed_seconds": round(time.monotonic() - started_at, 3),
+            "pose_landmarks_path": str(pose_landmarks_path),
+            "openpose_landmarks": str(raw_landmarks_path),
+            "skeleton_render_path": str(skeleton_render_path),
+            "qa_overlay_path": str(qa_overlay_path),
+            "features_path": str(features_path),
+            **summary,
+        }
+    except Exception as exc:
+        update_manifest_openpose(
+            manifest_path,
+            status="failed",
+            landmarks_path=raw_landmarks_path,
+            comparison_path=Path(str(paths.get("pose_comparison") or run_dir / "pose_comparison.json")),
+            skeleton_render_path=skeleton_render_path,
+            qa_overlay_path=qa_overlay_path,
+            error=str(exc),
+        )
+        raise
+
+
 def run_openpose_comparison(
     *,
     run_dir: Path,
@@ -633,6 +987,9 @@ def run_openpose_comparison(
             input_dir=input_dir,
             output_dir=output_dir,
             model_folder=str(setup["model_folder"]) if setup.get("model_folder") else None,
+            total_frames=int(meta.get("frame_count") or 0),
+            progress_callback=progress_callback,
+            started_at=started_at,
         )
         summary = _rows_from_openpose_json(
             output_dir=output_dir,

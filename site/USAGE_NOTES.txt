@@ -1,0 +1,3 @@
+Asset pack generated for the Who Do I Run Like landing page prototype.
+
+Images in this folder are generated or user-provided prototype assets. Do not assume they are cleared for public commercial launch without review.

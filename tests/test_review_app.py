@@ -493,7 +493,7 @@ def test_start_pose_job_marks_stage_running(tmp_path: Path, monkeypatch: pytest.
 
     monkeypatch.setattr(review_app.threading, "Thread", DummyThread)
 
-    status = start_pose_job(config, "pose-clip")
+    status = start_pose_job(config, "pose-clip", pose_backend="mediapipe")
 
     manifest = json.loads((run_dir / "cv_run_manifest.json").read_text(encoding="utf-8"))
     assert status["status"] == "running"

@@ -28,6 +28,35 @@ def write_identity_video(path: Path) -> None:
     writer.release()
 
 
+def write_switch_identity_video(path: Path) -> None:
+    writer = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*"mp4v"), 10.0, (96, 64))
+    assert writer.isOpened()
+    for index in range(18):
+        frame = np.full((64, 96, 3), 28, dtype=np.uint8)
+        target_x = 22 + index
+        cv2.rectangle(frame, (target_x, 18), (target_x + 14, 48), (48, 180, 220), -1)
+        cv2.circle(frame, (target_x + 7, 52), 3, (48, 180, 220), -1)
+        cv2.rectangle(frame, (60, 18), (74, 48), (40, 220, 80), -1)
+        cv2.circle(frame, (67, 52), 3, (40, 220, 80), -1)
+        writer.write(frame)
+    writer.release()
+
+
+def write_lookalike_jump_video(path: Path) -> None:
+    writer = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*"mp4v"), 10.0, (96, 64))
+    assert writer.isOpened()
+    for index in range(18):
+        frame = np.full((64, 96, 3), 28, dtype=np.uint8)
+        target_x = 22 + index
+        target_color = (48, 180, 220)
+        cv2.rectangle(frame, (target_x, 18), (target_x + 14, 48), target_color, -1)
+        cv2.circle(frame, (target_x + 7, 52), 3, target_color, -1)
+        cv2.rectangle(frame, (1, 18), (15, 48), (48, 180, 220), -1)
+        cv2.circle(frame, (8, 52), 3, (48, 180, 220), -1)
+        writer.write(frame)
+    writer.release()
+
+
 def write_json(path: Path, payload: dict[str, object]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
@@ -173,6 +202,101 @@ class FakeBoxmotTracker:
         return np.array([[det[0], det[1], det[2], det[3], 7, det[4], 0, 0]], dtype=np.float32)
 
 
+class SwitchFakeBoxes:
+    def __init__(self, frame_index: int) -> None:
+        target_x = 22 + frame_index
+        self.xyxy = np.array(
+            [
+                [target_x, 18, target_x + 14, 48],
+                [60, 18, 74, 48],
+            ],
+            dtype=np.float32,
+        )
+        self.conf = np.array([0.94, 0.93], dtype=np.float32)
+        self.cls = np.array([0, 0], dtype=np.float32)
+
+
+class SwitchFakeResult:
+    def __init__(self, frame_index: int) -> None:
+        self.boxes = SwitchFakeBoxes(frame_index)
+
+
+class SwitchFakeYolo:
+    def __init__(self) -> None:
+        self.frame_index = 0
+
+    def predict(self, frame: np.ndarray, **kwargs: object) -> list[SwitchFakeResult]:
+        result = SwitchFakeResult(self.frame_index)
+        self.frame_index += 1
+        return [result]
+
+
+class SwitchFakeBoxmotTracker:
+    def __init__(self) -> None:
+        self.frame_index = 0
+
+    def update(self, detections: np.ndarray, frame: np.ndarray) -> np.ndarray:
+        if detections.size == 0:
+            return np.empty((0, 8), dtype=np.float32)
+        frame_index = self.frame_index
+        self.frame_index += 1
+        target = detections[0]
+        distractor = detections[1]
+        if frame_index <= 9:
+            rows = [
+                [*target[:4], 3, target[4], 0, 0],
+                [*distractor[:4], 8, distractor[4], 0, 0],
+            ]
+        else:
+            rows = [
+                [*target[:4], 7, target[4], 0, 0],
+                [*distractor[:4], 3, distractor[4], 0, 0],
+            ]
+        return np.array(rows, dtype=np.float32)
+
+
+class LookalikeFakeBoxes:
+    def __init__(self, frame_index: int) -> None:
+        target_x = 22 + frame_index
+        self.xyxy = np.array(
+            [
+                [target_x, 18, target_x + 14, 48],
+                [1, 18, 15, 48],
+            ],
+            dtype=np.float32,
+        )
+        self.conf = np.array([0.91, 0.96], dtype=np.float32)
+        self.cls = np.array([0, 0], dtype=np.float32)
+
+
+class LookalikeFakeResult:
+    def __init__(self, frame_index: int) -> None:
+        self.boxes = LookalikeFakeBoxes(frame_index)
+
+
+class LookalikeFakeYolo:
+    def __init__(self) -> None:
+        self.frame_index = 0
+
+    def predict(self, frame: np.ndarray, **kwargs: object) -> list[LookalikeFakeResult]:
+        result = LookalikeFakeResult(self.frame_index)
+        self.frame_index += 1
+        return [result]
+
+
+class LookalikeFakeBoxmotTracker:
+    def update(self, detections: np.ndarray, frame: np.ndarray) -> np.ndarray:
+        if detections.size == 0:
+            return np.empty((0, 8), dtype=np.float32)
+        target = detections[0]
+        lookalike = detections[1]
+        rows = [
+            [*target[:4], 3, target[4], 0, 0],
+            [*lookalike[:4], 6, lookalike[4], 0, 0],
+        ]
+        return np.array(rows, dtype=np.float32)
+
+
 def test_boxmot_identity_tracking_uses_prompt_to_select_target_track(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -212,3 +336,82 @@ def test_boxmot_identity_tracking_uses_prompt_to_select_target_track(
     assert track_seed["backend"] == "boxmot_botsort"
     assert track_seed["tracker"]["name"] == "BotSort"
     assert track_seed["target_track_id"] == 7
+
+
+def test_boxmot_identity_tracking_recovers_when_tracker_id_switches(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_dir = tmp_path / "cv_runs" / "identity-clip"
+    run_dir.mkdir(parents=True)
+    write_identity_run(run_dir)
+    write_switch_identity_video(run_dir / "source_segment.mp4")
+
+    monkeypatch.setattr(
+        identity_runner,
+        "identity_setup_status",
+        lambda backend=None: {"ready": True, "reasons": [], "install_command": None},
+    )
+    monkeypatch.setattr(identity_runner, "_load_yolo_model", lambda detector_model: SwitchFakeYolo())
+    monkeypatch.setattr(
+        identity_runner,
+        "_create_boxmot_tracker",
+        lambda backend, reid_weights, device, half: SwitchFakeBoxmotTracker(),
+    )
+
+    result = run_identity_tracking(run_dir=run_dir, backend="boxmot_botsort", device="cpu")
+
+    assert result["status"] == "complete"
+    assert result["metrics"]["target_track_id"] == 3
+    assert result["metrics"]["target_track_ids"] == [3, 7]
+    assert result["metrics"]["target_track_switches"] == 1
+
+    track_rows = pq.read_table(run_dir / "tracklets.parquet").to_pylist()
+    target_rows = {
+        int(row["frame_index"]): row
+        for row in track_rows
+        if row["is_target"] and row["identity_state"] == "usable"
+    }
+    assert target_rows[9]["track_id"] == 3
+    assert target_rows[10]["track_id"] == 7
+
+    track_seed = json.loads((run_dir / "track_seed.json").read_text(encoding="utf-8"))
+    assert track_seed["target_track_id"] == 3
+    assert track_seed["target_track_ids"] == [3, 7]
+    assert track_seed["dynamic_target_selection"] is True
+
+
+def test_boxmot_identity_tracking_rejects_impossible_lookalike_jump(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_dir = tmp_path / "cv_runs" / "identity-clip"
+    run_dir.mkdir(parents=True)
+    write_identity_run(run_dir)
+    write_lookalike_jump_video(run_dir / "source_segment.mp4")
+
+    monkeypatch.setattr(
+        identity_runner,
+        "identity_setup_status",
+        lambda backend=None: {"ready": True, "reasons": [], "install_command": None},
+    )
+    monkeypatch.setattr(identity_runner, "_load_yolo_model", lambda detector_model: LookalikeFakeYolo())
+    monkeypatch.setattr(
+        identity_runner,
+        "_create_boxmot_tracker",
+        lambda backend, reid_weights, device, half: LookalikeFakeBoxmotTracker(),
+    )
+
+    result = run_identity_tracking(run_dir=run_dir, backend="boxmot_botsort", device="cpu")
+
+    assert result["status"] == "complete"
+    assert result["metrics"]["target_track_ids"] == [3]
+
+    track_rows = pq.read_table(run_dir / "tracklets.parquet").to_pylist()
+    target_rows = {
+        int(row["frame_index"]): row
+        for row in track_rows
+        if row["is_target"] and row["identity_state"] == "usable"
+    }
+    assert target_rows[10]["track_id"] == 3
+    assert target_rows[11]["track_id"] == 3

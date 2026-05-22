@@ -741,6 +741,350 @@ def _select_target_candidate(
     return best
 
 
+def _box_area(box: tuple[int, int, int, int]) -> float:
+    return float(max(1, int(box[2]) * int(box[3])))
+
+
+def _box_center_xy(box: tuple[int, int, int, int]) -> tuple[float, float]:
+    return (float(box[0]) + float(box[2]) / 2.0, float(box[1]) + float(box[3]) / 2.0)
+
+
+def _area_similarity(
+    a: tuple[int, int, int, int] | None,
+    b: tuple[int, int, int, int] | None,
+) -> float:
+    if a is None or b is None:
+        return 0.0
+    ratio = _box_area(a) / _box_area(b)
+    return min(ratio, 1.0 / ratio)
+
+
+def _center_continuity_score(
+    *,
+    candidate_box: tuple[int, int, int, int],
+    previous_box: tuple[int, int, int, int] | None,
+    frame_gap: int,
+    width: int,
+    height: int,
+) -> float:
+    if previous_box is None:
+        return 0.0
+    candidate_center = _box_center_xy(candidate_box)
+    previous_center = _box_center_xy(previous_box)
+    distance = float(
+        np.hypot(
+            candidate_center[0] - previous_center[0],
+            candidate_center[1] - previous_center[1],
+        )
+    )
+    max_jump = max(width, height) * 0.20 * max(1, frame_gap)
+    return max(0.0, 1.0 - (distance / max(max_jump, 1.0)))
+
+
+def _xywh_iou(
+    a: tuple[int, int, int, int] | None,
+    b: tuple[int, int, int, int] | None,
+) -> float:
+    if a is None or b is None:
+        return 0.0
+    return _bbox_iou_xyxy(_xywh_to_xyxy(a), _xywh_to_xyxy(b))
+
+
+def _normalized_anchor_from_prompt(
+    prompt: dict[str, Any],
+    prompt_box: tuple[int, int, int, int],
+    width: int,
+    height: int,
+) -> tuple[float, float]:
+    points = _prompt_points(prompt)
+    if points:
+        return (
+            sum(float(point["x"]) for point in points) / len(points),
+            sum(float(point["y"]) for point in points) / len(points),
+        )
+
+    selection = _selection(prompt)
+    subject_candidate = selection.get("subject_candidate")
+    if isinstance(subject_candidate, dict):
+        center = subject_candidate.get("center")
+        if isinstance(center, dict) and center.get("x") not in (None, "") and center.get("y") not in (None, ""):
+            return (
+                _clamp(float(center["x"]), 0.0, 1.0),
+                _clamp(float(center["y"]), 0.0, 1.0),
+            )
+
+    center_x, center_y = _box_center_xy(prompt_box)
+    return (center_x / max(width, 1), center_y / max(height, 1))
+
+
+def _prompt_anchor_box(
+    prompt: dict[str, Any],
+    prompt_box: tuple[int, int, int, int],
+    width: int,
+    height: int,
+) -> tuple[int, int, int, int]:
+    anchor_x, anchor_y = _normalized_anchor_from_prompt(prompt, prompt_box, width, height)
+    crop_width = max(8.0, min(width * 0.16, prompt_box[2] * 0.38))
+    crop_height = max(8.0, min(height * 0.24, prompt_box[3] * 0.32))
+    return _clip_box(
+        (
+            anchor_x * width - crop_width / 2.0,
+            anchor_y * height - crop_height / 2.0,
+            crop_width,
+            crop_height,
+        ),
+        width,
+        height,
+    )
+
+
+def _candidate_anchor_box(
+    candidate_box: tuple[int, int, int, int],
+    width: int,
+    height: int,
+) -> tuple[int, int, int, int]:
+    x, y, box_width, box_height = candidate_box
+    crop_width = max(6.0, box_width * 0.45)
+    crop_height = max(8.0, box_height * 0.35)
+    anchor_x = x + box_width * 0.55
+    anchor_y = y + box_height * 0.38
+    return _clip_box(
+        (
+            anchor_x - crop_width / 2.0,
+            anchor_y - crop_height / 2.0,
+            crop_width,
+            crop_height,
+        ),
+        width,
+        height,
+    )
+
+
+def _candidate_anchor_embedding(
+    frame: np.ndarray,
+    candidate: dict[str, Any],
+    *,
+    width: int,
+    height: int,
+) -> np.ndarray:
+    anchor_box = _candidate_anchor_box(candidate["box"], width, height)
+    return _hist_embedding(_crop(frame, anchor_box))
+
+
+def _annotate_dynamic_candidate(
+    candidate: dict[str, Any],
+    *,
+    embedding: np.ndarray,
+    similarity: float,
+    state: str,
+    reasons: list[str],
+    memory_updated: bool,
+    score: float,
+) -> dict[str, Any]:
+    candidate["_identity_embedding"] = embedding
+    candidate["_identity_similarity"] = float(similarity)
+    candidate["_identity_state"] = state
+    candidate["_identity_reasons"] = reasons
+    candidate["_identity_memory_updated"] = bool(memory_updated)
+    candidate["_identity_score"] = float(score)
+    return candidate
+
+
+def _dynamic_candidate_state(
+    *,
+    candidate: dict[str, Any],
+    appearance_similarity: float,
+    prompt_similarity: float,
+    continuity_iou: float,
+    center_score: float,
+    area_score: float,
+    impossible_motion: bool,
+    reid_accept: float,
+    reid_recover: float,
+) -> tuple[str, list[str], bool]:
+    reasons: list[str] = []
+    strong_recovery = prompt_similarity >= reid_accept
+    continuous_recovery = appearance_similarity >= reid_recover and (
+        continuity_iou >= 0.12 or center_score >= 0.35
+    )
+    if not strong_recovery and not continuous_recovery:
+        reasons.append("low_prompt_anchor_similarity")
+    if impossible_motion:
+        reasons.append("weak_motion_continuity")
+    elif continuity_iou < 0.03 and center_score < 0.10 and area_score < 0.35:
+        reasons.append("weak_motion_continuity")
+
+    state = "usable" if not reasons else "identity_risk"
+    memory_updated = state == "usable" and prompt_similarity >= reid_accept
+    return state, reasons, memory_updated
+
+
+def _score_dynamic_candidate(
+    *,
+    frame: np.ndarray,
+    candidate: dict[str, Any],
+    prompt_memory: np.ndarray,
+    memory: np.ndarray,
+    previous_box: tuple[int, int, int, int] | None,
+    previous_track_id: int | None,
+    previous_frame_index: int | None,
+    frame_index: int,
+    width: int,
+    height: int,
+) -> dict[str, Any]:
+    embedding = _candidate_anchor_embedding(frame, candidate, width=width, height=height)
+    prompt_similarity = _cosine_similarity(embedding, prompt_memory)
+    memory_similarity = _cosine_similarity(embedding, memory)
+    appearance_similarity = (0.72 * prompt_similarity) + (0.28 * memory_similarity)
+    frame_gap = max(1, abs(frame_index - int(previous_frame_index))) if previous_frame_index is not None else 1
+    continuity_iou = _xywh_iou(candidate["box"], previous_box)
+    center_score = _center_continuity_score(
+        candidate_box=candidate["box"],
+        previous_box=previous_box,
+        frame_gap=frame_gap,
+        width=width,
+        height=height,
+    )
+    area_score = _area_similarity(candidate["box"], previous_box)
+    confidence_score = _clamp(float(candidate.get("confidence") or 0.0), 0.0, 1.0)
+    same_track = 1.0 if previous_track_id is not None and int(candidate["track_id"]) == previous_track_id else 0.0
+    impossible_motion = previous_box is not None and continuity_iou < 0.03 and center_score < 0.25
+    score = (
+        0.48 * prompt_similarity
+        + 0.12 * memory_similarity
+        + 0.16 * continuity_iou
+        + 0.12 * center_score
+        + 0.04 * area_score
+        + 0.02 * confidence_score
+        + 0.06 * same_track
+    )
+    if impossible_motion:
+        score -= 0.50
+    return {
+        "candidate": candidate,
+        "embedding": embedding,
+        "prompt_similarity": prompt_similarity,
+        "memory_similarity": memory_similarity,
+        "appearance_similarity": appearance_similarity,
+        "continuity_iou": continuity_iou,
+        "center_score": center_score,
+        "area_score": area_score,
+        "impossible_motion": impossible_motion,
+        "score": score,
+    }
+
+
+def _select_dynamic_target_candidates(
+    *,
+    frames: VideoFrames,
+    prompt: dict[str, Any],
+    prompt_box: tuple[int, int, int, int],
+    candidates_by_frame: dict[int, list[dict[str, Any]]],
+    start_index: int,
+    target_candidate: dict[str, Any],
+    reid_accept: float,
+    reid_recover: float,
+) -> dict[int, dict[str, Any]]:
+    prompt_anchor_box = _prompt_anchor_box(prompt, prompt_box, frames.width, frames.height)
+    prompt_memory = _hist_embedding(_crop(frames.frames[start_index], prompt_anchor_box))
+    if not float(np.linalg.norm(prompt_memory)):
+        prompt_memory = _candidate_anchor_embedding(
+            frames.frames[int(target_candidate["frame_index"])],
+            target_candidate,
+            width=frames.width,
+            height=frames.height,
+        )
+    memory = prompt_memory.copy()
+    target_frame_index = int(target_candidate["frame_index"])
+    target_embedding = _candidate_anchor_embedding(
+        frames.frames[target_frame_index],
+        target_candidate,
+        width=frames.width,
+        height=frames.height,
+    )
+    selected: dict[int, dict[str, Any]] = {
+        target_frame_index: _annotate_dynamic_candidate(
+            target_candidate,
+            embedding=target_embedding,
+            similarity=1.0,
+            state="usable",
+            reasons=[],
+            memory_updated=True,
+            score=1.0,
+        )
+    }
+
+    for step in (1, -1):
+        direction_memory = memory.copy()
+        previous_box: tuple[int, int, int, int] | None = target_candidate["box"]
+        previous_track_id: int | None = int(target_candidate["track_id"])
+        previous_frame_index: int | None = target_frame_index
+        frame_index = target_frame_index + step
+        while 0 <= frame_index < frames.frame_count:
+            candidates = candidates_by_frame.get(frame_index, [])
+            if not candidates:
+                frame_index += step
+                continue
+
+            scored = [
+                _score_dynamic_candidate(
+                    frame=frames.frames[frame_index],
+                    candidate=candidate,
+                    prompt_memory=prompt_memory,
+                    memory=direction_memory,
+                    previous_box=previous_box,
+                    previous_track_id=previous_track_id,
+                    previous_frame_index=previous_frame_index,
+                    frame_index=frame_index,
+                    width=frames.width,
+                    height=frames.height,
+                )
+                for candidate in candidates
+            ]
+            best = max(scored, key=lambda item: float(item["score"]))
+            candidate = best["candidate"]
+            state, reasons, memory_updated = _dynamic_candidate_state(
+                candidate=candidate,
+                appearance_similarity=float(best["appearance_similarity"]),
+                prompt_similarity=float(best["prompt_similarity"]),
+                continuity_iou=float(best["continuity_iou"]),
+                center_score=float(best["center_score"]),
+                area_score=float(best["area_score"]),
+                impossible_motion=bool(best["impossible_motion"]),
+                reid_accept=reid_accept,
+                reid_recover=reid_recover,
+            )
+            selected[frame_index] = _annotate_dynamic_candidate(
+                candidate,
+                embedding=best["embedding"],
+                similarity=float(best["prompt_similarity"]),
+                state=state,
+                reasons=reasons,
+                memory_updated=memory_updated,
+                score=float(best["score"]),
+            )
+
+            if state == "usable":
+                previous_box = candidate["box"]
+                previous_track_id = int(candidate["track_id"])
+                previous_frame_index = frame_index
+            if memory_updated:
+                blended = (direction_memory * 0.9) + (best["embedding"] * 0.1)
+                norm = float(np.linalg.norm(blended))
+                direction_memory = blended / norm if norm > 0 else blended
+            frame_index += step
+
+    return selected
+
+
+def _same_candidate(a: dict[str, Any] | None, b: dict[str, Any]) -> bool:
+    if a is None:
+        return False
+    return int(a.get("frame_index", -1)) == int(b.get("frame_index", -2)) and int(
+        a.get("track_id", -1)
+    ) == int(b.get("track_id", -2)) and tuple(a.get("box") or ()) == tuple(b.get("box") or ())
+
+
 def _target_candidate_state(
     *,
     candidate: dict[str, Any],
@@ -1018,26 +1362,22 @@ def run_boxmot_identity_tracking(
             )
         target_track_id = int(target_candidate["track_id"])
 
-        target_candidates: dict[int, dict[str, Any]] = {}
-        for frame_index, candidates in candidates_by_frame.items():
-            matching = [candidate for candidate in candidates if candidate["track_id"] == target_track_id]
-            if matching:
-                target_candidates[frame_index] = max(
-                    matching,
-                    key=lambda candidate: float(candidate.get("confidence") or 0.0),
-                )
-
-        memory = _hist_embedding(_crop(frames.frames[target_candidate["frame_index"]], target_candidate["box"]))
-        if not float(np.linalg.norm(memory)):
-            memory = _hist_embedding(_crop(frames.frames[start_index], initial_box))
+        target_candidates = _select_dynamic_target_candidates(
+            frames=frames,
+            prompt=prompt,
+            prompt_box=initial_box,
+            candidates_by_frame=candidates_by_frame,
+            start_index=start_index,
+            target_candidate=target_candidate,
+            reid_accept=reid_accept,
+            reid_recover=reid_recover,
+        )
 
         track_rows: list[dict[str, Any]] = []
         target_rows: list[dict[str, Any]] = []
         reid_rows: list[dict[str, Any]] = []
         zero_embedding = np.zeros(64, dtype=np.float32)
-        previous_usable_box: tuple[int, int, int, int] | None = None
-        previous_usable_frame: int | None = None
-        embedding_model = f"boxmot_internal:{reid_weights};artifact:hsv_histogram_8x8"
+        embedding_model = f"boxmot_internal:{reid_weights};artifact:prompt_anchor_hsv_histogram_8x8"
 
         for frame_index, frame in enumerate(frames.frames):
             candidates = candidates_by_frame.get(frame_index, [])
@@ -1049,12 +1389,12 @@ def run_boxmot_identity_tracking(
                     width=frames.width,
                     height=frames.height,
                     box=None,
-                    track_id=target_track_id,
+                    track_id=None,
                     is_target=True,
                     detection_confidence=None,
                     reid_similarity=0.0,
                     state="missing",
-                    reasons=["target_track_missing"],
+                    reasons=["target_path_missing"],
                     backend=backend,
                 )
                 target_rows.append(target_row)
@@ -1063,7 +1403,7 @@ def run_boxmot_identity_tracking(
                     _boxmot_reid_row(
                         frame_index=frame_index,
                         fps=frames.fps,
-                        track_id=target_track_id,
+                        track_id=None,
                         embedding=zero_embedding,
                         similarity=0.0,
                         memory_updated=False,
@@ -1071,31 +1411,19 @@ def run_boxmot_identity_tracking(
                     )
                 )
             else:
-                embedding = _hist_embedding(_crop(frame, target["box"]))
-                if frame_index == int(target_candidate["frame_index"]):
-                    similarity = 1.0
-                    state = "usable"
-                    reasons: list[str] = []
-                    memory_updated = True
-                else:
-                    state, reasons, similarity, memory_updated = _target_candidate_state(
-                        candidate=target,
-                        embedding=embedding,
-                        memory=memory,
-                        previous_box=previous_usable_box,
-                        previous_frame_index=previous_usable_frame,
+                embedding = target.get("_identity_embedding")
+                if not isinstance(embedding, np.ndarray):
+                    embedding = _candidate_anchor_embedding(
+                        frame,
+                        target,
                         width=frames.width,
                         height=frames.height,
-                        reid_accept=reid_accept,
-                        reid_recover=reid_recover,
                     )
-                if memory_updated:
-                    blended = (memory * 0.9) + (embedding * 0.1)
-                    norm = float(np.linalg.norm(blended))
-                    memory = blended / norm if norm > 0 else blended
-                if state == "usable":
-                    previous_usable_box = target["box"]
-                    previous_usable_frame = frame_index
+                similarity = float(target.get("_identity_similarity", 0.0))
+                state = str(target.get("_identity_state") or "identity_risk")
+                reasons = list(target.get("_identity_reasons") or [])
+                memory_updated = bool(target.get("_identity_memory_updated", False))
+                selected_track_id = int(target["track_id"])
 
                 target_row = _boxmot_track_row(
                     frame_index=frame_index,
@@ -1103,7 +1431,7 @@ def run_boxmot_identity_tracking(
                     width=frames.width,
                     height=frames.height,
                     box=target["box"],
-                    track_id=target_track_id,
+                    track_id=selected_track_id,
                     is_target=True,
                     detection_confidence=target.get("confidence"),
                     reid_similarity=similarity,
@@ -1117,7 +1445,7 @@ def run_boxmot_identity_tracking(
                     _boxmot_reid_row(
                         frame_index=frame_index,
                         fps=frames.fps,
-                        track_id=target_track_id,
+                        track_id=selected_track_id,
                         embedding=embedding,
                         similarity=similarity,
                         memory_updated=memory_updated,
@@ -1126,7 +1454,7 @@ def run_boxmot_identity_tracking(
                 )
 
             for candidate in candidates:
-                if int(candidate["track_id"]) == target_track_id:
+                if _same_candidate(target, candidate):
                     continue
                 track_rows.append(
                     _boxmot_track_row(
@@ -1153,12 +1481,25 @@ def run_boxmot_identity_tracking(
             )
         )
         metrics = summarize_identity_rows(target_rows)
+        usable_track_ids = [
+            int(row["track_id"])
+            for row in target_rows
+            if row.get("identity_state") == "usable" and row.get("track_id") is not None
+        ]
+        target_track_ids = list(dict.fromkeys(usable_track_ids))
+        target_track_switches = sum(
+            1 for previous, current in zip(usable_track_ids, usable_track_ids[1:]) if previous != current
+        )
         prompt_box = _box_payload(initial_box, frames.width, frames.height)
         metrics.update(
             {
                 "prompt_frame_index": start_index,
                 "initial_prompt_box": prompt_box,
                 "target_track_id": target_track_id,
+                "initial_target_track_id": target_track_id,
+                "target_track_ids": target_track_ids,
+                "target_track_switches": target_track_switches,
+                "dynamic_target_selection": True,
                 "backend": backend,
                 "detector_model": detector_model,
                 "reid_weights": reid_weights,
@@ -1192,6 +1533,10 @@ def run_boxmot_identity_tracking(
                 "status": "complete",
                 "backend": backend,
                 "target_track_id": target_track_id,
+                "initial_target_track_id": target_track_id,
+                "target_track_ids": target_track_ids,
+                "target_track_switches": target_track_switches,
+                "dynamic_target_selection": True,
                 "prompt_box": prompt_box,
                 "detector": {
                     "model": detector_model,

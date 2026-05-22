@@ -895,19 +895,27 @@ def _dynamic_candidate_state(
     candidate: dict[str, Any],
     appearance_similarity: float,
     prompt_similarity: float,
+    memory_similarity: float,
     continuity_iou: float,
     center_score: float,
     area_score: float,
     impossible_motion: bool,
+    same_track: bool,
     reid_accept: float,
     reid_recover: float,
 ) -> tuple[str, list[str], bool]:
     reasons: list[str] = []
+    continuity_locked = (
+        same_track
+        and memory_similarity >= 0.74
+        and continuity_iou >= 0.55
+        and center_score >= 0.72
+    )
     strong_recovery = prompt_similarity >= reid_accept
     continuous_recovery = appearance_similarity >= reid_recover and (
         continuity_iou >= 0.12 or center_score >= 0.35
     )
-    if not strong_recovery and not continuous_recovery:
+    if not strong_recovery and not continuous_recovery and not continuity_locked:
         reasons.append("low_prompt_anchor_similarity")
     if impossible_motion:
         reasons.append("weak_motion_continuity")
@@ -969,6 +977,7 @@ def _score_dynamic_candidate(
         "continuity_iou": continuity_iou,
         "center_score": center_score,
         "area_score": area_score,
+        "same_track": bool(same_track),
         "impossible_motion": impossible_motion,
         "score": score,
     }
@@ -1042,15 +1051,34 @@ def _select_dynamic_target_candidates(
                 for candidate in candidates
             ]
             best = max(scored, key=lambda item: float(item["score"]))
+            incumbent = next((item for item in scored if item["same_track"]), None)
+            if incumbent is not None and best is not incumbent:
+                incumbent_state, _, _ = _dynamic_candidate_state(
+                    candidate=incumbent["candidate"],
+                    appearance_similarity=float(incumbent["appearance_similarity"]),
+                    prompt_similarity=float(incumbent["prompt_similarity"]),
+                    memory_similarity=float(incumbent["memory_similarity"]),
+                    continuity_iou=float(incumbent["continuity_iou"]),
+                    center_score=float(incumbent["center_score"]),
+                    area_score=float(incumbent["area_score"]),
+                    impossible_motion=bool(incumbent["impossible_motion"]),
+                    same_track=bool(incumbent["same_track"]),
+                    reid_accept=reid_accept,
+                    reid_recover=reid_recover,
+                )
+                if incumbent_state == "usable" and float(best["score"]) < float(incumbent["score"]) + 0.16:
+                    best = incumbent
             candidate = best["candidate"]
             state, reasons, memory_updated = _dynamic_candidate_state(
                 candidate=candidate,
                 appearance_similarity=float(best["appearance_similarity"]),
                 prompt_similarity=float(best["prompt_similarity"]),
+                memory_similarity=float(best["memory_similarity"]),
                 continuity_iou=float(best["continuity_iou"]),
                 center_score=float(best["center_score"]),
                 area_score=float(best["area_score"]),
                 impossible_motion=bool(best["impossible_motion"]),
+                same_track=bool(best["same_track"]),
                 reid_accept=reid_accept,
                 reid_recover=reid_recover,
             )

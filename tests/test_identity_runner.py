@@ -381,6 +381,46 @@ def test_boxmot_identity_tracking_recovers_when_tracker_id_switches(
     assert track_seed["dynamic_target_selection"] is True
 
 
+def test_dynamic_identity_state_trusts_strong_same_track_continuity() -> None:
+    state, reasons, memory_updated = identity_runner._dynamic_candidate_state(
+        candidate={},
+        appearance_similarity=0.52,
+        prompt_similarity=0.42,
+        memory_similarity=0.80,
+        continuity_iou=0.83,
+        center_score=0.89,
+        area_score=0.90,
+        impossible_motion=False,
+        same_track=True,
+        reid_accept=0.65,
+        reid_recover=0.58,
+    )
+
+    assert state == "usable"
+    assert reasons == []
+    assert memory_updated is False
+
+
+def test_dynamic_identity_state_rejects_weak_stale_track() -> None:
+    state, reasons, memory_updated = identity_runner._dynamic_candidate_state(
+        candidate={},
+        appearance_similarity=0.48,
+        prompt_similarity=0.44,
+        memory_similarity=0.56,
+        continuity_iou=0.37,
+        center_score=0.70,
+        area_score=0.80,
+        impossible_motion=False,
+        same_track=True,
+        reid_accept=0.65,
+        reid_recover=0.58,
+    )
+
+    assert state == "identity_risk"
+    assert "low_prompt_anchor_similarity" in reasons
+    assert memory_updated is False
+
+
 def test_boxmot_identity_tracking_rejects_impossible_lookalike_jump(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

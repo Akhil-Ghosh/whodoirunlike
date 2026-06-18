@@ -1,12 +1,17 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
+import sys
+import types
 
 import numpy as np
 
 from whodoirunlike.sam31_gpu_runner import (
     _build_track_box_fallback_masks,
+    _collect_sam31_masks,
     _filter_masks_to_track_boxes,
+    _first_nonempty_output_object_id,
     _has_prompt_points,
     _mask_from_outputs,
     _patch_multiplex_init_state_kwargs,
@@ -45,6 +50,21 @@ def test_mask_from_outputs_falls_back_to_first_nonempty_mask() -> None:
 
     assert mask is not None
     assert mask.tolist() == [[0, 0], [1, 0]]
+
+
+def test_first_nonempty_output_object_id_uses_mask_content() -> None:
+    outputs = {
+        "out_obj_ids": np.array([3, 7]),
+        "out_binary_masks": np.array(
+            [
+                [[0, 0], [0, 0]],
+                [[0, 1], [0, 0]],
+            ],
+            dtype=np.uint8,
+        ),
+    }
+
+    assert _first_nonempty_output_object_id(outputs) == 7
 
 
 def test_patch_multiplex_init_state_kwargs_filters_unknown_kwargs() -> None:
@@ -192,3 +212,83 @@ def test_update_manifest_after_sam31_gpu_records_fallback(tmp_path) -> None:
     assert stage["fallback"]["reason"] == "sam31_gpu_empty_mask"
     assert stage["mask_summary"]["nonempty_frames"] == 3
     assert "error" not in stage
+
+
+def test_collect_sam31_masks_tracks_visual_box_object_id(monkeypatch, tmp_path: Path) -> None:
+    class FakeInferenceMode:
+        def __enter__(self) -> None:
+            return None
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+    fake_torch = types.SimpleNamespace(
+        float32="float32",
+        int32="int32",
+        tensor=lambda data, **_kwargs: np.asarray(data),
+        inference_mode=lambda: FakeInferenceMode(),
+    )
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+
+    class FakePredictor:
+        def __init__(self) -> None:
+            self.add_prompts: list[dict[str, object]] = []
+
+        def handle_request(self, *, request: dict[str, object]) -> dict[str, object]:
+            request_type = request["type"]
+            if request_type == "start_session":
+                return {"session_id": "session-1"}
+            if request_type == "close_session":
+                return {}
+            if request_type == "add_prompt":
+                self.add_prompts.append(request)
+                if "bounding_boxes" in request:
+                    return {
+                        "outputs": {
+                            "out_obj_ids": np.array([7]),
+                            "out_binary_masks": np.array([[[1, 0], [0, 0]]], dtype=np.uint8),
+                        }
+                    }
+                return {
+                    "outputs": {
+                        "out_obj_ids": np.array([7]),
+                        "out_binary_masks": np.array([[[0, 1], [0, 0]]], dtype=np.uint8),
+                    }
+                }
+            raise AssertionError(f"unexpected request: {request_type}")
+
+        def handle_stream_request(self, *, request: dict[str, object]) -> list[dict[str, object]]:
+            assert request["type"] == "propagate_in_video"
+            return [
+                {
+                    "frame_index": 1,
+                    "outputs": {
+                        "out_obj_ids": np.array([7]),
+                        "out_binary_masks": np.array([[[1, 1], [0, 0]]], dtype=np.uint8),
+                    },
+                }
+            ]
+
+    predictor = FakePredictor()
+    masks, diagnostics = _collect_sam31_masks(
+        predictor=predictor,
+        video_path=tmp_path / "clip.mp4",
+        prompt={
+            "frame_index": 0,
+            "box": np.array([0, 0, 2, 2], dtype=np.float32),
+            "points": np.array([[1, 1]], dtype=np.float32),
+            "labels": np.array([1], dtype=np.int32),
+        },
+        width=2,
+        height=2,
+        frame_count=2,
+        obj_id=1,
+    )
+
+    point_prompt = predictor.add_prompts[1]
+    assert point_prompt["obj_id"] == 7
+    assert diagnostics["visual_box_prompt"] is True
+    assert diagnostics["visual_box_obj_id"] == 7
+    assert diagnostics["active_obj_id"] == 7
+    assert sorted(masks) == [0, 1]
+    assert masks[1].tolist() == [[1, 1], [0, 0]]

@@ -54,23 +54,34 @@ def _relative_prompt_tensors(
 
     box = prompt.get("box")
     if box is not None:
-        x1, y1, x2, y2 = [float(value) for value in np.asarray(box).tolist()]
-        rel_box = np.array(
-            [[
-                x1 / max(float(width), 1.0),
-                y1 / max(float(height), 1.0),
-                max(x2 - x1, 0.0) / max(float(width), 1.0),
-                max(y2 - y1, 0.0) / max(float(height), 1.0),
-            ]],
-            dtype=np.float32,
-        )
-        rel_box = np.clip(rel_box, 0.0, 1.0)
-        return {
-            "bounding_boxes": torch.tensor(rel_box, dtype=torch.float32, device="cuda"),
-            "bounding_box_labels": torch.tensor([1], dtype=torch.int32, device="cuda"),
-        }
+        return _box_prompt_tensors(box=np.asarray(box, dtype=np.float32), width=width, height=height)
 
     raise ValueError("SAM 3.1 GPU requires at least one prompt point or box.")
+
+
+def _box_prompt_tensors(
+    *,
+    box: np.ndarray,
+    width: int,
+    height: int,
+) -> dict[str, Any]:
+    import torch
+
+    x1, y1, x2, y2 = [float(value) for value in np.asarray(box).tolist()]
+    rel_box = np.array(
+        [[
+            x1 / max(float(width), 1.0),
+            y1 / max(float(height), 1.0),
+            max(x2 - x1, 0.0) / max(float(width), 1.0),
+            max(y2 - y1, 0.0) / max(float(height), 1.0),
+        ]],
+        dtype=np.float32,
+    )
+    rel_box = np.clip(rel_box, 0.0, 1.0)
+    return {
+        "bounding_boxes": torch.tensor(rel_box, dtype=torch.float32, device="cuda"),
+        "bounding_box_labels": torch.tensor([1], dtype=torch.int32, device="cuda"),
+    }
 
 
 def _support_points_from_box(box: np.ndarray) -> np.ndarray:
@@ -211,6 +222,20 @@ def _mask_from_outputs(outputs: dict[str, Any], *, obj_id: int) -> np.ndarray | 
     return (fallback > 0).astype("uint8") if fallback is not None else None
 
 
+def _first_nonempty_output_object_id(outputs: dict[str, Any]) -> int | None:
+    obj_ids = outputs.get("out_obj_ids")
+    masks = outputs.get("out_binary_masks")
+    if obj_ids is None or masks is None:
+        return None
+
+    ids = _as_numpy(obj_ids).reshape(-1).tolist()
+    for index, raw_id in enumerate(ids):
+        mask = np.squeeze(_as_numpy(masks[index]))
+        if mask.any():
+            return int(raw_id)
+    return None
+
+
 def _patch_multiplex_init_state_kwargs(predictor: Any) -> None:
     """Filter unsupported SAM 3.1 multiplex init_state kwargs until upstream lands it."""
     import inspect
@@ -240,7 +265,7 @@ def _collect_sam31_masks(
     frame_count: int,
     obj_id: int,
     track_boxes: dict[int, np.ndarray] | None = None,
-) -> dict[int, np.ndarray]:
+) -> tuple[dict[int, np.ndarray], dict[str, Any]]:
     import torch
 
     response = predictor.handle_request(
@@ -251,6 +276,11 @@ def _collect_sam31_masks(
     )
     session_id = response["session_id"]
     masks_by_frame: dict[int, np.ndarray] = {}
+    diagnostics: dict[str, Any] = {
+        "initial_obj_id": obj_id,
+        "active_obj_id": obj_id,
+        "visual_box_prompt": False,
+    }
     try:
         prompt_frame = max(0, min(int(prompt["frame_index"]), max(frame_count - 1, 0)))
         prompt_box = None
@@ -262,9 +292,35 @@ def _collect_sam31_masks(
             )
             if nearest_prompt_box is not None:
                 _, prompt_box = nearest_prompt_box
+        visual_box = prompt.get("box") if prompt.get("box") is not None else prompt_box
         prompt_points, prompt_labels = _prompt_points_with_box_support(prompt, box=prompt_box)
 
         with torch.inference_mode():
+            active_obj_id = obj_id
+            if visual_box is not None:
+                diagnostics["visual_box_prompt"] = True
+                box_response = predictor.handle_request(
+                    request={
+                        "type": "add_prompt",
+                        "session_id": session_id,
+                        "frame_index": prompt_frame,
+                        **_box_prompt_tensors(
+                            box=np.asarray(visual_box, dtype=np.float32),
+                            width=width,
+                            height=height,
+                        ),
+                    }
+                )
+                box_outputs = box_response.get("outputs", {})
+                box_obj_id = _first_nonempty_output_object_id(box_outputs)
+                if box_obj_id is not None:
+                    active_obj_id = box_obj_id
+                    diagnostics["visual_box_obj_id"] = box_obj_id
+                    diagnostics["active_obj_id"] = active_obj_id
+                box_mask = _mask_from_outputs(box_outputs, obj_id=active_obj_id)
+                if box_mask is not None:
+                    masks_by_frame[prompt_frame] = box_mask
+
             if prompt_points is not None and prompt_labels is not None:
                 prompt_inputs = _point_prompt_tensors(
                     points=prompt_points,
@@ -279,11 +335,17 @@ def _collect_sam31_masks(
                     "type": "add_prompt",
                     "session_id": session_id,
                     "frame_index": prompt_frame,
-                    "obj_id": obj_id,
+                    "obj_id": active_obj_id,
                     **prompt_inputs,
                 }
             )
-            prompt_mask = _mask_from_outputs(prompt_response.get("outputs", {}), obj_id=obj_id)
+            prompt_outputs = prompt_response.get("outputs", {})
+            prompt_obj_id = _first_nonempty_output_object_id(prompt_outputs)
+            if prompt_obj_id is not None:
+                active_obj_id = prompt_obj_id
+                diagnostics["point_prompt_obj_id"] = prompt_obj_id
+                diagnostics["active_obj_id"] = active_obj_id
+            prompt_mask = _mask_from_outputs(prompt_outputs, obj_id=active_obj_id)
             if prompt_mask is not None:
                 masks_by_frame[prompt_frame] = prompt_mask
 
@@ -302,7 +364,7 @@ def _collect_sam31_masks(
                             "type": "add_prompt",
                             "session_id": session_id,
                             "frame_index": anchor_frame,
-                            "obj_id": obj_id,
+                            "obj_id": active_obj_id,
                             **_point_prompt_tensors(
                                 points=points,
                                 labels=labels,
@@ -313,21 +375,29 @@ def _collect_sam31_masks(
                     )
                     anchor_mask = _mask_from_outputs(
                         anchor_response.get("outputs", {}),
-                        obj_id=obj_id,
+                        obj_id=active_obj_id,
                     )
                     if anchor_mask is not None:
                         masks_by_frame[anchor_frame] = anchor_mask
 
-            for stream_response in predictor.handle_stream_request(
-                request={
-                    "type": "propagate_in_video",
-                    "session_id": session_id,
-                }
-            ):
-                frame_index = int(stream_response["frame_index"])
-                mask = _mask_from_outputs(stream_response.get("outputs", {}), obj_id=obj_id)
-                if mask is not None:
-                    masks_by_frame[frame_index] = mask
+            try:
+                for stream_response in predictor.handle_stream_request(
+                    request={
+                        "type": "propagate_in_video",
+                        "session_id": session_id,
+                    }
+                ):
+                    frame_index = int(stream_response["frame_index"])
+                    mask = _mask_from_outputs(
+                        stream_response.get("outputs", {}),
+                        obj_id=active_obj_id,
+                    )
+                    if mask is not None:
+                        masks_by_frame[frame_index] = mask
+            except RuntimeError as exc:
+                if "No prompts are received on any frames" not in str(exc):
+                    raise
+                diagnostics["propagation_warning"] = str(exc)
     finally:
         predictor.handle_request(
             request={
@@ -335,7 +405,7 @@ def _collect_sam31_masks(
                 "session_id": session_id,
             }
         )
-    return masks_by_frame
+    return masks_by_frame, diagnostics
 
 
 def _mask_from_track_box(
@@ -623,7 +693,7 @@ def run_sam31_gpu_mask(
         default_output_prob_thresh=float(os.getenv("WHODOIRUNLIKE_SAM31_GPU_THRESHOLD", "0.5")),
     )
     _patch_multiplex_init_state_kwargs(predictor)
-    masks_by_frame = _collect_sam31_masks(
+    masks_by_frame, sam_prompt_diagnostics = _collect_sam31_masks(
         predictor=predictor,
         video_path=source_segment,
         prompt=prompt,
@@ -633,6 +703,7 @@ def run_sam31_gpu_mask(
         obj_id=obj_id,
         track_boxes=track_boxes,
     )
+    prompt_summary["sam31"] = sam_prompt_diagnostics
     masks_by_frame, identity_filter = _filter_masks_to_track_boxes(masks_by_frame, track_boxes)
     prompt_summary["identity_filter"] = identity_filter
 

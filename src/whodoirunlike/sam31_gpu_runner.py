@@ -87,6 +87,25 @@ def _mask_from_outputs(outputs: dict[str, Any], *, obj_id: int) -> np.ndarray | 
     return (fallback > 0).astype("uint8") if fallback is not None else None
 
 
+def _patch_multiplex_init_state_kwargs(predictor: Any) -> None:
+    """Filter unsupported SAM 3.1 multiplex init_state kwargs until upstream lands it."""
+    import inspect
+
+    model = getattr(predictor, "model", None)
+    original_init_state = getattr(model, "init_state", None)
+    if model is None or original_init_state is None:
+        return
+
+    signature = inspect.signature(original_init_state)
+    valid_params = set(signature.parameters)
+
+    def filtered_init_state(*args: Any, **kwargs: Any) -> Any:
+        filtered_kwargs = {key: value for key, value in kwargs.items() if key in valid_params}
+        return original_init_state(*args, **filtered_kwargs)
+
+    setattr(model, "init_state", filtered_init_state)
+
+
 def _collect_sam31_masks(
     *,
     predictor: Any,
@@ -215,6 +234,7 @@ def run_sam31_gpu_mask(
         warm_up=_env_bool("WHODOIRUNLIKE_SAM31_GPU_WARM_UP", default=False),
         default_output_prob_thresh=float(os.getenv("WHODOIRUNLIKE_SAM31_GPU_THRESHOLD", "0.5")),
     )
+    _patch_multiplex_init_state_kwargs(predictor)
     masks_by_frame = _collect_sam31_masks(
         predictor=predictor,
         video_path=source_segment,

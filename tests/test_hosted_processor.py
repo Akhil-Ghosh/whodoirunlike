@@ -116,6 +116,52 @@ def test_hosted_manifest_uses_demo_profile_prompt(tmp_path: Path) -> None:
     assert prompt["selection"]["box"]["x"] == 0.6
 
 
+def test_hosted_manifest_uses_uploaded_runner_prompt(tmp_path: Path) -> None:
+    from whodoirunlike import hosted_processor
+
+    source_path = tmp_path / "source.mp4"
+    _write_tiny_video(source_path)
+    payload = hosted_processor.WorkerJobRequest(
+        run_id="12345678-1234-4234-9234-123456789abc",
+        callback_base_url="https://api.whodoirunlike.com",
+        source={
+            "url": "https://api.whodoirunlike.com/v1/jobs/12345678-1234-4234-9234-123456789abc/source",
+            "key": "uploads/12345678-1234-4234-9234-123456789abc/source.mp4",
+            "filename": "clip.mp4",
+            "content_type": "video/mp4",
+            "size_bytes": source_path.stat().st_size,
+        },
+        target_prompt={
+            "selection": {
+                "type": "box",
+                "positive_points": [{"x": 0.5, "y": 0.5, "label": "target_runner_center"}],
+                "negative_points": [],
+                "box": {"x": 0.42, "y": 0.15, "width": 0.22, "height": 0.7},
+            },
+            "frame": {"time_seconds": 0.2, "width": 64, "height": 48},
+        },
+    )
+
+    manifest_path = hosted_processor._write_hosted_manifest(
+        run_dir=tmp_path / "run",
+        payload=payload,
+        source_path=source_path,
+        video_meta={"width": 64, "height": 48, "fps": 10.0, "frame_count": 3},
+        uploaded_prompt=payload.target_prompt,
+    )
+
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    prompt = json.loads((tmp_path / "run/person_prompt.json").read_text(encoding="utf-8"))
+    track_seed = json.loads((tmp_path / "run/track_seed.json").read_text(encoding="utf-8"))
+    assert manifest["target_prompt_source"] == "hosted_upload_user_prompt_v1"
+    assert manifest["stages"]["person_prompt"]["status"] == "user_selected"
+    assert track_seed["target_lock_method"] == "uploaded_runner_prompt"
+    assert prompt["source"] == "hosted_upload_user_prompt_v1"
+    assert prompt["frame"]["frame_index"] == 2
+    assert prompt["selection"]["box"]["x"] == 0.42
+    assert prompt["selection"]["positive_points"][0]["label"] == "target_runner_center"
+
+
 def test_apply_demo_reference_artifacts_replaces_selected_outputs(
     monkeypatch: Any,
     tmp_path: Path,

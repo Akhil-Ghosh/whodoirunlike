@@ -66,6 +66,7 @@ class WorkerJobRequest(BaseModel):
     run_id: str
     source: WorkerJobSource
     callback_base_url: str
+    target_prompt: dict[str, Any] | None = None
 
 
 def _hosted_run_root() -> Path:
@@ -235,6 +236,7 @@ def _default_target_prompt(
     frame_meta: dict[str, Any],
     *,
     demo_profile: dict[str, Any] | None = None,
+    uploaded_prompt: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     if demo_profile:
         return {
@@ -255,6 +257,24 @@ def _default_target_prompt(
                 "profile_id": demo_profile["id"],
             },
             "notes": "Seeded from the validated local reference run for this public Cole Hocker demo clip.",
+        }
+
+    if uploaded_prompt:
+        selection = uploaded_prompt.get("selection", {})
+        return {
+            "version": 1,
+            "source": "hosted_upload_user_prompt_v1",
+            "selection": {
+                "type": selection.get("type") or ("box" if selection.get("box") else "point"),
+                "positive_points": selection.get("positive_points") or [],
+                "negative_points": selection.get("negative_points") or [],
+                **({"box": selection["box"]} if selection.get("box") else {}),
+            },
+            "frame": {
+                **frame_meta,
+                "image_path": str(prompt_frame_path),
+            },
+            "notes": "Selected in the public upload UI.",
         }
 
     return {
@@ -283,6 +303,27 @@ def _default_target_prompt(
         },
         "notes": "Auto-seeded for public uploads. Works best when the target runner is centered in frame.",
     }
+
+
+def _uploaded_prompt_frame_index(
+    uploaded_prompt: dict[str, Any] | None,
+    video_meta: dict[str, Any],
+) -> int:
+    if not uploaded_prompt:
+        return 0
+    frame = uploaded_prompt.get("frame") or {}
+    frame_count = max(0, int(video_meta.get("frame_count") or 0))
+    fps = float(video_meta.get("fps") or 0.0)
+    frame_index: int
+    if frame.get("frame_index") is not None:
+        frame_index = int(frame.get("frame_index") or 0)
+    elif frame.get("time_seconds") is not None and fps > 0:
+        frame_index = int(round(float(frame.get("time_seconds") or 0.0) * fps))
+    else:
+        frame_index = 0
+    if frame_count:
+        return max(0, min(frame_index, frame_count - 1))
+    return max(0, frame_index)
 
 
 def _manifest_paths(run_dir: Path) -> dict[str, str]:
@@ -329,15 +370,26 @@ def _write_hosted_manifest(
     source_path: Path,
     video_meta: dict[str, Any],
     demo_profile: dict[str, Any] | None = None,
+    uploaded_prompt: dict[str, Any] | None = None,
 ) -> Path:
     prompt_frame_path = run_dir / "prompt_frame.jpg"
+    prompt_frame_index = (
+        int(demo_profile["prompt_frame_index"])
+        if demo_profile
+        else _uploaded_prompt_frame_index(uploaded_prompt, video_meta)
+    )
     frame_meta = _write_prompt_frame(
         source_path,
         prompt_frame_path,
-        frame_index=int(demo_profile["prompt_frame_index"]) if demo_profile else 0,
+        frame_index=prompt_frame_index,
     )
     prompt_path = run_dir / "person_prompt.json"
-    prompt = _default_target_prompt(prompt_frame_path, frame_meta, demo_profile=demo_profile)
+    prompt = _default_target_prompt(
+        prompt_frame_path,
+        frame_meta,
+        demo_profile=demo_profile,
+        uploaded_prompt=uploaded_prompt,
+    )
     write_json(prompt_path, prompt)
 
     paths = _manifest_paths(run_dir)
@@ -346,6 +398,14 @@ def _write_hosted_manifest(
     duration_seconds = round(frame_count / fps, 3) if fps else None
     runner_name = demo_profile["runner_name"] if demo_profile else "Uploaded runner"
     runner_slug = demo_profile["runner_slug"] if demo_profile else "uploaded-runner"
+    target_lock_method = (
+        "demo_reference_prompt"
+        if demo_profile
+        else "uploaded_runner_prompt"
+        if uploaded_prompt
+        else "auto_center_prompt"
+    )
+    prompt_stage_status = "user_selected" if uploaded_prompt and not demo_profile else "auto_seeded"
 
     write_json(
         run_dir / "track_seed.json",
@@ -353,7 +413,7 @@ def _write_hosted_manifest(
             "candidate_id": payload.run_id,
             "runner_name": runner_name,
             "prompt_path": str(prompt_path),
-            "target_lock_method": "demo_reference_prompt" if demo_profile else "auto_center_prompt",
+            "target_lock_method": target_lock_method,
             "updated_at": utc_now_iso(),
         },
     )
@@ -390,9 +450,14 @@ def _write_hosted_manifest(
             "camera_angle": "unknown",
             "primary_bucket": "running",
             "duration_seconds": duration_seconds,
-            "notes": "Auto-seeded public upload. Review the target prompt before adding this clip to a reference set.",
+            "notes": (
+                "Target runner selected in the public upload UI."
+                if uploaded_prompt and not demo_profile
+                else "Auto-seeded public upload. Review the target prompt before adding this clip to a reference set."
+            ),
         },
         "video": video_meta,
+        "target_prompt_source": prompt["source"],
         "demo_profile": (
             {
                 "id": demo_profile["id"],
@@ -404,7 +469,7 @@ def _write_hosted_manifest(
         "paths": paths,
         "stages": {
             "upload": {"status": "complete", "output": str(source_path)},
-            "person_prompt": {"status": "auto_seeded", "output": str(prompt_path)},
+            "person_prompt": {"status": prompt_stage_status, "output": str(prompt_path)},
             "detector_tracker": {"status": "pending"},
             "whole_runner_mask": {"status": "pending"},
             "pose": {"status": "pending"},
@@ -796,6 +861,7 @@ def process_hosted_job(payload: WorkerJobRequest, *, raise_on_error: bool = Fals
             source_path=source_path,
             video_meta=video_meta,
             demo_profile=demo_profile,
+            uploaded_prompt=payload.target_prompt,
         )
 
         _post_worker_report(

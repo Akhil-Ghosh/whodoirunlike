@@ -7,6 +7,37 @@ type WorkerEnv = Env & {
 
 type JobStatus = "uploaded" | "queued" | "running" | "complete" | "failed";
 
+type RunnerPromptPoint = {
+  x: number;
+  y: number;
+  label?: string;
+};
+
+type RunnerPromptBox = {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+};
+
+type RunnerTargetPrompt = {
+  version: 1;
+  source: "hosted_upload_user_prompt_v1";
+  selection: {
+    type: "box" | "point";
+    positive_points: RunnerPromptPoint[];
+    negative_points: RunnerPromptPoint[];
+    box?: RunnerPromptBox;
+  };
+  frame: {
+    time_seconds?: number;
+    frame_index?: number;
+    width?: number;
+    height?: number;
+  };
+  notes: string;
+};
+
 type ArtifactRecord = {
   key: string;
   content_type: string;
@@ -27,6 +58,7 @@ type JobRecord = {
     size_bytes: number;
     consent_scope: string | null;
   };
+  target_prompt?: RunnerTargetPrompt | null;
   progress?: unknown;
   summary?: unknown;
   error?: string;
@@ -42,6 +74,7 @@ type ProcessorPayload = {
     content_type: string;
     size_bytes: number;
   };
+  target_prompt?: RunnerTargetPrompt | null;
   callback_base_url: string;
 };
 
@@ -168,6 +201,10 @@ async function handleUpload(
   if (!extension) {
     return errorResponse(request, env, 415, "Upload an MP4, MOV, M4V, or WebM running clip.");
   }
+  const promptResult = parseRunnerPromptHeader(request.headers.get("x-runner-prompt"));
+  if (!promptResult.ok) {
+    return errorResponse(request, env, 400, promptResult.error);
+  }
 
   const runId = crypto.randomUUID();
   const createdAt = new Date().toISOString();
@@ -199,6 +236,7 @@ async function handleUpload(
       size_bytes: uploaded.size,
       consent_scope: request.headers.get("x-clip-consent"),
     },
+    target_prompt: promptResult.prompt,
     artifacts: {},
   };
   await writeJob(env, job);
@@ -388,6 +426,7 @@ async function notifyProcessor(request: Request, env: WorkerEnv, job: JobRecord)
       content_type: job.upload.content_type,
       size_bytes: job.upload.size_bytes,
     },
+    target_prompt: job.target_prompt ?? null,
     callback_base_url: base,
   };
 
@@ -490,6 +529,13 @@ function publicJob(job: JobRecord, baseUrl: string): Record<string, unknown> {
       size_bytes: job.upload.size_bytes,
       consent_scope: job.upload.consent_scope,
     },
+    target_prompt: job.target_prompt
+      ? {
+          source: job.target_prompt.source,
+          selection_type: job.target_prompt.selection.type,
+          frame: job.target_prompt.frame,
+        }
+      : null,
     progress: job.progress ?? null,
     summary: job.summary ?? null,
     error: job.error ?? null,
@@ -572,10 +618,142 @@ function corsHeaders(request: Request, env: WorkerEnv): Record<string, string> {
   return {
     "Access-Control-Allow-Origin": allowedOrigin,
     "Access-Control-Allow-Methods": "GET, POST, PUT, OPTIONS",
-    "Access-Control-Allow-Headers": "Authorization, Content-Type, X-Clip-Consent, X-Original-Filename",
+    "Access-Control-Allow-Headers": "Authorization, Content-Type, X-Clip-Consent, X-Original-Filename, X-Runner-Prompt",
     "Access-Control-Max-Age": "86400",
     Vary: "Origin",
   };
+}
+
+type PromptParseResult =
+  | { ok: true; prompt: RunnerTargetPrompt | null }
+  | { ok: false; error: string };
+
+function parseRunnerPromptHeader(rawHeader: string | null): PromptParseResult {
+  if (!rawHeader || !rawHeader.trim()) {
+    return { ok: true, prompt: null };
+  }
+
+  if (rawHeader.length > 4096) {
+    return { ok: false, error: "Runner prompt is too large." };
+  }
+
+  let decoded = rawHeader;
+  try {
+    decoded = decodeURIComponent(rawHeader);
+  } catch {
+    decoded = rawHeader;
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(decoded);
+  } catch {
+    return { ok: false, error: "Runner prompt must be valid JSON." };
+  }
+
+  if (!parsed || typeof parsed !== "object") {
+    return { ok: false, error: "Runner prompt must be an object." };
+  }
+
+  const prompt = parsed as Record<string, unknown>;
+  const selection = prompt.selection;
+  if (!selection || typeof selection !== "object") {
+    return { ok: false, error: "Runner prompt selection is required." };
+  }
+
+  const selectionRecord = selection as Record<string, unknown>;
+  const box = sanitizePromptBox(selectionRecord.box);
+  const positivePoints = sanitizePromptPoints(selectionRecord.positive_points);
+  const negativePoints = sanitizePromptPoints(selectionRecord.negative_points);
+
+  if (!box && positivePoints.length === 0) {
+    return { ok: false, error: "Select a runner with a box or a point before processing." };
+  }
+
+  const frame = sanitizePromptFrame(prompt.frame);
+  return {
+    ok: true,
+    prompt: {
+      version: 1,
+      source: "hosted_upload_user_prompt_v1",
+      selection: {
+        type: box ? "box" : "point",
+        positive_points: positivePoints,
+        negative_points: negativePoints,
+        ...(box ? { box } : {}),
+      },
+      frame,
+      notes: "Selected in the upload UI.",
+    },
+  };
+}
+
+function sanitizePromptBox(value: unknown): RunnerPromptBox | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const raw = value as Record<string, unknown>;
+  const x = normalizedNumber(raw.x);
+  const y = normalizedNumber(raw.y);
+  const width = normalizedNumber(raw.width);
+  const height = normalizedNumber(raw.height);
+  if (x === null || y === null || width === null || height === null) return undefined;
+  const boundedX = Math.min(x, 0.98);
+  const boundedY = Math.min(y, 0.96);
+  const boundedWidth = Math.min(width, 1 - boundedX);
+  const boundedHeight = Math.min(height, 1 - boundedY);
+  if (boundedWidth < 0.02 || boundedHeight < 0.04) return undefined;
+  return {
+    x: roundUnit(boundedX),
+    y: roundUnit(boundedY),
+    width: roundUnit(boundedWidth),
+    height: roundUnit(boundedHeight),
+  };
+}
+
+function sanitizePromptPoints(value: unknown): RunnerPromptPoint[] {
+  if (!Array.isArray(value)) return [];
+  return value.slice(0, 4).flatMap((point): RunnerPromptPoint[] => {
+    if (!point || typeof point !== "object") return [];
+    const raw = point as Record<string, unknown>;
+    const x = normalizedNumber(raw.x);
+    const y = normalizedNumber(raw.y);
+    if (x === null || y === null) return [];
+    const label = typeof raw.label === "string" ? raw.label.slice(0, 80) : undefined;
+    return [{ x: roundUnit(x), y: roundUnit(y), ...(label ? { label } : {}) }];
+  });
+}
+
+function sanitizePromptFrame(value: unknown): RunnerTargetPrompt["frame"] {
+  if (!value || typeof value !== "object") return {};
+  const raw = value as Record<string, unknown>;
+  const frame: RunnerTargetPrompt["frame"] = {};
+  const timeSeconds = finiteNumber(raw.time_seconds);
+  if (timeSeconds !== null && timeSeconds >= 0 && timeSeconds <= 600) {
+    frame.time_seconds = Number(timeSeconds.toFixed(3));
+  }
+  const frameIndex = finiteNumber(raw.frame_index);
+  if (frameIndex !== null && frameIndex >= 0) {
+    frame.frame_index = Math.floor(frameIndex);
+  }
+  const width = finiteNumber(raw.width);
+  const height = finiteNumber(raw.height);
+  if (width !== null && width > 0) frame.width = Math.round(width);
+  if (height !== null && height > 0) frame.height = Math.round(height);
+  return frame;
+}
+
+function normalizedNumber(value: unknown): number | null {
+  const parsed = finiteNumber(value);
+  if (parsed === null || parsed < 0 || parsed > 1) return null;
+  return parsed;
+}
+
+function finiteNumber(value: unknown): number | null {
+  const parsed = typeof value === "number" ? value : typeof value === "string" ? Number(value) : Number.NaN;
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function roundUnit(value: number): number {
+  return Math.round(value * 1_000_000) / 1_000_000;
 }
 
 function allowedOrigins(env: WorkerEnv): string[] {

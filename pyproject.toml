@@ -47,6 +47,9 @@ mmpose = [
   "onnxruntime>=1.20",
   "rtmlib>=0.0.15",
 ]
+serverless = [
+  "runpod>=1.7",
+]
 
 [tool.setuptools.packages.find]
 where = ["src"]

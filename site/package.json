@@ -5,6 +5,9 @@
   "scripts": {
     "dev": "next dev -H 127.0.0.1 -p 4173",
     "build": "next build",
+    "build:pages": "NEXT_PUBLIC_API_BASE_URL=${NEXT_PUBLIC_API_BASE_URL:-https://api.whodoirunlike.com} NEXT_PUBLIC_UPLOAD_API_MODE=${NEXT_PUBLIC_UPLOAD_API_MODE:-async} next build",
+    "pages:preview": "wrangler pages dev out --port 8788",
+    "pages:deploy": "npm run build:pages && wrangler pages deploy out --project-name whodoirunlike",
     "start": "next start -H 127.0.0.1 -p 4173",
     "typecheck": "tsc --noEmit"
   },
@@ -21,6 +24,7 @@
     "@types/react": "19.2.15",
     "@types/react-dom": "19.2.3",
     "tailwindcss": "4.3.0",
-    "typescript": "6.0.3"
+    "typescript": "6.0.3",
+    "wrangler": "4.101.0"
   }
 }

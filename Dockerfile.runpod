@@ -1,0 +1,39 @@
+FROM runpod/pytorch:1.0.3-cu1281-torch291-ubuntu2404
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    HF_HOME=/runpod-volume/huggingface \
+    WHODOIRUNLIKE_HOSTED_RUN_ROOT=/runpod-volume/whodoirunlike/runs \
+    WHODOIRUNLIKE_IDENTITY_BACKEND=boxmot_botsort \
+    WHODOIRUNLIKE_POSE_BACKEND=mmpose_rtmpose_l_384 \
+    WHODOIRUNLIKE_MASK_BACKEND=sam31_gpu \
+    WHODOIRUNLIKE_SAM31_GPU_USE_FA3=false \
+    WHODOIRUNLIKE_SKIP_DENSEPOSE=false \
+    DENSEPOSE_CONFIG=/opt/detectron2/projects/DensePose/configs/densepose_rcnn_R_50_FPN_s1x.yaml \
+    DENSEPOSE_WEIGHTS=https://dl.fbaipublicfiles.com/densepose/densepose_rcnn_R_50_FPN_s1x/165712039/model_final_162be9.pkl \
+    DENSEPOSE_DEVICE=cuda
+
+WORKDIR /app
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        build-essential \
+        ffmpeg \
+        git \
+        libglib2.0-0 \
+        libgl1 \
+        ninja-build \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN git clone --depth 1 https://github.com/facebookresearch/detectron2.git /opt/detectron2
+
+COPY pyproject.toml README.md ./
+COPY src ./src
+
+RUN python -m pip install --upgrade pip setuptools wheel \
+    && python -m pip install --no-cache-dir -e ".[mot,mmpose,serverless]" \
+    && python -m pip install --no-cache-dir git+https://github.com/facebookresearch/sam3.git \
+    && python -m pip install --no-cache-dir /opt/detectron2 \
+    && python -m pip install --no-cache-dir /opt/detectron2/projects/DensePose
+
+CMD ["python", "-m", "whodoirunlike.runpod_serverless"]

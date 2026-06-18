@@ -15,6 +15,7 @@ from starlette.concurrency import run_in_threadpool
 
 from whodoirunlike.cv_flow import utc_now_iso
 from whodoirunlike.form_features import compile_form_features
+from whodoirunlike.hosted_processor import router as hosted_processor_router
 from whodoirunlike.pose_runner import process_pose_video, update_manifest_after_pose
 from whodoirunlike.sam2_runner import inspect_video, write_json
 from whodoirunlike.video_eval import POSE_MODEL_URLS, ensure_pose_model
@@ -240,6 +241,7 @@ def create_app() -> FastAPI:
         allow_headers=["*"],
     )
     app.mount("/artifacts", StaticFiles(directory=artifact_root), name="artifacts")
+    app.include_router(hosted_processor_router)
 
     @app.get("/health")
     def health() -> dict[str, Any]:

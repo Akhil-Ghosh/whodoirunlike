@@ -10,7 +10,12 @@ venv/
 node_modules/
 .next/
 out/
+.wrangler/
 *.tsbuildinfo
+.dev.vars
+worker/worker-configuration.d.ts
+.agents/
+skills-lock.json
 
 # Generated / local media artifacts
 artifacts/**
@@ -24,3 +29,4 @@ models/**
 # Local secrets
 .env
 .env.*
+!.env.example

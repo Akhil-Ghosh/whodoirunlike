@@ -1,0 +1,56 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "whodoirunlike-api",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-06-18",
+  "compatibility_flags": ["nodejs_compat"],
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 1
+  },
+  "routes": [
+    {
+      "pattern": "api.whodoirunlike.com",
+      "custom_domain": true
+    }
+  ],
+  "r2_buckets": [
+    {
+      "binding": "CLIPS",
+      "bucket_name": "whodoirunlike-clips"
+    }
+  ],
+  "vars": {
+    "ENVIRONMENT": "production",
+    "PUBLIC_API_BASE_URL": "https://api.whodoirunlike.com",
+    "PUBLIC_ORIGINS": "https://whodoirunlike.com,http://127.0.0.1:4173,http://localhost:4173",
+    "MAX_UPLOAD_BYTES": "78643200",
+    "PROCESSOR_URL": "",
+    "RUNPOD_ENDPOINT_ID": ""
+  },
+  "env": {
+    "preview": {
+      "name": "whodoirunlike-api-preview",
+      "routes": [
+        {
+          "pattern": "staging-api.whodoirunlike.com",
+          "custom_domain": true
+        }
+      ],
+      "r2_buckets": [
+        {
+          "binding": "CLIPS",
+          "bucket_name": "whodoirunlike-clips-preview"
+        }
+      ],
+      "vars": {
+        "ENVIRONMENT": "preview",
+        "PUBLIC_API_BASE_URL": "https://staging-api.whodoirunlike.com",
+        "PUBLIC_ORIGINS": "https://whodoirunlike.com,http://127.0.0.1:4173,http://localhost:4173",
+        "MAX_UPLOAD_BYTES": "78643200",
+        "PROCESSOR_URL": "",
+        "RUNPOD_ENDPOINT_ID": ""
+      }
+    }
+  }
+}

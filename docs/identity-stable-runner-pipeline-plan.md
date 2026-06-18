@@ -118,11 +118,11 @@ Recommended initial thresholds are stored in `track_seed.json` when a CV run is 
 
 Implemented:
 
-- SAM 3.1 MLX via `scripts/run_sam31_mlx_mask.py`
+- SAM 3.1 GPU via `src/whodoirunlike/sam31_gpu_runner.py` for hosted CUDA runs
+- SAM 3.1 MLX via `scripts/run_sam31_mlx_mask.py` for local Apple Silicon runs
 - Track-gated SAM 3.1 candidate selection when `tracklets.jsonl` or `tracklets.parquet`
   exists
 - `masks.jsonl` with uncompressed RLE mask records
-- Legacy SAM 2.1 fallback also writes `masks.jsonl`
 
 Future production target:
 

@@ -1,60 +1,49 @@
 # Who Do I Run Like
 
-Running-form computer vision pipeline with a deployed-style API and web demo.
+Small computer vision project for running clips.
 
-This repo turns a short running clip into reviewable motion artifacts:
+You can upload a short clip, run pose extraction, and get back review artifacts:
 
-- MediaPipe pose landmarks per frame
-- skeleton render and QA overlay videos
-- pose-quality metrics
-- normalized form features for later similarity search
+- a skeleton video
+- a QA overlay
+- pose quality metrics
+- a small feature summary
 
-It is intentionally scoped as an engineering project, not a coaching product. The matching layer is in progress; the current shipped path is clip ingestion, model inference, artifact generation, and feature compilation.
+The matching part is still a work in progress. Right now the repo is mostly about getting from raw video to usable pose artifacts without hiding the messy parts.
 
-## Why This Exists
+## Current state
 
-The product idea is simple: upload a running clip and eventually compare your form to a reference library of elite runners.
+- FastAPI endpoint for short video uploads
+- MediaPipe pose pass over each frame
+- generated skeleton and QA videos
+- Next.js preview site with demo, gallery, and about pages
+- Cloudflare Worker scaffold for R2-backed uploads and async job status
+- RunPod Serverless processor scaffold for the full hosted pipeline
+- offline scripts for finding and reviewing candidate running footage
 
-The engineering work behind that is less simple:
+No coaching claims. The metrics are rough signals for checking whether a clip is readable.
 
-1. find usable running footage
-2. isolate the target runner
-3. extract pose consistently across frames
-4. score artifact quality
-5. compile features that can support retrieval and explanation
+## What happens to a clip locally
 
-This repo focuses on those backend and data-pipeline pieces.
+1. Save the upload under `artifacts/api_runs/<run_id>/`.
+2. Run MediaPipe pose landmarks.
+3. Write the skeleton render, QA overlay, landmarks, and feature summary.
+4. Return JSON with artifact URLs and basic quality metrics.
 
-## What It Demonstrates
+That local API path is synchronous because it is meant for quick short-clip checks.
 
-- **Python backend**: FastAPI service that accepts video uploads and returns JSON plus generated artifacts.
-- **ML inference**: MediaPipe Pose Landmarker over uploaded running clips.
-- **Data pipeline design**: staged artifacts, manifests, JSONL/NPZ feature contracts, review queues, and QC metrics.
-- **Computer vision ops**: browser-playable render outputs for debugging model quality.
-- **Frontend integration**: Next.js technical-preview page that can call the API.
-- **Deployment readiness**: Dockerfile, environment config, and clear local/cloud run commands.
-- **Testing**: unit coverage for candidate scoring, pose selection, feature compilation, pipeline contracts, and API behavior.
+## Hosted flow
 
-## Architecture
+The Cloudflare path is async:
 
-```text
-site/                         Next.js technical-preview UI
-src/whodoirunlike/api.py      FastAPI clip-processing API
-src/whodoirunlike/pose_runner.py
-                              MediaPipe pose inference + skeleton/QA renders
-src/whodoirunlike/form_features.py
-                              normalized pose arrays and summary features
-src/whodoirunlike/*_runner.py optional CV stages for masks, identity, DensePose
-scripts/                      CLI entrypoints for offline ingestion/review
-schemas/                      JSON contracts for candidates, reviews, artifacts
-docs/                         design notes and implementation plans
-```
+1. The site uploads the clip to the Worker at `api.whodoirunlike.com`.
+2. The Worker stores the source clip and job record in R2.
+3. Once `RUNPOD_ENDPOINT_ID` and `RUNPOD_API_KEY` are set, the Worker queues a RunPod Serverless job.
+4. The RunPod processor downloads the clip, seeds a center-runner prompt, runs identity tracking, SAM 3.1 GPU, pose, DensePose, fusion, features, and QC, then uploads artifacts back through the Worker.
 
-The web API is deliberately lean. It runs the pose path synchronously for short clips and writes artifacts under `artifacts/api_runs/<run_id>/`.
+Right now production uploads are safe but processing is intentionally off: `RUNPOD_ENDPOINT_ID` is blank in the deployed Worker, so jobs are stored in R2 and `start` returns `processor_configured: false`. The next deploy step is the RunPod endpoint, not a tunnel to a local machine.
 
-For longer or production workloads, the same contract can move to async jobs: upload object storage, enqueue processing, run workers, then serve artifacts once complete.
-
-## API Quickstart
+## Run the API
 
 ```bash
 python3.12 -m venv .venv
@@ -69,7 +58,7 @@ Health check:
 curl http://127.0.0.1:8000/health
 ```
 
-Process a short clip:
+Process a clip:
 
 ```bash
 curl -X POST http://127.0.0.1:8000/v1/clips \
@@ -77,39 +66,9 @@ curl -X POST http://127.0.0.1:8000/v1/clips \
   -F "file=@/path/to/running-clip.mp4"
 ```
 
-Response shape:
+Artifacts are written locally by default. The first API call downloads the selected MediaPipe model into `models/mediapipe/`.
 
-```json
-{
-  "run_id": "abc123...",
-  "status": "complete",
-  "quality": {
-    "pose_hit_rate": 0.92,
-    "usable_rate": 0.84
-  },
-  "summary_features": {
-    "stride_rhythm_proxy": 1.5,
-    "arm_swing_amplitude": 0.42
-  },
-  "artifacts": {
-    "skeleton_render": "http://127.0.0.1:8000/artifacts/...",
-    "qa_overlay": "http://127.0.0.1:8000/artifacts/..."
-  }
-}
-```
-
-The first API call downloads the selected MediaPipe model into `models/mediapipe/`.
-
-## Docker
-
-```bash
-docker build -t whodoirunlike-api .
-docker run --rm -p 8000:8000 \
-  -e WHODOIRUNLIKE_CORS_ORIGINS=http://127.0.0.1:4173 \
-  whodoirunlike-api
-```
-
-Important environment variables:
+Useful environment variables:
 
 ```text
 WHODOIRUNLIKE_API_ARTIFACT_ROOT=artifacts/api_runs
@@ -117,11 +76,37 @@ WHODOIRUNLIKE_MODEL_DIR=models/mediapipe
 WHODOIRUNLIKE_MAX_UPLOAD_BYTES=78643200
 WHODOIRUNLIKE_MAX_DURATION_SECONDS=20
 WHODOIRUNLIKE_CORS_ORIGINS=http://127.0.0.1:4173,http://localhost:4173
+WHODOIRUNLIKE_PROCESSOR_SHARED_SECRET=<same secret as the Worker>
+WHODOIRUNLIKE_HOSTED_RUN_ROOT=artifacts/hosted_runs
+WHODOIRUNLIKE_IDENTITY_BACKEND=boxmot_botsort
+WHODOIRUNLIKE_POSE_BACKEND=mmpose_rtmpose_l_384
+WHODOIRUNLIKE_MASK_BACKEND=sam31_gpu
+WHODOIRUNLIKE_MASK_QUALITY_MODE=native
+HF_TOKEN=<token with facebook/sam3.1 access>
+WHODOIRUNLIKE_SKIP_DENSEPOSE=false
+DENSEPOSE_CONFIG=models/densepose/detectron2/projects/DensePose/configs/densepose_rcnn_R_50_FPN_s1x.yaml
+DENSEPOSE_WEIGHTS=models/densepose/weights/densepose_rcnn_R_50_FPN_s1x_model_final_162be9.pkl
 ```
 
-See `.env.example`.
+See `.env.example` for the same defaults.
 
-## Frontend Quickstart
+Hosted processor readiness:
+
+```bash
+curl http://127.0.0.1:8000/v1/processor/health
+```
+
+For the full hosted pipeline, `readiness.ready_for_full_pipeline` should be `true`. If it is false, the response names the missing identity, SAM 3.1 GPU, pose, or DensePose dependency.
+
+RunPod setup lives in [docs/runpod-serverless.md](docs/runpod-serverless.md). After the Worker and cloud processor are connected, run an end-to-end hosted smoke test:
+
+```bash
+.venv/bin/python scripts/smoke_hosted_upload_flow.py \
+  --api-base-url https://api.whodoirunlike.com \
+  --clip /path/to/short-running-clip.mp4
+```
+
+## Run the site
 
 In one terminal, run the API. In another:
 
@@ -133,68 +118,54 @@ NEXT_PUBLIC_API_BASE_URL=http://127.0.0.1:8000 npm run dev
 
 Open `http://127.0.0.1:4173`.
 
-The page is a technical preview:
+The site has a demo walkthrough, a gallery of processed runners, and an upload card. In local dev it calls the synchronous FastAPI endpoint. In production it uses the Cloudflare Worker upload/job flow.
 
-- hero comparison visual
-- featured four-stage demo from an existing processed clip
-- volunteer upload card wired to the FastAPI service
+For Cloudflare Pages, use `site` as the root directory, `npm run build:pages` as the build command, and `out` as the output directory. The current Pages project was created by direct upload, so it is not Git-backed. For production, recreate it through the Cloudflare GitHub integration and point the custom domain at that Git-backed project. The upload card should point at `https://api.whodoirunlike.com`.
 
-## Offline Pipeline
-
-The API path is the portfolio-facing service. The broader offline pipeline is still available for corpus building and artifact review.
-
-Useful commands:
+## Docker
 
 ```bash
-python scripts/discover_youtube.py \
-  --runner-data data/runners.yml \
-  --out artifacts/discovery/candidates.jsonl \
-  --limit-per-query 5
-
-python scripts/evaluate_video_candidates.py \
-  --limit 30 \
-  --sample-count 16 \
-  --out artifacts/evaluation/video_candidates.top30.csv
-
-python scripts/serve_review_ui.py --limit 20 --port 8765
-
-python scripts/prepare_single_clip_cv_run.py --candidate-id <candidate_id>
-python scripts/run_pose_landmarks.py --candidate-id <candidate_id> --model-variant heavy
-python scripts/compile_form_features.py --candidate-id <candidate_id>
+docker build -t whodoirunlike-api .
+docker run --rm -p 8000:8000 \
+  -e WHODOIRUNLIKE_CORS_ORIGINS=http://127.0.0.1:4173 \
+  whodoirunlike-api
 ```
 
-More detail:
+## Repo map
 
-- `docs/single-clip-cv-flow.md`
-- `docs/identity-stable-runner-pipeline-plan.md`
-- `docs/similarity-search-implementation-plan.md`
+```text
+site/                         Next.js preview site
+worker/                       Cloudflare Worker for uploads, jobs, and R2 artifacts
+src/whodoirunlike/api.py      FastAPI upload endpoint
+src/whodoirunlike/hosted_processor.py
+                              hosted Worker-to-pipeline bridge
+src/whodoirunlike/runpod_serverless.py
+                              RunPod Serverless entrypoint
+src/whodoirunlike/full_pipeline.py
+                              identity, SAM, pose, DensePose, fusion, features, QC
+src/whodoirunlike/pose_runner.py
+                              pose inference and render outputs
+src/whodoirunlike/form_features.py
+                              normalized pose arrays and summary features
+scripts/                      offline ingestion and review commands
+schemas/                      JSON contracts
+docs/                         plans and design notes
+```
+
+DensePose, SAM, identity tracking, and curation tools are still heavyweight. They run in the processor path, not inside Cloudflare Pages or the Worker runtime.
 
 ## Tests
 
 ```bash
-python -m pytest
+.venv/bin/python -m pytest
 cd site && npm run typecheck && npm run build
+cd worker && npm run check
 ```
 
-The test suite covers:
+## Known limits
 
-- runner seed data contracts
-- YouTube candidate scoring
-- clip curation
-- pose target selection
-- form-feature compilation
-- pipeline manifest updates
-- API validation and response shape
-
-## Current Limits
-
-- The API is optimized for short clips, not full races.
-- The public matching layer is not complete yet.
-- DensePose, identity tracking, and SAM 3.1 masking are available as offline stages, not part of the default web request.
-- Uploaded API artifacts are local by default. A production deployment should move source clips and generated artifacts to object storage and run inference in background workers.
-
-## Design Notes
-
-Primary matching will use pose-sequence similarity. Masks and DensePose are treated as confidence/QA layers, not as the source of truth.
-
-See `CONTEXT.md` for project language and `docs/adr/0001-pose-sequence-primary-densepose-confidence-layer.md` for the core architecture decision.
+- Short clips only by default.
+- Matching is not live yet.
+- Hosted processing needs a RunPod endpoint, Worker secrets, and configured R2 buckets.
+- The auto target prompt works best when the uploaded runner is centered.
+- The gallery uses a small set of hand-reviewed examples, not a full reference corpus.

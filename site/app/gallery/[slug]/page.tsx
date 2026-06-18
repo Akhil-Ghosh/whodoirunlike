@@ -10,6 +10,8 @@ type RunnerPageProps = {
   params: Promise<{ slug: string }>;
 };
 
+export const dynamicParams = false;
+
 function getRunner(slug: string) {
   return analyzedRunners.find((runner) => runner.slug === slug);
 }

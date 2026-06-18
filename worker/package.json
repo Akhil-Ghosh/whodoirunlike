@@ -1,0 +1,18 @@
+{
+  "name": "whodoirunlike-worker",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev --port 8787",
+    "deploy": "wrangler deploy --env=\"\"",
+    "types": "wrangler types worker-configuration.d.ts --env-file .dev.vars.example --strict-vars false",
+    "typecheck": "npm run types && tsc --noEmit",
+    "check": "npm run typecheck && wrangler deploy --dry-run --env=\"\""
+  },
+  "devDependencies": {
+    "@types/node": "^25.9.3",
+    "typescript": "6.0.3",
+    "wrangler": "4.101.0"
+  }
+}

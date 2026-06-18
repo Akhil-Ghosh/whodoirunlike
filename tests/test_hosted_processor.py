@@ -162,6 +162,63 @@ def test_hosted_manifest_uses_uploaded_runner_prompt(tmp_path: Path) -> None:
     assert prompt["selection"]["positive_points"][0]["label"] == "target_runner_center"
 
 
+def test_uploaded_runner_prompt_overrides_demo_profile(tmp_path: Path) -> None:
+    from whodoirunlike import hosted_processor
+
+    source_path = tmp_path / "source.mp4"
+    _write_tiny_video(source_path)
+    payload = hosted_processor.WorkerJobRequest(
+        run_id="12345678-1234-4234-9234-123456789abc",
+        callback_base_url="https://api.whodoirunlike.com",
+        source={
+            "url": "https://api.whodoirunlike.com/v1/jobs/12345678-1234-4234-9234-123456789abc/source",
+            "key": "uploads/12345678-1234-4234-9234-123456789abc/source.mp4",
+            "filename": "cole-source.mp4",
+            "content_type": "video/mp4",
+            "size_bytes": source_path.stat().st_size,
+        },
+        target_prompt={
+            "selection": {
+                "type": "box",
+                "positive_points": [{"x": 0.46, "y": 0.45, "label": "target_runner_center"}],
+                "negative_points": [],
+                "box": {"x": 0.36, "y": 0.14, "width": 0.2, "height": 0.62},
+            },
+            "frame": {"time_seconds": 0.2, "width": 64, "height": 48},
+        },
+    )
+    demo_profile = {
+        "id": "cole_hocker_reference_v1",
+        "source_sha256": "sha",
+        "runner_name": "Cole Hocker",
+        "runner_slug": "cole-hocker",
+        "prompt_frame_index": 0,
+        "prompt_box": {"x": 0.6, "y": 0.2, "width": 0.2, "height": 0.7},
+        "reference_artifacts": {"fused_overlay.mp4": "cole-fused.mp4"},
+    }
+
+    manifest_path = hosted_processor._write_hosted_manifest(
+        run_dir=tmp_path / "run",
+        payload=payload,
+        source_path=source_path,
+        video_meta={"width": 64, "height": 48, "fps": 10.0, "frame_count": 3},
+        demo_profile=demo_profile,
+        uploaded_prompt=payload.target_prompt,
+    )
+
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    prompt = json.loads((tmp_path / "run/person_prompt.json").read_text(encoding="utf-8"))
+    track_seed = json.loads((tmp_path / "run/track_seed.json").read_text(encoding="utf-8"))
+    assert manifest["runner_name"] == "Uploaded runner"
+    assert manifest["demo_profile"] is None
+    assert manifest["target_prompt_source"] == "hosted_upload_user_prompt_v1"
+    assert manifest["stages"]["person_prompt"]["status"] == "user_selected"
+    assert track_seed["target_lock_method"] == "uploaded_runner_prompt"
+    assert prompt["source"] == "hosted_upload_user_prompt_v1"
+    assert prompt["selection"]["box"]["x"] == 0.36
+    assert prompt["frame"]["frame_index"] == 2
+
+
 def test_apply_demo_reference_artifacts_replaces_selected_outputs(
     monkeypatch: Any,
     tmp_path: Path,

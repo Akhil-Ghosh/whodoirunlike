@@ -150,6 +150,15 @@ def _demo_upload_profile(source_path: Path) -> dict[str, Any] | None:
     }
 
 
+def _active_demo_profile(
+    demo_profile: dict[str, Any] | None,
+    uploaded_prompt: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    if uploaded_prompt is not None:
+        return None
+    return demo_profile
+
+
 def _post_worker_report(
     *,
     callback_base_url: str,
@@ -372,6 +381,7 @@ def _write_hosted_manifest(
     demo_profile: dict[str, Any] | None = None,
     uploaded_prompt: dict[str, Any] | None = None,
 ) -> Path:
+    demo_profile = _active_demo_profile(demo_profile, uploaded_prompt)
     prompt_frame_path = run_dir / "prompt_frame.jpg"
     prompt_frame_index = (
         int(demo_profile["prompt_frame_index"])
@@ -854,13 +864,14 @@ def process_hosted_job(payload: WorkerJobRequest, *, raise_on_error: bool = Fals
         )
         _download_source(payload, source_path)
         demo_profile = _demo_upload_profile(source_path)
+        active_demo_profile = _active_demo_profile(demo_profile, payload.target_prompt)
         video_meta = inspect_video(source_path)
         _write_hosted_manifest(
             run_dir=run_dir,
             payload=payload,
             source_path=source_path,
             video_meta=video_meta,
-            demo_profile=demo_profile,
+            demo_profile=active_demo_profile,
             uploaded_prompt=payload.target_prompt,
         )
 
@@ -879,11 +890,11 @@ def process_hosted_job(payload: WorkerJobRequest, *, raise_on_error: bool = Fals
         )
         demo_artifacts = _apply_demo_reference_artifacts(
             run_dir=run_dir,
-            demo_profile=demo_profile,
+            demo_profile=active_demo_profile,
         )
         result = _attach_demo_reference_summary(
             result,
-            demo_profile=demo_profile,
+            demo_profile=active_demo_profile,
             copied_artifacts=demo_artifacts,
         )
         write_json(run_dir / "hosted_pipeline_result.json", result)

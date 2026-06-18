@@ -6,7 +6,6 @@ from typing import Any
 
 import cv2
 import numpy as np
-import torch
 
 from whodoirunlike.densepose_runner import (
     DensePoseBackend,
@@ -72,14 +71,30 @@ def _read_jsonl(path: Path) -> list[dict[str, Any]]:
     return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
 
 
+class _FakeTensor:
+    def __init__(self, value: np.ndarray) -> None:
+        self.value = value
+
+    def detach(self) -> _FakeTensor:
+        return self
+
+    def cpu(self) -> _FakeTensor:
+        return self
+
+    def numpy(self) -> np.ndarray:
+        return self.value
+
+
 class _FakeChartResult:
-    labels = torch.tensor([[0, 1, 1], [2, 2, 0]], dtype=torch.int64)
-    uv = torch.tensor(
-        [
-            [[0.0, 0.2, 0.4], [0.6, 0.8, 0.0]],
-            [[0.0, 0.1, 0.3], [0.5, 0.7, 0.0]],
-        ],
-        dtype=torch.float32,
+    labels = _FakeTensor(np.array([[0, 1, 1], [2, 2, 0]], dtype=np.int64))
+    uv = _FakeTensor(
+        np.array(
+            [
+                [[0.0, 0.2, 0.4], [0.6, 0.8, 0.0]],
+                [[0.0, 0.1, 0.3], [0.5, 0.7, 0.0]],
+            ],
+            dtype=np.float32,
+        )
     )
 
 

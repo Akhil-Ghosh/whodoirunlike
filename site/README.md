@@ -1,26 +1,35 @@
-# Who Do I Run Like landing app
+# Who Do I Run Like Site
 
-This folder contains the Next.js landing page prototype plus the image, SVG, and token
-assets needed to match the reference mockup.
+Next.js technical-preview UI for the running-form CV pipeline.
 
-## Running locally
+The page is intentionally demo-first:
+
+- hero comparison visual
+- featured four-stage walkthrough from a processed clip
+- upload card that calls the FastAPI service at `NEXT_PUBLIC_API_BASE_URL`
+
+## Run Locally
+
+Start the API from the repo root:
+
+```bash
+uvicorn whodoirunlike.api:app --host 127.0.0.1 --port 8000
+```
+
+Then start the site:
 
 ```bash
 npm install
-npm run dev
+NEXT_PUBLIC_API_BASE_URL=http://127.0.0.1:8000 npm run dev
 ```
 
-Then open `http://127.0.0.1:4173`.
+Open `http://127.0.0.1:4173`.
 
-## Hero overlay behavior
+## Build
 
-The hero comparison uses the gray runner as the base image and clips the color runner on top.
-The interactive wipe is isolated in `app/components/CompareRunner.tsx`.
+```bash
+npm run typecheck
+npm run build
+```
 
-## Assets
-
-Assets are served from `public/assets`, so component paths should use `/assets/...`.
-
-## Notes before production
-
-The athlete images and likenesses are generated assets. Review rights, approvals, copy, and factual labels before public launch.
+Assets under `public/assets/demos/` are web-sized derivatives of local CV artifacts. The larger source artifacts stay outside git under `artifacts/`.

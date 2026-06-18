@@ -6,18 +6,18 @@ import { UploadCard } from "./UploadCard";
 const featureItems = [
   {
     icon: "/assets/icons/video.svg",
-    title: "Upload a short running video",
-    description: "Just 5-10 seconds",
+    title: "Submit a short running clip",
+    description: "MP4, MOV, or WebM",
   },
   {
     icon: "/assets/icons/analytics.svg",
-    title: "We analyze 50+ movement patterns",
-    description: "Stride, posture, arm swing, and more",
+    title: "Extract pose and QA artifacts",
+    description: "Landmarks, overlays, and metrics",
   },
   {
     icon: "/assets/icons/user-match.svg",
-    title: "See your top matches",
-    description: "Discover who you run most like, and why",
+    title: "Compile form features",
+    description: "The matching layer comes next",
   },
 ];
 
@@ -28,7 +28,7 @@ export function Hero() {
       className="hero-field relative overflow-hidden"
       aria-label="Running form comparison"
     >
-      <div className="mx-auto grid max-w-[1416px] grid-cols-1 gap-8 px-5 pb-8 pt-8 sm:px-8 lg:h-[632px] lg:grid-cols-[370px_minmax(360px,1fr)_300px] lg:items-center lg:gap-8 lg:px-8 lg:py-0 2xl:grid-cols-[410px_580px_306px] 2xl:gap-[60px] 2xl:px-0">
+      <div className="mx-auto grid max-w-[1416px] grid-cols-1 gap-8 px-5 pb-8 pt-8 sm:px-8 lg:min-h-[684px] lg:grid-cols-[370px_minmax(360px,1fr)_300px] lg:items-center lg:gap-8 lg:px-8 lg:py-6 2xl:grid-cols-[410px_580px_306px] 2xl:gap-[60px] 2xl:px-0">
         <Reveal className="relative z-[1] lg:pt-3" delay={0.02}>
           <h1 className="text-[54px] font-medium leading-[0.96] text-[var(--ink)] sm:text-[68px] lg:text-[64px] 2xl:text-[76px]">
             <span className="block">Who Do You</span>
@@ -42,11 +42,29 @@ export function Hero() {
             className="mb-6 mt-1 w-[270px] sm:w-[330px]"
             aria-hidden="true"
           />
-          <p className="max-w-[420px] text-[17px] leading-[1.48] text-[#222326] sm:text-[18px]">
-            Who Do I Run Like uses AI and computer vision to analyze your running form and compare it to the world&apos;s best athletes.
+          <p className="mb-4 inline-flex rounded-full border border-[var(--line)] bg-white/70 px-4 py-2 text-[12px] font-bold uppercase tracking-[0.08em] text-[var(--accent-deep)]">
+            Technical Preview
           </p>
+          <p className="max-w-[420px] text-[17px] leading-[1.48] text-[#222326] sm:text-[18px]">
+            Who Do I Run Like is a running-form computer vision pipeline: upload a clip,
+            extract pose artifacts, and turn motion into searchable features.
+          </p>
+          <div className="mt-7 flex flex-wrap gap-3">
+            <a
+              className="focus-ring inline-flex h-12 items-center justify-center rounded-full bg-[var(--charcoal)] px-6 text-[14px] font-medium text-white shadow-[0_12px_35px_rgba(20,20,20,0.10)] transition duration-300 hover:bg-[#202124]"
+              href="#demo"
+            >
+              Watch the demo
+            </a>
+            <a
+              className="focus-ring inline-flex h-12 items-center justify-center rounded-full border border-[rgba(23,23,25,0.16)] bg-white/64 px-6 text-[14px] font-medium text-[var(--ink)] transition duration-300 hover:bg-white"
+              href="#upload"
+            >
+              Volunteer a clip
+            </a>
+          </div>
 
-          <ul className="mt-8 hidden gap-[22px] lg:grid" aria-label="How it works">
+          <ul className="mt-7 hidden gap-[18px] lg:grid" aria-label="How it works">
             {featureItems.map((item) => (
               <li className="grid grid-cols-[34px_1fr] items-start gap-4" key={item.title}>
                 <Image src={item.icon} alt="" width={28} height={28} className="mt-0.5 h-7 w-7" aria-hidden="true" />

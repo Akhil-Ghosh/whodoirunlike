@@ -96,6 +96,18 @@ def _as_float(value: Any, default: float = 0.0) -> float:
         return default
 
 
+def _nanmean(values: np.ndarray, axis: int) -> np.ndarray:
+    finite = np.isfinite(values)
+    counts = finite.sum(axis=axis)
+    sums = np.where(finite, values, 0.0).sum(axis=axis)
+    return np.divide(
+        sums,
+        counts,
+        out=np.full_like(sums, np.nan, dtype=np.float32),
+        where=counts > 0,
+    ).astype(np.float32)
+
+
 def _landmark_matrix(rows: Sequence[dict[str, Any]]) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     frame_count = len(rows)
     xy = np.full((frame_count, JOINT_COUNT, 2), np.nan, dtype=np.float32)
@@ -127,7 +139,7 @@ def _landmark_matrix(rows: Sequence[dict[str, Any]]) -> tuple[np.ndarray, np.nda
 
 def _safe_midpoint(points: np.ndarray, left: int, right: int) -> np.ndarray:
     pair = points[:, [left, right], :]
-    return np.nanmean(pair, axis=1)
+    return _nanmean(pair, axis=1)
 
 
 def normalize_pose_xy(xy: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -137,7 +149,7 @@ def normalize_pose_xy(xy: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarra
     torso_scale = np.linalg.norm(torso, axis=1)
     hip_width = np.linalg.norm(xy[:, 23] - xy[:, 24], axis=1)
     shoulder_width = np.linalg.norm(xy[:, 11] - xy[:, 12], axis=1)
-    fallback_scale = np.nanmean(np.stack([hip_width, shoulder_width], axis=1), axis=1)
+    fallback_scale = _nanmean(np.stack([hip_width, shoulder_width], axis=1), axis=1)
     scale = np.where(np.isfinite(torso_scale) & (torso_scale > 1e-4), torso_scale, fallback_scale)
     scale = np.where(np.isfinite(scale) & (scale > 1e-4), scale, 1.0).astype(np.float32)
     normalized = (xy - hip_mid[:, None, :]) / scale[:, None, None]
@@ -309,7 +321,7 @@ def _joint_range(normalized_xy: np.ndarray, weights: np.ndarray, joint_index: in
 def _rhythm_proxy(normalized_xy: np.ndarray, weights: np.ndarray, fps: float) -> float:
     left = normalized_xy[:, 31, 1]
     right = normalized_xy[:, 32, 1]
-    signal = np.nanmean(np.stack([left, right]), axis=0)
+    signal = _nanmean(np.stack([left, right]), axis=0)
     valid = np.isfinite(signal) & (weights > 0)
     if valid.sum() < 8 or not fps:
         return 0.0
@@ -356,7 +368,7 @@ def summary_features(
             for joint in (25, 26, 27, 28, 31, 32)
         ]
     )
-    hip_mid_y = np.nanmean(raw_xy[:, [23, 24], 1], axis=1)
+    hip_mid_y = _nanmean(raw_xy[:, [23, 24], 1], axis=1)
     densepose_visibility = {
         f"{name}_visibility_rate": _weighted_mean(densepose_group_visibility[:, index], frame_weights)
         for name, index in group_lookup.items()

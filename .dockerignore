@@ -1,0 +1,15 @@
+.DS_Store
+.git
+.venv
+.pytest_cache
+.ruff_cache
+__pycache__
+*.pyc
+artifacts
+clips
+models
+site/.next
+site/node_modules
+site/out
+node_modules
+yolo*.pt

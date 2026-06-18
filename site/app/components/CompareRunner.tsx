@@ -3,22 +3,21 @@
 import Image from "next/image";
 import {
   CSSProperties,
-  MouseEvent as ReactMouseEvent,
   PointerEvent as ReactPointerEvent,
   useLayoutEffect,
   useRef,
 } from "react";
 
 type RevealStyle = CSSProperties & {
+  "--athlete-note-opacity": number;
   "--divider-opacity": number;
-  "--jakob-note-opacity": number;
   "--reveal-x": string;
   "--you-note-opacity": number;
 };
 
 const initialRevealStyle: RevealStyle = {
+  "--athlete-note-opacity": 0,
   "--divider-opacity": 0,
-  "--jakob-note-opacity": 0,
   "--reveal-x": "0px",
   "--you-note-opacity": 1,
 };
@@ -26,15 +25,16 @@ const initialRevealStyle: RevealStyle = {
 export function CompareRunner() {
   const stageRef = useRef<HTMLDivElement | null>(null);
   const ratioRef = useRef(0);
+  const dividerHideTimerRef = useRef<number | null>(null);
 
-  function setReveal(clientX: number) {
+  function setReveal(clientX: number, showDivider: boolean) {
     const stage = stageRef.current;
     if (!stage) return;
 
     const rect = stage.getBoundingClientRect();
     const raw = clientX - rect.left;
     const clamped = Math.max(0, Math.min(rect.width, raw));
-    setRevealVars(stage, clamped, rect.width);
+    setRevealVars(stage, clamped, rect.width, showDivider);
   }
 
   function syncRevealWidth() {
@@ -43,49 +43,62 @@ export function CompareRunner() {
 
     const width = stage.getBoundingClientRect().width;
     const x = width * ratioRef.current;
-    setRevealVars(stage, x, width);
+    setRevealVars(stage, x, width, false);
   }
 
-  function setRevealVars(stage: HTMLDivElement, x: number, width: number) {
+  function setRevealVars(stage: HTMLDivElement, x: number, width: number, showDivider: boolean) {
     const ratio = width > 0 ? x / width : 0;
     ratioRef.current = ratio;
     stage.style.setProperty("--reveal-x", `${x}px`);
-    stage.style.setProperty("--divider-opacity", x > 1 ? "1" : "0");
     stage.style.setProperty("--you-note-opacity", ratio <= 0.5 ? "1" : "0");
-    stage.style.setProperty("--jakob-note-opacity", ratio >= 0.5 ? "1" : "0");
+    stage.style.setProperty("--athlete-note-opacity", ratio >= 0.5 ? "1" : "0");
+
+    if (showDivider) {
+      showDividerWhileMoving(stage, x, width);
+    }
+  }
+
+  function hideDivider(stage = stageRef.current) {
+    if (dividerHideTimerRef.current) {
+      window.clearTimeout(dividerHideTimerRef.current);
+      dividerHideTimerRef.current = null;
+    }
+    stage?.style.setProperty("--divider-opacity", "0");
+  }
+
+  function showDividerWhileMoving(stage: HTMLDivElement, x: number, width: number) {
+    if (dividerHideTimerRef.current) {
+      window.clearTimeout(dividerHideTimerRef.current);
+    }
+
+    const isInsideStage = x > 1 && x < width - 1;
+    stage.style.setProperty("--divider-opacity", isInsideStage ? "1" : "0");
+    dividerHideTimerRef.current = window.setTimeout(() => {
+      hideDivider(stage);
+    }, 120);
   }
 
   useLayoutEffect(() => {
     const stage = stageRef.current;
     if (!stage) return;
 
-    const trackPointer = (event: globalThis.PointerEvent) => {
-      setReveal(event.clientX);
-    };
-
     syncRevealWidth();
-    window.addEventListener("pointermove", trackPointer, { passive: true });
-
     const observer = new ResizeObserver(syncRevealWidth);
     observer.observe(stage);
 
     return () => {
-      window.removeEventListener("pointermove", trackPointer);
+      hideDivider(stage);
       observer.disconnect();
     };
   }, []);
 
   function handlePointer(event: ReactPointerEvent<HTMLDivElement>) {
-    setReveal(event.clientX);
+    setReveal(event.clientX, true);
   }
 
   function handlePointerDown(event: ReactPointerEvent<HTMLDivElement>) {
     event.currentTarget.setPointerCapture(event.pointerId);
-    setReveal(event.clientX);
-  }
-
-  function handleMouse(event: ReactMouseEvent<HTMLDivElement>) {
-    setReveal(event.clientX);
+    setReveal(event.clientX, false);
   }
 
   return (
@@ -96,9 +109,9 @@ export function CompareRunner() {
       style={initialRevealStyle}
       onPointerMove={handlePointer}
       onPointerDown={handlePointerDown}
-      onMouseMove={handleMouse}
-      onMouseDown={handleMouse}
-      onClick={handleMouse}
+      onPointerLeave={() => hideDivider()}
+      onPointerCancel={() => hideDivider()}
+      onPointerUp={() => hideDivider()}
       aria-label="Runner comparison reveal"
     >
       <div className="runner-ground absolute bottom-[7%] left-[12%] h-8 w-[76%]" aria-hidden="true" />
@@ -141,8 +154,8 @@ export function CompareRunner() {
         data-testid="runner-color-reveal"
       >
         <Image
-          src="/assets/hero/runner-color.png"
-          alt="Color comparison runner"
+          src="/assets/hero/cole-hocker-color.png"
+          alt="Cole Hocker comparison runner"
           width={1024}
           height={1536}
           priority
@@ -151,13 +164,13 @@ export function CompareRunner() {
       </div>
 
       <div
-        className="pointer-events-none absolute inset-0 opacity-[var(--jakob-note-opacity)] transition-opacity duration-200 ease-out will-change-[opacity]"
+        className="pointer-events-none absolute inset-0 opacity-[var(--athlete-note-opacity)] transition-opacity duration-200 ease-out will-change-[opacity]"
         data-testid="runner-color-note"
       >
         <p className="hand-font absolute right-[3%] top-[10%] text-center text-[22px] leading-[1.08] text-[var(--ink)] lg:right-[-3%] lg:top-[12%] lg:text-[23px]">
-          Jakob
+          Cole
           <br />
-          Ingebrigtsen
+          Hocker
           <Image
             src="/assets/ui/hand-arrow-athlete.svg"
             alt=""

@@ -1,323 +1,200 @@
 # Who Do I Run Like
 
-Offline-first CV ingestion pipeline for `whodoirunlike.com`.
+Running-form computer vision pipeline with a deployed-style API and web demo.
 
-The first product goal is an entertainment similarity experience: upload a running clip, generate a form/motion representation, and return the elite runner whose motion looks closest. Sprinting stays in the product model, but the first working pipeline targets distance running.
+This repo turns a short running clip into reviewable motion artifacts:
 
-## MVP Decisions
+- MediaPipe pose landmarks per frame
+- skeleton render and QA overlay videos
+- pose-quality metrics
+- normalized form features for later similarity search
 
-- Product mode: entertainment-first, not coaching or injury analysis.
-- First supported mode: `running`; `sprinting` is planned but "coming soon" in UI.
-- User input: video-only, anonymous upload, temporary storage by default.
-- Corpus target: 30 elite distance runners, split 10 / 10 / 10 across `800_1500`, `5k_10k`, and `marathon`.
-- Corpus clips: 3-5 approved reference segments per runner.
-- Ingestion starts with YouTube discovery, then human review of URL + timestamps.
-- Matching representation: pose-sequence similarity as the primary signal.
-- Experiments: Gemini Embedding 2 on normalized skeleton render video and masked runner video.
-- Visual output: SAM/ZIM-style mask plus pose/body map for private alpha, treated as visual evidence rather than the matching source of truth.
+It is intentionally scoped as an engineering project, not a coaching product. The matching layer is in progress; the current shipped path is clip ingestion, model inference, artifact generation, and feature compilation.
 
-## Repo Layout
+## Why This Exists
+
+The product idea is simple: upload a running clip and eventually compare your form to a reference library of elite runners.
+
+The engineering work behind that is less simple:
+
+1. find usable running footage
+2. isolate the target runner
+3. extract pose consistently across frames
+4. score artifact quality
+5. compile features that can support retrieval and explanation
+
+This repo focuses on those backend and data-pipeline pieces.
+
+## What It Demonstrates
+
+- **Python backend**: FastAPI service that accepts video uploads and returns JSON plus generated artifacts.
+- **ML inference**: MediaPipe Pose Landmarker over uploaded running clips.
+- **Data pipeline design**: staged artifacts, manifests, JSONL/NPZ feature contracts, review queues, and QC metrics.
+- **Computer vision ops**: browser-playable render outputs for debugging model quality.
+- **Frontend integration**: Next.js technical-preview page that can call the API.
+- **Deployment readiness**: Dockerfile, environment config, and clear local/cloud run commands.
+- **Testing**: unit coverage for candidate scoring, pose selection, feature compilation, pipeline contracts, and API behavior.
+
+## Architecture
 
 ```text
-data/
-  runners.yml                    # Opinionated seed corpus list
-  approved_segments.example.yml  # Human-approved segment shape
-schemas/
-  *.schema.json                  # Contracts for review + future CV artifacts
-scripts/
-  discover_youtube.py            # Create candidate video queue with yt-dlp search
-  candidates_to_csv.py           # Convert JSONL candidates to review CSV
-  serve_review_ui.py             # Local clip review/annotation UI
-src/whodoirunlike/
-  discovery.py                   # Shared discovery helpers and data contracts
-  review_app.py                  # Lightweight local review server
-artifacts/
-  discovery/                     # Generated candidate queues
-  review/                        # Local human labels, ignored by git
-clips/
-  raw/                           # Downloaded/source videos later
-  segments/                      # Approved local segments later
+site/                         Next.js technical-preview UI
+src/whodoirunlike/api.py      FastAPI clip-processing API
+src/whodoirunlike/pose_runner.py
+                              MediaPipe pose inference + skeleton/QA renders
+src/whodoirunlike/form_features.py
+                              normalized pose arrays and summary features
+src/whodoirunlike/*_runner.py optional CV stages for masks, identity, DensePose
+scripts/                      CLI entrypoints for offline ingestion/review
+schemas/                      JSON contracts for candidates, reviews, artifacts
+docs/                         design notes and implementation plans
 ```
 
-## Setup
+The web API is deliberately lean. It runs the pose path synchronously for short clips and writes artifacts under `artifacts/api_runs/<run_id>/`.
+
+For longer or production workloads, the same contract can move to async jobs: upload object storage, enqueue processing, run workers, then serve artifacts once complete.
+
+## API Quickstart
 
 ```bash
 python3.12 -m venv .venv
 source .venv/bin/activate
 python -m pip install -e ".[dev]"
-python -m camoufox fetch
+uvicorn whodoirunlike.api:app --host 127.0.0.1 --port 8000
 ```
 
-## Landing Site Prototype
+Health check:
 
-The public-facing website prototype lives in `site/`, separate from the internal clip
-review UI and CV pipeline tools. It is a Next.js app that uses the generated asset pack
-for the hero comparison, upload card, brand marks, and athlete cards.
+```bash
+curl http://127.0.0.1:8000/health
+```
+
+Process a short clip:
+
+```bash
+curl -X POST http://127.0.0.1:8000/v1/clips \
+  -F "model_variant=lite" \
+  -F "file=@/path/to/running-clip.mp4"
+```
+
+Response shape:
+
+```json
+{
+  "run_id": "abc123...",
+  "status": "complete",
+  "quality": {
+    "pose_hit_rate": 0.92,
+    "usable_rate": 0.84
+  },
+  "summary_features": {
+    "stride_rhythm_proxy": 1.5,
+    "arm_swing_amplitude": 0.42
+  },
+  "artifacts": {
+    "skeleton_render": "http://127.0.0.1:8000/artifacts/...",
+    "qa_overlay": "http://127.0.0.1:8000/artifacts/..."
+  }
+}
+```
+
+The first API call downloads the selected MediaPipe model into `models/mediapipe/`.
+
+## Docker
+
+```bash
+docker build -t whodoirunlike-api .
+docker run --rm -p 8000:8000 \
+  -e WHODOIRUNLIKE_CORS_ORIGINS=http://127.0.0.1:4173 \
+  whodoirunlike-api
+```
+
+Important environment variables:
+
+```text
+WHODOIRUNLIKE_API_ARTIFACT_ROOT=artifacts/api_runs
+WHODOIRUNLIKE_MODEL_DIR=models/mediapipe
+WHODOIRUNLIKE_MAX_UPLOAD_BYTES=78643200
+WHODOIRUNLIKE_MAX_DURATION_SECONDS=20
+WHODOIRUNLIKE_CORS_ORIGINS=http://127.0.0.1:4173,http://localhost:4173
+```
+
+See `.env.example`.
+
+## Frontend Quickstart
+
+In one terminal, run the API. In another:
 
 ```bash
 cd site
 npm install
-npm run dev
+NEXT_PUBLIC_API_BASE_URL=http://127.0.0.1:8000 npm run dev
 ```
 
 Open `http://127.0.0.1:4173`.
 
-## Discover Candidate YouTube Videos
+The page is a technical preview:
 
-Start small while we tune queries:
+- hero comparison visual
+- featured four-stage demo from an existing processed clip
+- volunteer upload card wired to the FastAPI service
+
+## Offline Pipeline
+
+The API path is the portfolio-facing service. The broader offline pipeline is still available for corpus building and artifact review.
+
+Useful commands:
 
 ```bash
 python scripts/discover_youtube.py \
   --runner-data data/runners.yml \
   --out artifacts/discovery/candidates.jsonl \
-  --limit-per-query 5 \
-  --max-runners 2
-```
+  --limit-per-query 5
 
-Export the review queue:
-
-```bash
-python scripts/candidates_to_csv.py \
-  artifacts/discovery/candidates.jsonl \
-  artifacts/discovery/candidates.csv
-```
-
-The discovery output is not an approved corpus. It is a review queue: you choose useful videos and timestamps, then add them to `data/approved_segments.yml` using the example file as a template.
-
-## Score Candidate Videos
-
-Metadata score first:
-
-```bash
-python scripts/evaluate_candidates.py \
-  artifacts/discovery/candidates.jsonl \
-  artifacts/discovery/candidates.scored.csv
-```
-
-Browser-backed search smoke tests:
-
-```bash
-python scripts/search_youtube_web.py \
-  --query "Faith Kipyegon running form" \
-  --runner-slug faith-kipyegon \
-  --limit 3 \
-  --backend both \
-  --out artifacts/discovery/web_search.smoke.jsonl
-```
-
-CV score the strongest short/medium candidates:
-
-```bash
 python scripts/evaluate_video_candidates.py \
   --limit 30 \
   --sample-count 16 \
-  --max-duration-seconds 600 \
   --out artifacts/evaluation/video_candidates.top30.csv
-```
 
-The CV pass downloads low-resolution source videos into `clips/raw/candidates`, samples frames, runs MediaPipe Pose Landmarker, and scores whether the clip appears to have usable full-body running footage. Treat this as triage, not final approval.
-
-Propose short review windows inside local source videos:
-
-```bash
-python scripts/run_clip_curation.py \
-  clips/raw/review_best/<candidate_id>.mp4 \
-  --out artifacts/curation/clip_windows.json \
-  --top-k 12 \
-  --write-thumbnails
-```
-
-This writes ranked 2-6 second windows using shot detection plus a cheap motion-proxy score.
-It is the first executable step toward the identity-stable runner pipeline in
-[`docs/identity-stable-runner-pipeline-plan.md`](docs/identity-stable-runner-pipeline-plan.md).
-Future scorer passes should enrich the same manifest with detector/pose runningness,
-track-continuity, and occlusion features.
-
-Download higher-quality copies for human review:
-
-```bash
-python scripts/download_review_videos.py \
-  --limit 20 \
-  --max-height 720 \
-  --out artifacts/evaluation/video_candidates.review20_720.json
-```
-
-Use `--max-height 0` to fetch the highest available source format for each clip:
-
-```bash
-python scripts/download_review_videos.py \
-  --limit 20 \
-  --max-height 0 \
-  --download-dir clips/raw/review_best \
-  --out artifacts/evaluation/video_candidates.review20_best.json
-```
-
-## Review Candidate Clips
-
-Run the local review UI against the top evaluated clips:
-
-```bash
 python scripts/serve_review_ui.py --limit 20 --port 8765
-```
 
-Open `http://127.0.0.1:8765`. The UI serves local candidate videos with byte-range support for scrubbing, lets you set start/end timestamps, previews the saved segment, records camera angle, and saves `good`, `mid`, or `bad` labels to `artifacts/review/clip_reviews.json`.
-
-After preparing a CV run, open `http://127.0.0.1:8765/subject.html` to select the target runner on the prompt frame and inspect the run artifact slots.
-
-Run the default SAM 3.1 whole-runner mask after saving a subject prompt:
-
-```bash
-python -m pip install -e ".[sam31]"
-
-python scripts/run_sam31_mlx_mask.py \
-  --candidate-id d6ee6cd75cd04b95 \
-  --model mlx-community/sam3.1-bf16 \
-  --quality-mode native \
-  --prompt "a runner" \
-  --prompt "a person"
-```
-
-The SAM 3.1 MLX path uses text prompts to detect runners on each frame, then uses the saved
-prompt box/points to choose the target runner identity and write `runner_mask.mp4`,
-`masked_runner.mp4`, `qa_overlay.mp4`, and `runner_mask_metadata.jsonl`. The first run
-downloads the MLX model from Hugging Face. Quality modes are `max` (source-sized square
-resolution, capped for sanity), `native` (`1008`, the SAM 3.1 default), and `fast` (`224`).
-
-Legacy SAM 2.1 local mask generation remains available as a fallback, but the pipeline plan
-does not depend on it:
-
-```bash
-python -m pip install torch torchvision
-SAM2_BUILD_CUDA=0 python -m pip install git+https://github.com/facebookresearch/sam2.git
-mkdir -p models/sam2
-curl -L -o models/sam2/sam2.1_hiera_tiny.pt \
-  https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_tiny.pt
-
-python scripts/run_sam2_mask.py \
-  --candidate-id d6ee6cd75cd04b95 \
-  --checkpoint models/sam2/sam2.1_hiera_tiny.pt \
-  --model-cfg configs/sam2.1/sam2.1_hiera_t.yaml
-```
-
-This writes `runner_mask.mp4`, `masked_runner.mp4`, `qa_overlay.mp4`, and `runner_mask_metadata.jsonl` inside the CV run folder.
-
-Run MediaPipe pose extraction after a mask pass:
-
-```bash
-python scripts/run_pose_landmarks.py \
-  --candidate-id d6ee6cd75cd04b95 \
-  --model-variant heavy
-```
-
-This prefers `masked_runner.mp4` when present, writes `pose_landmarks.jsonl`,
-`skeleton_render.mp4`, `features.json`, and refreshes `qa_overlay.mp4` with the runner mask
-plus skeleton.
-
-DensePose is optional and stays off the critical path. The local default uses the official
-Detectron2 DensePose R50-FPN config and weights under `models/densepose/` when present:
-
-```text
-models/densepose/detectron2/projects/DensePose/configs/densepose_rcnn_R_50_FPN_s1x.yaml
-models/densepose/weights/densepose_rcnn_R_50_FPN_s1x_model_final_162be9.pkl
-```
-
-Manual setup:
-
-```bash
-PIP_NO_BUILD_ISOLATION=1 CC=clang CXX=clang++ \
-  python -m pip install --no-build-isolation \
-  'git+https://github.com/facebookresearch/detectron2.git'
-
-PIP_NO_BUILD_ISOLATION=1 CC=clang CXX=clang++ \
-  python -m pip install --no-build-isolation \
-  'git+https://github.com/facebookresearch/detectron2@main#subdirectory=projects/DensePose'
-
-mkdir -p models/densepose/weights
-git clone --depth 1 https://github.com/facebookresearch/detectron2.git models/densepose/detectron2
-curl -L -o models/densepose/weights/densepose_rcnn_R_50_FPN_s1x_model_final_162be9.pkl \
-  https://dl.fbaipublicfiles.com/densepose/densepose_rcnn_R_50_FPN_s1x/165712039/model_final_162be9.pkl
-```
-
-Run:
-
-```bash
-python scripts/run_densepose.py \
-  --candidate-id d6ee6cd75cd04b95 \
-  --config models/densepose/detectron2/projects/DensePose/configs/densepose_rcnn_R_50_FPN_s1x.yaml \
-  --weights models/densepose/weights/densepose_rcnn_R_50_FPN_s1x_model_final_162be9.pkl \
-  --device cpu
-```
-
-The local review UI also uses those default files automatically. CPU inference is slow:
-expect roughly a few minutes for an 8-10 second 1080p clip.
-
-Fuse pose, mask, and DensePose into the confidence-weighted form artifact:
-
-```bash
-python scripts/run_fused_form.py \
-  --candidate-id d6ee6cd75cd04b95
-```
-
-This writes `fused_form.jsonl` and `fused_overlay.mp4`. Matching should still use the
-pose sequence as the motion truth; the fused output supplies per-frame/per-joint weights,
-DensePose body-region coverage, occlusion/identity-risk states, and the alpha QA overlay.
-
-## Next Pipeline Milestones
-
-The detailed similarity-search tracker lives in
-[`docs/similarity-search-implementation-plan.md`](docs/similarity-search-implementation-plan.md).
-
-Prepare one reviewed clip for the single-clip CV loop:
-
-```bash
 python scripts/prepare_single_clip_cv_run.py --candidate-id <candidate_id>
+python scripts/run_pose_landmarks.py --candidate-id <candidate_id> --model-variant heavy
+python scripts/compile_form_features.py --candidate-id <candidate_id>
 ```
 
-This creates `artifacts/cv_runs/<candidate_id>/source_segment.mp4`, a prompt frame, a `person_prompt.json` target-selection stub, `track_seed.json`, `view_bucket.json`, and a `cv_run_manifest.json` describing the identity, segmentation, pose, DensePose, render, and feature stages.
+More detail:
 
-After saving the target prompt, run the identity stage:
+- `docs/single-clip-cv-flow.md`
+- `docs/identity-stable-runner-pipeline-plan.md`
+- `docs/similarity-search-implementation-plan.md`
+
+## Tests
 
 ```bash
-python scripts/run_identity_track.py --candidate-id <candidate_id>
+python -m pytest
+cd site && npm run typecheck && npm run build
 ```
 
-This writes `tracklets.parquet`, `tracklets.jsonl`, `reid.parquet`, `reid.jsonl`, updates
-`track_seed.json`, and adds identity metrics to `qc_metrics.json`. The default backend is
-YOLO person detection plus BoxMOT BoT-SORT with OSNet-style ReID weights:
+The test suite covers:
 
-```bash
-python -m pip install -e ".[mot]"
-python scripts/run_identity_track.py --candidate-id <candidate_id> --backend boxmot_botsort
-```
+- runner seed data contracts
+- YouTube candidate scoring
+- clip curation
+- pose target selection
+- form-feature compilation
+- pipeline manifest updates
+- API validation and response shape
 
-Use `--backend boxmot_deepocsort` for the hard-occlusion A/B path,
-`--backend boxmot_bytetrack` for the fastest baseline, or
-`--backend prompt_template_tracker_v1` for the deterministic local fallback.
+## Current Limits
 
-Run the full local pipeline when optional model dependencies are installed:
+- The API is optimized for short clips, not full races.
+- The public matching layer is not complete yet.
+- DensePose, identity tracking, and SAM 3.1 masking are available as offline stages, not part of the default web request.
+- Uploaded API artifacts are local by default. A production deployment should move source clips and generated artifacts to object storage and run inference in background workers.
 
-```bash
-python scripts/run_full_cv_pipeline.py \
-  --candidate-id <candidate_id> \
-  --pose-backend mmpose_rtmpose_l_384 \
-  --mask-quality-mode native
-```
+## Design Notes
 
-Postprocess and triage artifacts:
+Primary matching will use pose-sequence similarity. Masks and DensePose are treated as confidence/QA layers, not as the source of truth.
 
-```bash
-python scripts/export_cv_tables.py --candidate-id <candidate_id>
-python scripts/run_qc_metrics.py --candidate-id <candidate_id>
-python scripts/build_uncertainty_queue.py
-python scripts/run_multiview_match.py --candidate-a <candidate_id_a> --candidate-b <candidate_id_b>
-```
-
-1. Use `run_clip_curation.py` to propose ranked windows before human review.
-2. Keep the prompt-frame UI focused on target identity, not manual masking.
-3. Run detector/tracker/ReID outputs: `tracklets.parquet`, `reid.parquet`, and identity-risk flags.
-4. Gate SAM 3.1 mask generation on the chosen target track and write `masks.jsonl`.
-5. Scale RTMPose/RTMW pose extraction over approved identity-stable segments.
-6. Add Detectron2 DensePose as a secondary body-surface layer after target tracking is stable.
-7. Export Parquet tables, generate fused confidence-weighted form artifacts, and write `qc_metrics.json`.
-8. Build the active-learning uncertainty queue and multi-view matching artifacts.
-9. Compute pose-sequence similarities and Gemini render embeddings.
+See `CONTEXT.md` for project language and `docs/adr/0001-pose-sequence-primary-densepose-confidence-layer.md` for the core architecture decision.

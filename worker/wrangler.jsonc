@@ -26,7 +26,7 @@
     "PUBLIC_ORIGINS": "https://whodoirunlike.com,http://127.0.0.1:4173,http://localhost:4173",
     "MAX_UPLOAD_BYTES": "78643200",
     "PROCESSOR_URL": "",
-    "RUNPOD_ENDPOINT_ID": "ly0bgpdu2amm9z"
+    "RUNPOD_ENDPOINT_ID": "kfy6zrxmpuz47w"
   },
   "env": {
     "preview": {
@@ -49,7 +49,7 @@
         "PUBLIC_ORIGINS": "https://whodoirunlike.com,http://127.0.0.1:4173,http://localhost:4173",
         "MAX_UPLOAD_BYTES": "78643200",
         "PROCESSOR_URL": "",
-        "RUNPOD_ENDPOINT_ID": "ly0bgpdu2amm9z"
+        "RUNPOD_ENDPOINT_ID": "kfy6zrxmpuz47w"
       }
     }
   }

@@ -122,7 +122,7 @@ runpodctl template create \
     "WHODOIRUNLIKE_PROCESSOR_SHARED_SECRET":"<shared-secret>",
     "HF_TOKEN":"<hf-token>",
     "WHODOIRUNLIKE_MASK_BACKEND":"sam31_gpu",
-    "WHODOIRUNLIKE_IDENTITY_BACKEND":"boxmot_botsort",
+    "WHODOIRUNLIKE_IDENTITY_BACKEND":"boxmot_bytetrack",
     "WHODOIRUNLIKE_POSE_BACKEND":"mmpose_rtmpose_l_384",
     "WHODOIRUNLIKE_SKIP_DENSEPOSE":"false",
     "DENSEPOSE_DEVICE":"cuda"

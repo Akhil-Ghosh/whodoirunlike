@@ -9,6 +9,7 @@ import re
 import secrets
 import shutil
 import time
+import traceback
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -683,11 +684,13 @@ def process_hosted_job(payload: WorkerJobRequest, *, raise_on_error: bool = Fals
         }
     except Exception as exc:
         run_dir.mkdir(parents=True, exist_ok=True)
+        error_traceback = traceback.format_exc(limit=8)
         write_json(
             run_dir / "hosted_job_error.json",
             {
                 "run_id": payload.run_id,
                 "error": str(exc),
+                "traceback": error_traceback,
                 "failed_at": utc_now_iso(),
             },
         )
@@ -698,7 +701,7 @@ def process_hosted_job(payload: WorkerJobRequest, *, raise_on_error: bool = Fals
                 payload={
                     "status": "failed",
                     "progress": {"phase": "failed"},
-                    "error": str(exc),
+                    "error": f"{exc}\n\n{error_traceback[-2000:]}",
                 },
             )
         except (OSError, urllib.error.URLError, urllib.error.HTTPError):

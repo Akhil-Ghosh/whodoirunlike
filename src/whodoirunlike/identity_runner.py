@@ -4,6 +4,7 @@ import json
 import time
 import importlib
 import importlib.util
+import inspect
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterable, Sequence
@@ -79,6 +80,16 @@ def identity_setup_status(backend: str | None = None) -> dict[str, Any]:
             reasons.append(f"{package} import failed: missing Python package: {exc.name}")
         except Exception as exc:  # noqa: BLE001 - readiness should surface dependency failures.
             reasons.append(f"{package} import failed: {type(exc).__name__}: {exc}")
+    if importlib.util.find_spec("gdown") is None:
+        reasons.append("Missing Python package: gdown")
+    else:
+        try:
+            import gdown
+
+            if "fuzzy" not in inspect.signature(gdown.download).parameters:
+                reasons.append("gdown.download is missing the fuzzy parameter required by BoxMOT")
+        except Exception as exc:  # noqa: BLE001 - readiness should surface dependency failures.
+            reasons.append(f"gdown import failed: {type(exc).__name__}: {exc}")
     return {
         "backend": backend_name,
         "ready": not reasons,

@@ -50,6 +50,109 @@ def test_hosted_manifest_seeds_center_target_prompt(tmp_path: Path) -> None:
     assert prompt["selection"]["type"] == "auto_center_runner"
     assert prompt["selection"]["positive_points"][0]["x"] == 0.5
     assert prompt["selection"]["box"]["height"] > 0.5
+    assert prompt["frame"]["frame_index"] == 0
+
+
+def test_write_prompt_frame_can_select_middle_frame(tmp_path: Path) -> None:
+    from whodoirunlike import hosted_processor
+
+    source_path = tmp_path / "source.mp4"
+    prompt_frame_path = tmp_path / "prompt_frame.jpg"
+    _write_tiny_video(source_path)
+
+    frame_meta = hosted_processor._write_prompt_frame(
+        source_path,
+        prompt_frame_path,
+        frame_index=2,
+    )
+
+    prompt_frame = cv2.imread(str(prompt_frame_path))
+    assert frame_meta["frame_index"] == 2
+    assert prompt_frame is not None
+    assert float(prompt_frame.mean()) > 60.0
+
+
+def test_hosted_manifest_uses_demo_profile_prompt(tmp_path: Path) -> None:
+    from whodoirunlike import hosted_processor
+
+    source_path = tmp_path / "source.mp4"
+    _write_tiny_video(source_path)
+    payload = hosted_processor.WorkerJobRequest(
+        run_id="12345678-1234-4234-9234-123456789abc",
+        callback_base_url="https://api.whodoirunlike.com",
+        source={
+            "url": "https://api.whodoirunlike.com/v1/jobs/12345678-1234-4234-9234-123456789abc/source",
+            "key": "uploads/12345678-1234-4234-9234-123456789abc/source.mp4",
+            "filename": "clip.mp4",
+            "content_type": "video/mp4",
+            "size_bytes": source_path.stat().st_size,
+        },
+    )
+    demo_profile = {
+        "id": "cole_hocker_reference_v1",
+        "source_sha256": "sha",
+        "runner_name": "Cole Hocker",
+        "runner_slug": "cole-hocker",
+        "prompt_frame_index": 2,
+        "prompt_box": {"x": 0.6, "y": 0.2, "width": 0.2, "height": 0.7},
+        "reference_artifacts": {"fused_overlay.mp4": "cole-fused.mp4"},
+    }
+
+    manifest_path = hosted_processor._write_hosted_manifest(
+        run_dir=tmp_path / "run",
+        payload=payload,
+        source_path=source_path,
+        video_meta={"width": 64, "height": 48, "fps": 10.0, "frame_count": 3},
+        demo_profile=demo_profile,
+    )
+
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    prompt = json.loads((tmp_path / "run/person_prompt.json").read_text(encoding="utf-8"))
+    assert manifest["runner_name"] == "Cole Hocker"
+    assert manifest["demo_profile"]["id"] == "cole_hocker_reference_v1"
+    assert prompt["source"] == "hosted_upload_demo_profile_v1"
+    assert prompt["frame"]["frame_index"] == 2
+    assert prompt["selection"]["type"] == "reference_box"
+    assert prompt["selection"]["box"]["x"] == 0.6
+
+
+def test_apply_demo_reference_artifacts_replaces_selected_outputs(
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    from whodoirunlike import hosted_processor
+
+    asset_root = tmp_path / "assets"
+    asset_root.mkdir()
+    (asset_root / "cole-fused.mp4").write_bytes(b"reference fused")
+    (asset_root / "cole-skeleton.mp4").write_bytes(b"reference skeleton")
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    (run_dir / "fused_overlay.mp4").write_bytes(b"bad fused")
+    (run_dir / "skeleton_render.mp4").write_bytes(b"bad skeleton")
+    (run_dir / "cv_run_manifest.json").write_text(
+        json.dumps({"stages": {}}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(hosted_processor, "DEMO_ASSET_ROOT", asset_root)
+    demo_profile = {
+        "id": "cole_hocker_reference_v1",
+        "reference_artifacts": {
+            "fused_overlay.mp4": "cole-fused.mp4",
+            "skeleton_render.mp4": "cole-skeleton.mp4",
+        },
+    }
+
+    copied = hosted_processor._apply_demo_reference_artifacts(
+        run_dir=run_dir,
+        demo_profile=demo_profile,
+    )
+
+    manifest = json.loads((run_dir / "cv_run_manifest.json").read_text(encoding="utf-8"))
+    assert copied == ["fused_overlay.mp4", "skeleton_render.mp4"]
+    assert (run_dir / "fused_overlay.mp4").read_bytes() == b"reference fused"
+    assert (run_dir / "skeleton_render.mp4").read_bytes() == b"reference skeleton"
+    assert manifest["stages"]["demo_reference_artifacts"]["status"] == "complete"
 
 
 def test_processor_job_requires_shared_secret(monkeypatch: Any) -> None:

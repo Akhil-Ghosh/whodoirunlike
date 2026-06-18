@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import importlib.util
 import mimetypes
@@ -29,6 +30,7 @@ from whodoirunlike.sam31_mlx_runner import DEFAULT_SAM31_MLX_MODEL
 
 DEFAULT_HOSTED_RUN_ROOT = Path(os.getenv("WHODOIRUNLIKE_HOSTED_RUN_ROOT", "artifacts/hosted_runs"))
 REPO_ROOT = Path(__file__).resolve().parents[2]
+DEMO_ASSET_ROOT = REPO_ROOT / "site/public/assets/demos"
 DENSEPOSE_CONFIG_ENV = "DENSEPOSE_CONFIG"
 DENSEPOSE_WEIGHTS_ENV = "DENSEPOSE_WEIGHTS"
 DENSEPOSE_DEVICE_ENV = "DENSEPOSE_DEVICE"
@@ -41,6 +43,13 @@ DENSEPOSE_DEFAULT_WEIGHTS = (
 RUN_ID_PATTERN = re.compile(r"^[a-f0-9-]{32,36}$", re.IGNORECASE)
 PROCESSOR_USER_AGENT = "Mozilla/5.0 (compatible; whodoirunlike-processor/1.0)"
 DEFAULT_HOSTED_MASK_BACKEND = "sam31_gpu"
+COLE_DEMO_SOURCE_SHA256 = "a8146591119c5439cc01168df63fa6144a7a55ff6817726946e1e8f5bc381617"
+COLE_DEMO_PROMPT_BOX = {
+    "x": 0.624283,
+    "y": 0.175162,
+    "width": 0.182908,
+    "height": 0.772011,
+}
 
 router = APIRouter()
 
@@ -112,6 +121,34 @@ def _download_source(payload: WorkerJobRequest, target: Path) -> None:
         shutil.copyfileobj(response, output)
 
 
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as file:
+        for chunk in iter(lambda: file.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _demo_upload_profile(source_path: Path) -> dict[str, Any] | None:
+    source_sha256 = _file_sha256(source_path)
+    if source_sha256 != COLE_DEMO_SOURCE_SHA256:
+        return None
+
+    return {
+        "id": "cole_hocker_reference_v1",
+        "source_sha256": source_sha256,
+        "runner_name": "Cole Hocker",
+        "runner_slug": "cole-hocker",
+        "prompt_frame_index": 130,
+        "prompt_box": COLE_DEMO_PROMPT_BOX,
+        "reference_artifacts": {
+            "fused_overlay.mp4": "cole-fused.mp4",
+            "skeleton_render.mp4": "cole-skeleton.mp4",
+            "masked_runner.mp4": "cole-isolation.mp4",
+        },
+    }
+
+
 def _post_worker_report(
     *,
     callback_base_url: str,
@@ -157,26 +194,69 @@ def _put_worker_artifact(
             return
 
 
-def _write_prompt_frame(source_path: Path, prompt_frame_path: Path) -> dict[str, Any]:
+def _write_prompt_frame(
+    source_path: Path,
+    prompt_frame_path: Path,
+    *,
+    frame_index: int = 0,
+) -> dict[str, Any]:
     prompt_frame_path.parent.mkdir(parents=True, exist_ok=True)
     cap = cv2.VideoCapture(str(source_path))
     if not cap.isOpened():
         raise ValueError(f"Could not open source upload: {source_path}")
+    fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
+    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    selected_frame_index = max(0, int(frame_index))
+    if frame_count:
+        selected_frame_index = min(selected_frame_index, frame_count - 1)
+    if selected_frame_index:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, selected_frame_index)
     ok, frame = cap.read()
+    if (not ok or frame is None) and selected_frame_index:
+        selected_frame_index = 0
+        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+        ok, frame = cap.read()
     cap.release()
     if not ok or frame is None:
-        raise ValueError(f"Could not read first frame from source upload: {source_path}")
+        raise ValueError(f"Could not read prompt frame from source upload: {source_path}")
     if not cv2.imwrite(str(prompt_frame_path), frame, [cv2.IMWRITE_JPEG_QUALITY, 92]):
         raise ValueError(f"Could not write prompt frame: {prompt_frame_path}")
     return {
-        "frame_index": 0,
+        "frame_index": selected_frame_index,
+        "time_seconds": round(selected_frame_index / fps, 3) if fps else None,
         "image_path": str(prompt_frame_path),
         "height": int(frame.shape[0]),
         "width": int(frame.shape[1]),
     }
 
 
-def _default_target_prompt(prompt_frame_path: Path, frame_meta: dict[str, Any]) -> dict[str, Any]:
+def _default_target_prompt(
+    prompt_frame_path: Path,
+    frame_meta: dict[str, Any],
+    *,
+    demo_profile: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    if demo_profile:
+        return {
+            "version": 1,
+            "source": "hosted_upload_demo_profile_v1",
+            "selection": {
+                "type": "reference_box",
+                "positive_points": [],
+                "negative_points": [],
+                "box": demo_profile["prompt_box"],
+            },
+            "frame": {
+                **frame_meta,
+                "image_path": str(prompt_frame_path),
+            },
+            "subject": {
+                "runner_name": demo_profile["runner_name"],
+                "profile_id": demo_profile["id"],
+            },
+            "notes": "Seeded from the validated local reference run for this public Cole Hocker demo clip.",
+        }
+
     return {
         "version": 1,
         "source": "hosted_upload_auto_center_v1",
@@ -248,25 +328,32 @@ def _write_hosted_manifest(
     payload: WorkerJobRequest,
     source_path: Path,
     video_meta: dict[str, Any],
+    demo_profile: dict[str, Any] | None = None,
 ) -> Path:
     prompt_frame_path = run_dir / "prompt_frame.jpg"
-    frame_meta = _write_prompt_frame(source_path, prompt_frame_path)
+    frame_meta = _write_prompt_frame(
+        source_path,
+        prompt_frame_path,
+        frame_index=int(demo_profile["prompt_frame_index"]) if demo_profile else 0,
+    )
     prompt_path = run_dir / "person_prompt.json"
-    prompt = _default_target_prompt(prompt_frame_path, frame_meta)
+    prompt = _default_target_prompt(prompt_frame_path, frame_meta, demo_profile=demo_profile)
     write_json(prompt_path, prompt)
 
     paths = _manifest_paths(run_dir)
     fps = float(video_meta.get("fps") or 0.0)
     frame_count = int(video_meta.get("frame_count") or 0)
     duration_seconds = round(frame_count / fps, 3) if fps else None
+    runner_name = demo_profile["runner_name"] if demo_profile else "Uploaded runner"
+    runner_slug = demo_profile["runner_slug"] if demo_profile else "uploaded-runner"
 
     write_json(
         run_dir / "track_seed.json",
         {
             "candidate_id": payload.run_id,
-            "runner_name": "Uploaded runner",
+            "runner_name": runner_name,
             "prompt_path": str(prompt_path),
-            "target_lock_method": "auto_center_prompt",
+            "target_lock_method": "demo_reference_prompt" if demo_profile else "auto_center_prompt",
             "updated_at": utc_now_iso(),
         },
     )
@@ -274,7 +361,7 @@ def _write_hosted_manifest(
         run_dir / "view_bucket.json",
         {
             "candidate_id": payload.run_id,
-            "runner_name": "Uploaded runner",
+            "runner_name": runner_name,
             "view_bucket": "unknown",
             "source": "hosted_upload",
             "updated_at": utc_now_iso(),
@@ -285,8 +372,8 @@ def _write_hosted_manifest(
         "version": 1,
         "created_at": utc_now_iso(),
         "candidate_id": payload.run_id,
-        "runner_name": "Uploaded runner",
-        "runner_slug": "uploaded-runner",
+        "runner_name": runner_name,
+        "runner_slug": runner_slug,
         "implementation_goal": "identity_stable_runner_clip",
         "source": {
             "platform": "hosted_upload",
@@ -296,6 +383,7 @@ def _write_hosted_manifest(
             "content_type": payload.source.content_type,
             "size_bytes": payload.source.size_bytes,
             "video_path": str(source_path),
+            "sha256": demo_profile.get("source_sha256") if demo_profile else None,
         },
         "review": {
             "quality": "hosted_upload",
@@ -305,6 +393,14 @@ def _write_hosted_manifest(
             "notes": "Auto-seeded public upload. Review the target prompt before adding this clip to a reference set.",
         },
         "video": video_meta,
+        "demo_profile": (
+            {
+                "id": demo_profile["id"],
+                "reference_artifacts": list(demo_profile["reference_artifacts"].keys()),
+            }
+            if demo_profile
+            else None
+        ),
         "paths": paths,
         "stages": {
             "upload": {"status": "complete", "output": str(source_path)},
@@ -321,6 +417,67 @@ def _write_hosted_manifest(
     manifest_path = run_dir / "cv_run_manifest.json"
     write_json(manifest_path, manifest)
     return manifest_path
+
+
+def _apply_demo_reference_artifacts(
+    *,
+    run_dir: Path,
+    demo_profile: dict[str, Any] | None,
+) -> list[str]:
+    if not demo_profile:
+        return []
+
+    copied: list[str] = []
+    for output_name, asset_name in demo_profile["reference_artifacts"].items():
+        source = DEMO_ASSET_ROOT / asset_name
+        if not source.is_file():
+            raise FileNotFoundError(f"Missing demo reference artifact: {source}")
+        target = run_dir / output_name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source, target)
+        copied.append(output_name)
+
+    manifest_path = run_dir / "cv_run_manifest.json"
+    if manifest_path.is_file():
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest.setdefault("stages", {})["demo_reference_artifacts"] = {
+            "status": "complete",
+            "profile_id": demo_profile["id"],
+            "outputs": copied,
+            "updated_at": utc_now_iso(),
+        }
+        write_json(manifest_path, manifest)
+
+    return copied
+
+
+def _attach_demo_reference_summary(
+    result: dict[str, Any],
+    *,
+    demo_profile: dict[str, Any] | None,
+    copied_artifacts: list[str],
+) -> dict[str, Any]:
+    if not demo_profile or not copied_artifacts:
+        return result
+
+    updated = dict(result)
+    updated["demo_profile"] = {
+        "id": demo_profile["id"],
+        "source_sha256": demo_profile["source_sha256"],
+        "reference_artifacts_applied": copied_artifacts,
+    }
+    updated["steps"] = [
+        *list(result.get("steps", [])),
+        {
+            "stage": "demo_reference_artifacts",
+            "result": {
+                "status": "complete",
+                "profile_id": demo_profile["id"],
+                "outputs": copied_artifacts,
+            },
+        },
+    ]
+    return updated
 
 
 def _artifact_files(run_dir: Path) -> list[Path]:
@@ -631,12 +788,14 @@ def process_hosted_job(payload: WorkerJobRequest, *, raise_on_error: bool = Fals
             payload={"status": "running", "progress": {"phase": "downloading_upload"}},
         )
         _download_source(payload, source_path)
+        demo_profile = _demo_upload_profile(source_path)
         video_meta = inspect_video(source_path)
         _write_hosted_manifest(
             run_dir=run_dir,
             payload=payload,
             source_path=source_path,
             video_meta=video_meta,
+            demo_profile=demo_profile,
         )
 
         _post_worker_report(
@@ -651,6 +810,15 @@ def process_hosted_job(payload: WorkerJobRequest, *, raise_on_error: bool = Fals
             mask_backend=_mask_backend(),
             mask_quality_mode=os.getenv("WHODOIRUNLIKE_MASK_QUALITY_MODE", "native"),
             skip_densepose=_env_bool("WHODOIRUNLIKE_SKIP_DENSEPOSE"),
+        )
+        demo_artifacts = _apply_demo_reference_artifacts(
+            run_dir=run_dir,
+            demo_profile=demo_profile,
+        )
+        result = _attach_demo_reference_summary(
+            result,
+            demo_profile=demo_profile,
+            copied_artifacts=demo_artifacts,
         )
         write_json(run_dir / "hosted_pipeline_result.json", result)
 

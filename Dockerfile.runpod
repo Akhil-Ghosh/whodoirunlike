@@ -29,6 +29,7 @@ RUN git clone --depth 1 https://github.com/facebookresearch/detectron2.git /opt/
 
 COPY pyproject.toml README.md ./
 COPY src ./src
+COPY site/public/assets/demos ./site/public/assets/demos
 COPY requirements-runpod-processor.txt ./
 
 RUN python -m pip install --upgrade pip setuptools wheel \

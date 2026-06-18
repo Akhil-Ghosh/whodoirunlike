@@ -17,8 +17,8 @@ The matching part is still a work in progress. Right now the repo is mostly abou
 - MediaPipe pose pass over each frame
 - generated skeleton and QA videos
 - Next.js preview site with demo, gallery, and about pages
-- Cloudflare Worker scaffold for R2-backed uploads and async job status
-- RunPod Serverless processor scaffold for the full hosted pipeline
+- Cloudflare Worker for R2-backed uploads, job status, and artifacts
+- RunPod Serverless processor for identity tracking, SAM 3.1 GPU masks, pose, DensePose, fusion, features, and QC
 - offline scripts for finding and reviewing candidate running footage
 
 No coaching claims. The metrics are rough signals for checking whether a clip is readable.
@@ -41,7 +41,7 @@ The Cloudflare path is async:
 3. Once `RUNPOD_ENDPOINT_ID` and `RUNPOD_API_KEY` are set, the Worker queues a RunPod Serverless job.
 4. The RunPod processor downloads the clip, seeds a center-runner prompt, runs identity tracking, SAM 3.1 GPU, pose, DensePose, fusion, features, and QC, then uploads artifacts back through the Worker.
 
-Right now production uploads are safe but processing is intentionally off: `RUNPOD_ENDPOINT_ID` is blank in the deployed Worker, so jobs are stored in R2 and `start` returns `processor_configured: false`. The next deploy step is the RunPod endpoint, not a tunnel to a local machine.
+The production Worker is connected to RunPod. The endpoint scales to zero when idle, so the first request after a quiet period can take a few minutes to start.
 
 ## Run the API
 
@@ -166,6 +166,6 @@ cd worker && npm run check
 
 - Short clips only by default.
 - Matching is not live yet.
-- Hosted processing needs a RunPod endpoint, Worker secrets, and configured R2 buckets.
+- Hosted processing depends on Cloudflare R2, Worker secrets, and the current RunPod endpoint.
 - The auto target prompt works best when the uploaded runner is centered.
 - The gallery uses a small set of hand-reviewed examples, not a full reference corpus.

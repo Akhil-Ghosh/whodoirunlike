@@ -577,20 +577,36 @@ def pose_setup_status(pose_backend: str) -> dict[str, Any]:
     return openpose_setup_status()
 
 
+def _readiness_check(label: str, callback: Any) -> dict[str, Any]:
+    try:
+        return callback()
+    except Exception as error:
+        return {
+            "ready": False,
+            "reasons": [
+                f"{label} readiness check failed: {type(error).__name__}: {str(error)[:500]}"
+            ],
+            "error_type": type(error).__name__,
+        }
+
+
 def processor_readiness() -> dict[str, Any]:
     identity_backend = os.getenv("WHODOIRUNLIKE_IDENTITY_BACKEND", DEFAULT_IDENTITY_BACKEND)
     pose_backend = os.getenv("WHODOIRUNLIKE_POSE_BACKEND", "mmpose_rtmpose_l_384")
     mask_backend = _mask_backend()
     skip_densepose = _env_bool("WHODOIRUNLIKE_SKIP_DENSEPOSE")
     checks = {
-        "processor_secret": _secret_status(),
-        "identity": identity_setup_status(identity_backend),
-        "mask": mask_setup_status(mask_backend),
-        "pose": pose_setup_status(pose_backend),
+        "processor_secret": _readiness_check("processor_secret", _secret_status),
+        "identity": _readiness_check(
+            "identity",
+            lambda: identity_setup_status(identity_backend),
+        ),
+        "mask": _readiness_check("mask", lambda: mask_setup_status(mask_backend)),
+        "pose": _readiness_check("pose", lambda: pose_setup_status(pose_backend)),
         "densepose": (
             {"ready": True, "skipped": True, "reasons": ["WHODOIRUNLIKE_SKIP_DENSEPOSE=true"]}
             if skip_densepose
-            else densepose_setup_status()
+            else _readiness_check("densepose", densepose_setup_status)
         ),
     }
     return {

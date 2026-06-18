@@ -145,6 +145,35 @@ def test_processor_readiness_respects_densepose_skip(monkeypatch: Any) -> None:
     assert readiness["checks"]["densepose"]["skipped"] is True
 
 
+def test_processor_readiness_reports_check_exceptions(monkeypatch: Any) -> None:
+    from whodoirunlike import hosted_processor
+
+    monkeypatch.setenv("WHODOIRUNLIKE_PROCESSOR_SHARED_SECRET", "secret")
+    monkeypatch.setenv("WHODOIRUNLIKE_SKIP_DENSEPOSE", "true")
+    monkeypatch.setattr(
+        hosted_processor,
+        "identity_setup_status",
+        lambda backend=None: {"ready": True, "reasons": [], "backend": backend},
+    )
+    monkeypatch.setattr(
+        hosted_processor,
+        "sam31_gpu_setup_status",
+        lambda: {"ready": True, "reasons": [], "backend": "sam31_gpu"},
+    )
+
+    def broken_pose_status(backend: str) -> dict[str, Any]:
+        raise RuntimeError(f"could not initialize {backend}")
+
+    monkeypatch.setattr(hosted_processor, "pose_setup_status", broken_pose_status)
+
+    readiness = hosted_processor.processor_readiness()
+
+    assert readiness["ready_for_full_pipeline"] is False
+    assert readiness["checks"]["pose"]["ready"] is False
+    assert readiness["checks"]["pose"]["error_type"] == "RuntimeError"
+    assert "could not initialize" in readiness["checks"]["pose"]["reasons"][0]
+
+
 def test_densepose_setup_status_reports_missing_default_files(monkeypatch: Any, tmp_path: Path) -> None:
     from whodoirunlike import hosted_processor
 

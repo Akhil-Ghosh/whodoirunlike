@@ -6,13 +6,28 @@ from typing import Any
 def test_runpod_handler_health(monkeypatch: Any) -> None:
     from whodoirunlike import runpod_serverless
 
+    monkeypatch.setenv("WHODOIRUNLIKE_PROCESSOR_SHARED_SECRET", "secret")
+    monkeypatch.setenv("HF_TOKEN", "token")
+    monkeypatch.setenv("WHODOIRUNLIKE_MASK_BACKEND", "sam31_gpu")
+
+    response = runpod_serverless.handler({"input": {"type": "health"}})
+
+    assert response["status"] == "ok"
+    assert response["health"]["has_processor_secret"] is True
+    assert response["health"]["has_hf_token"] is True
+    assert response["health"]["mask_backend"] == "sam31_gpu"
+
+
+def test_runpod_handler_deep_health(monkeypatch: Any) -> None:
+    from whodoirunlike import runpod_serverless
+
     monkeypatch.setattr(
         runpod_serverless,
         "processor_readiness",
         lambda: {"ready_for_full_pipeline": True, "mask_backend": "sam31_gpu"},
     )
 
-    response = runpod_serverless.handler({"input": {"type": "health"}})
+    response = runpod_serverless.handler({"input": {"type": "health", "level": "deep"}})
 
     assert response["status"] == "ok"
     assert response["readiness"]["mask_backend"] == "sam31_gpu"

@@ -23,6 +23,12 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Free runner disk
+        run: |
+          sudo rm -rf /opt/hostedtoolcache /usr/local/lib/android /usr/share/dotnet
+          docker system prune --all --force --volumes
+          df -h
+
       - name: Pull image
         run: docker pull "${{ inputs.image }}"
 

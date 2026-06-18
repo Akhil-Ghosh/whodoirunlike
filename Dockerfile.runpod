@@ -40,7 +40,8 @@ RUN python -m pip install --upgrade pip setuptools wheel \
         "ultralytics-thop>=2.0.18" \
         "boxmot>=17" \
         "rtmlib>=0.0.15" \
-    && python -m pip install --no-cache-dir --no-deps /opt/detectron2 \
-    && python -m pip install --no-cache-dir --no-deps /opt/detectron2/projects/DensePose
+        "timm>=1.0.17" \
+    && python -m pip install --no-cache-dir --no-build-isolation --no-deps /opt/detectron2 \
+    && python -m pip install --no-cache-dir --no-build-isolation --no-deps /opt/detectron2/projects/DensePose
 
 CMD ["python", "-m", "whodoirunlike.runpod_serverless"]

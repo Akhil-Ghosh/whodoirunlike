@@ -53,9 +53,10 @@ python -m pip install --no-cache-dir --no-deps \
   "ultralytics>=8.3" \
   "ultralytics-thop>=2.0.18" \
   "boxmot>=17" \
-  "rtmlib>=0.0.15"
-python -m pip install --no-cache-dir --no-deps "$DETECTRON2_DIR"
-python -m pip install --no-cache-dir --no-deps "$DETECTRON2_DIR/projects/DensePose"
+  "rtmlib>=0.0.15" \
+  "timm>=1.0.17"
+python -m pip install --no-cache-dir --no-build-isolation --no-deps "$DETECTRON2_DIR"
+python -m pip install --no-cache-dir --no-build-isolation --no-deps "$DETECTRON2_DIR/projects/DensePose"
 
 python - <<'PY'
 from whodoirunlike.hosted_processor import processor_readiness

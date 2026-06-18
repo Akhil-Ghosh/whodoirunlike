@@ -11,6 +11,8 @@ const apiBaseUrl =
 const uploadApiMode =
   process.env.NEXT_PUBLIC_UPLOAD_API_MODE ?? (process.env.NODE_ENV === "production" ? "async" : "sync");
 const maxBytes = 75 * 1024 * 1024;
+const asyncPollIntervalMs = 5_000;
+const asyncPollTimeoutMs = 20 * 60 * 1_000;
 
 type UploadState = "idle" | "ready" | "error" | "loading" | "queued" | "complete";
 
@@ -74,9 +76,14 @@ async function parseJsonResponse<T>(response: Response): Promise<T> {
 
 function phaseLabel(job: WorkerJobResponse) {
   const phase = job.progress?.phase?.replaceAll("_", " ");
+  const elapsed = job.progress?.elapsed_seconds;
+  const elapsedLabel =
+    typeof elapsed === "number" && Number.isFinite(elapsed) && elapsed > 0
+      ? ` ${Math.round(elapsed)}s elapsed.`
+      : "";
   if (job.status === "complete") return "Full pipeline complete.";
   if (job.status === "failed") return job.error || "Pipeline failed.";
-  if (phase) return `Pipeline ${phase}.`;
+  if (phase) return `Pipeline ${phase}.${elapsedLabel}`;
   if (job.message) return job.message;
   return "Clip is queued for the full CV pipeline.";
 }
@@ -136,8 +143,10 @@ export function UploadCard() {
   }
 
   async function pollAsyncJob(runId: string) {
-    for (let attempt = 0; attempt < 40; attempt += 1) {
-      await sleep(3000);
+    const deadline = Date.now() + asyncPollTimeoutMs;
+
+    while (Date.now() < deadline) {
+      await sleep(asyncPollIntervalMs);
       const response = await fetch(`${apiBaseUrl}/v1/jobs/${runId}`);
       const job = await parseJsonResponse<WorkerJobResponse>(response);
       setResult({ mode: "async", data: job });
@@ -153,7 +162,7 @@ export function UploadCard() {
     }
 
     setStatus("queued");
-    setMessage("Uploaded. Processing is still running; keep the run ID for review.");
+    setMessage("Uploaded. Processing is still running in the cloud; keep this tab open or save the run ID.");
   }
 
   async function handleAsyncAnalyze(file: File) {
@@ -228,6 +237,7 @@ export function UploadCard() {
     asyncResult?.artifacts["fused_overlay.mp4"] ??
     asyncResult?.artifacts["qa_overlay.mp4"] ??
     asyncResult?.artifacts["skeleton_render.mp4"];
+  const isBusy = status === "loading" || status === "queued";
 
   return (
     <motion.aside
@@ -300,7 +310,7 @@ export function UploadCard() {
         className="focus-ring mt-5 flex h-[52px] w-full items-center justify-center gap-4 rounded-full bg-[var(--charcoal)] px-5 text-[15px] font-medium text-white shadow-[inset_0_-1px_0_rgba(255,255,255,0.15),0_12px_28px_rgba(0,0,0,0.16)] transition-colors duration-300 hover:bg-[#202124] sm:h-[58px]"
         type="button"
         onClick={handleAnalyze}
-        disabled={status === "loading"}
+        disabled={isBusy}
         whileTap={{ scale: 0.98, y: 1 }}
         transition={{ type: "spring", stiffness: 220, damping: 24 }}
       >

@@ -109,6 +109,11 @@ def _prompt_points_with_box_support(
     return np.vstack(point_parts).astype(np.float32), np.concatenate(label_parts).astype(np.int32)
 
 
+def _has_prompt_points(prompt: dict[str, Any]) -> bool:
+    points = prompt.get("points")
+    return points is not None and len(points) > 0
+
+
 def _point_prompt_tensors(
     *,
     points: np.ndarray,
@@ -603,7 +608,7 @@ def run_sam31_gpu_mask(
     )
     prompt_summary = {
         "mode": "point_track_anchors" if track_boxes else "point_or_box_prompt",
-        "uses_user_points": bool(prompt.get("points") is not None and len(prompt.get("points") or []) > 0),
+        "uses_user_points": _has_prompt_points(prompt),
         "track_box_frames": len(track_boxes),
         "anchor_frames": track_prompt_anchors,
     }

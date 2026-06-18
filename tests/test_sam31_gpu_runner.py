@@ -7,6 +7,7 @@ import numpy as np
 from whodoirunlike.sam31_gpu_runner import (
     _build_track_box_fallback_masks,
     _filter_masks_to_track_boxes,
+    _has_prompt_points,
     _mask_from_outputs,
     _patch_multiplex_init_state_kwargs,
     _prompt_points_with_box_support,
@@ -84,6 +85,12 @@ def test_prompt_points_with_box_support_keeps_user_point_and_adds_runner_body_po
     assert points[1:].tolist() == _support_points_from_box(
         np.array([10, 10, 30, 50], dtype=np.float32)
     ).tolist()
+
+
+def test_has_prompt_points_handles_numpy_arrays() -> None:
+    assert _has_prompt_points({"points": np.array([[20, 30]], dtype=np.float32)}) is True
+    assert _has_prompt_points({"points": np.zeros((0, 2), dtype=np.float32)}) is False
+    assert _has_prompt_points({}) is False
 
 
 def test_track_prompt_anchors_choose_prompt_start_middle_and_end_boxes() -> None:

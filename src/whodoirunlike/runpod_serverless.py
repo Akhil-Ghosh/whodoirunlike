@@ -3,12 +3,6 @@ from __future__ import annotations
 import os
 from typing import Any
 
-from whodoirunlike.hosted_processor import (
-    WorkerJobRequest,
-    process_hosted_job,
-    processor_readiness,
-)
-
 
 def _shallow_health() -> dict[str, Any]:
     return {
@@ -22,6 +16,24 @@ def _shallow_health() -> dict[str, Any]:
         "mask_backend": os.getenv("WHODOIRUNLIKE_MASK_BACKEND", ""),
         "skip_densepose": os.getenv("WHODOIRUNLIKE_SKIP_DENSEPOSE", ""),
     }
+
+
+def processor_readiness() -> dict[str, Any]:
+    from whodoirunlike.hosted_processor import processor_readiness as read_processor_readiness
+
+    return read_processor_readiness()
+
+
+def process_hosted_job(request: Any, *, raise_on_error: bool) -> dict[str, Any]:
+    from whodoirunlike.hosted_processor import process_hosted_job as process_worker_job
+
+    return process_worker_job(request, raise_on_error=raise_on_error)
+
+
+def _parse_worker_job_request(payload: dict[str, Any]) -> Any:
+    from whodoirunlike.hosted_processor import WorkerJobRequest
+
+    return WorkerJobRequest.model_validate(payload)
 
 
 def handler(event: dict[str, Any]) -> dict[str, Any]:
@@ -40,7 +52,7 @@ def handler(event: dict[str, Any]) -> dict[str, Any]:
             "readiness": processor_readiness(),
         }
 
-    request = WorkerJobRequest.model_validate(payload)
+    request = _parse_worker_job_request(payload)
     return process_hosted_job(request, raise_on_error=True)
 
 

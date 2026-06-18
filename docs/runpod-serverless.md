@@ -19,6 +19,8 @@ Do not use SAM2 for this hosted path. Do not use SAM 3.1 MLX for this hosted pat
 
 The serverless image is defined in [Dockerfile.runpod](../Dockerfile.runpod).
 
+The image keeps the RunPod base image's CUDA/Torch stack intact. [requirements-runpod-processor.txt](../requirements-runpod-processor.txt) installs the non-Torch Python dependencies, then the Dockerfile installs SAM 3.1, Ultralytics, BoxMOT, RTMLib, Detectron2, and DensePose with `--no-deps` so pip does not replace Torch/Torchvision during the build.
+
 It starts:
 
 ```bash
@@ -43,7 +45,34 @@ Watch it:
 gh run list --workflow "Build RunPod Processor" --limit 5
 ```
 
-This repo is currently private, so RunPod needs registry auth for GHCR unless the image/package is made public.
+This repository is public now, but confirm the GHCR package visibility after the first successful image push. If the package stays private, RunPod still needs registry auth.
+
+## Pod-first debug path
+
+Use this before Serverless. It is faster to debug the CUDA/SAM/DensePose runtime on an interactive pod than to keep waiting on full image builds.
+
+Create a pod from the RunPod UI or CLI with:
+
+```bash
+runpodctl pod create \
+  --name whodoirunlike-processor-debug \
+  --image runpod/pytorch:1.0.3-cu1281-torch291-ubuntu2404 \
+  --gpu-id "NVIDIA GeForce RTX 4090" \
+  --min-cuda-version 12.6 \
+  --container-disk-in-gb 100 \
+  --volume-in-gb 100 \
+  --ports "8000/http,22/tcp"
+```
+
+Inside the pod, set the required secrets and run:
+
+```bash
+export WHODOIRUNLIKE_PROCESSOR_SHARED_SECRET=<shared-secret>
+export HF_TOKEN=<hf-token-with-facebook-sam3.1-access>
+curl -fsSL https://raw.githubusercontent.com/Akhil-Ghosh/whodoirunlike/main/scripts/runpod_bootstrap_processor.sh | bash
+```
+
+When the script prints `ready_for_full_pipeline: true`, the FastAPI processor listens on port `8000`. For a temporary cloud-only smoke test, set the Worker `PROCESSOR_URL` to the pod's RunPod HTTP proxy URL and redeploy the Worker. Clear `PROCESSOR_URL` again before switching to Serverless.
 
 ## Required secrets
 

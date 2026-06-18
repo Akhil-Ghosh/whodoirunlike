@@ -32,7 +32,9 @@ Current production safety state:
 - `api.whodoirunlike.com` is deployed and stores uploads in R2.
 - `RUNPOD_ENDPOINT_ID` is blank in production, so the Worker does not queue RunPod jobs yet.
 - A temporary local Cloudflare Tunnel was tested and removed. Do not use a laptop tunnel for the public demo.
-- The existing Pages deployment was created by direct upload. Cloudflare cannot convert a Direct Upload project to Git-backed; recreate the Pages project from GitHub for the real production site.
+- The `whodoirunlike` Pages project was replaced with a GitHub-backed project pointed at `Akhil-Ghosh/whodoirunlike`.
+- If the Cloudflare dashboard says the project is disconnected from Git, reconnect the Cloudflare Pages GitHub App to `Akhil-Ghosh/whodoirunlike` from the dashboard before relying on automatic deploys.
+- `whodoirunlike.com` is attached to the Pages project and resolves through Cloudflare.
 
 The FastAPI app now exposes:
 
@@ -45,7 +47,7 @@ Cloudflare Pages settings:
 
 ```text
 Root directory: site
-Build command: npm run build:pages
+Build command: npm ci && npm run build:pages
 Build output directory: out
 Production branch: main
 Custom domain: whodoirunlike.com
@@ -62,6 +64,8 @@ npm ci
 NEXT_PUBLIC_API_BASE_URL=https://api.whodoirunlike.com NEXT_PUBLIC_UPLOAD_API_MODE=async npm run build:pages
 npx wrangler pages deploy out --project-name whodoirunlike
 ```
+
+Use direct deploy only as a temporary smoke test. The production project is intended to deploy from GitHub pushes once the dashboard Git reconnect warning is gone.
 
 Worker deploy from the repo:
 
@@ -96,6 +100,8 @@ Use RunPod Serverless with a CUDA image built from [Dockerfile.runpod](../Docker
 
 The mask backend is `sam31_gpu`, using the official `facebookresearch/sam3` SAM 3.1 video predictor. SAM2 is not part of this hosted plan. SAM 3.1 MLX remains local-only for Apple Silicon experiments.
 
+Before creating the final Serverless endpoint, use a normal RunPod pod to debug the runtime with [scripts/runpod_bootstrap_processor.sh](../scripts/runpod_bootstrap_processor.sh). That avoids the slow image-build loop while checking Hugging Face access, SAM 3.1 CUDA, BoxMOT/YOLO, RTMPose, and DensePose on a real GPU.
+
 ## Recommended v1 architecture
 
 ```text
@@ -127,12 +133,10 @@ For metadata, start with a small JSON job record in R2 or KV. Move to D1 once th
 
 Cloudflare:
 
-- Cloudflare account ID.
-- Whether the Pages project should be named `whodoirunlike`.
-- Confirmation that `whodoirunlike.com` is in the same Cloudflare account where Pages will live.
+- Dashboard reconnect of the Cloudflare Pages GitHub App if the Pages project still says it is disconnected from Git.
+- DNS/custom-domain access only if `whodoirunlike.com` needs changes later; it is currently active on the Pages project.
 - The RunPod endpoint ID once the serverless endpoint is created.
-- A Cloudflare API token with Pages edit access if you want me to deploy from this machine.
-- R2 bucket names, or permission for me to create them.
+- A Cloudflare API token with DNS edit access if you want me to finish the custom domain from this machine.
 - The shared `PROCESSOR_SHARED_SECRET` value, or permission for me to generate and set one.
 - A RunPod API key for the Worker secret `RUNPOD_API_KEY`.
 
@@ -160,14 +164,14 @@ Product:
 
 Deploy order:
 
-1. Log in to Cloudflare or provide a scoped API token.
-2. Create the R2 buckets.
-3. Deploy the Worker and bind `api.whodoirunlike.com`.
-4. Build and publish the RunPod processor image.
-5. Create the RunPod Serverless template and endpoint.
-6. Confirm the RunPod health job reports `readiness.ready_for_full_pipeline: true`.
+1. Reconnect the Pages GitHub App in the Cloudflare dashboard if the warning is still present.
+2. Verify `whodoirunlike.com` still returns the current Pages build after the first Git-backed deploy.
+3. Start a temporary RunPod pod and run [scripts/runpod_bootstrap_processor.sh](../scripts/runpod_bootstrap_processor.sh).
+4. Confirm the pod health response reports `readiness.ready_for_full_pipeline: true`.
+5. Create the final RunPod Serverless image, template, and endpoint.
+6. Confirm the RunPod Serverless health job reports `readiness.ready_for_full_pipeline: true`.
 7. Set `RUNPOD_ENDPOINT_ID` in the Worker and redeploy.
-8. Deploy Pages to `whodoirunlike.com`.
+8. Push to `main` and verify the Git-backed Pages deployment.
 
 After that, submit one short centered running clip and verify that R2 contains the source, job record, and returned artifacts.
 

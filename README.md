@@ -120,7 +120,7 @@ Open `http://127.0.0.1:4173`.
 
 The site has a demo walkthrough, a gallery of processed runners, and an upload card. In local dev it calls the synchronous FastAPI endpoint. In production it uses the Cloudflare Worker upload/job flow.
 
-For Cloudflare Pages, use `site` as the root directory, `npm run build:pages` as the build command, and `out` as the output directory. The current Pages project was created by direct upload, so it is not Git-backed. For production, recreate it through the Cloudflare GitHub integration and point the custom domain at that Git-backed project. The upload card should point at `https://api.whodoirunlike.com`.
+For Cloudflare Pages, use `site` as the root directory, `npm ci && npm run build:pages` as the build command, and `out` as the output directory. The `whodoirunlike` Pages project is Git-backed and `whodoirunlike.com` is attached. If Cloudflare shows a Git disconnect warning, reconnect the Pages GitHub App to `Akhil-Ghosh/whodoirunlike` before relying on automatic deploys.
 
 ## Docker
 

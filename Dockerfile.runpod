@@ -29,11 +29,18 @@ RUN git clone --depth 1 https://github.com/facebookresearch/detectron2.git /opt/
 
 COPY pyproject.toml README.md ./
 COPY src ./src
+COPY requirements-runpod-processor.txt ./
 
 RUN python -m pip install --upgrade pip setuptools wheel \
-    && python -m pip install --no-cache-dir -e ".[mot,mmpose,serverless]" \
-    && python -m pip install --no-cache-dir git+https://github.com/facebookresearch/sam3.git \
-    && python -m pip install --no-cache-dir /opt/detectron2 \
-    && python -m pip install --no-cache-dir /opt/detectron2/projects/DensePose
+    && python -m pip install --no-cache-dir -r requirements-runpod-processor.txt \
+    && python -m pip install --no-cache-dir --no-deps -e . \
+    && python -m pip install --no-cache-dir --no-deps \
+        git+https://github.com/facebookresearch/sam3.git \
+        "ultralytics>=8.3" \
+        "ultralytics-thop>=2.0.18" \
+        "boxmot>=17" \
+        "rtmlib>=0.0.15" \
+    && python -m pip install --no-cache-dir --no-deps /opt/detectron2 \
+    && python -m pip install --no-cache-dir --no-deps /opt/detectron2/projects/DensePose
 
 CMD ["python", "-m", "whodoirunlike.runpod_serverless"]

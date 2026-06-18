@@ -10,6 +10,7 @@ import numpy as np
 from whodoirunlike.sam31_gpu_runner import (
     _build_track_box_fallback_masks,
     _collect_sam31_masks,
+    _configure_interactive_tracker_for_user_prompt,
     _filter_masks_to_track_boxes,
     _first_nonempty_output_object_id,
     _has_prompt_points,
@@ -84,6 +85,27 @@ def test_patch_multiplex_init_state_kwargs_filters_unknown_kwargs() -> None:
         offload_state_to_cpu=True,
         offload_video_to_cpu=True,
     ) == {"video_path": "clip.mp4"}
+
+
+def test_configure_interactive_tracker_disables_demo_suppression() -> None:
+    class Model:
+        masklet_confirmation_enable = True
+        hotstart_delay = 15
+        hotstart_unmatch_thresh = 8
+        hotstart_dup_thresh = 8
+        suppress_unmatched_only_within_hotstart = False
+        suppress_overlapping_based_on_recent_occlusion_threshold = 0.7
+
+    class Predictor:
+        model = Model()
+
+    result = _configure_interactive_tracker_for_user_prompt(Predictor())
+
+    assert result["applied"] is True
+    assert Predictor.model.masklet_confirmation_enable is False
+    assert Predictor.model.hotstart_delay == 0
+    assert Predictor.model.suppress_unmatched_only_within_hotstart is True
+    assert Predictor.model.suppress_overlapping_based_on_recent_occlusion_threshold == 1.1
 
 
 def test_prompt_points_with_box_support_keeps_user_point_and_adds_runner_body_points() -> None:
@@ -233,6 +255,7 @@ def test_collect_sam31_masks_tracks_visual_box_object_id(monkeypatch, tmp_path: 
     class FakePredictor:
         def __init__(self) -> None:
             self.add_prompts: list[dict[str, object]] = []
+            self.stream_requests: list[dict[str, object]] = []
 
         def handle_request(self, *, request: dict[str, object]) -> dict[str, object]:
             request_type = request["type"]
@@ -259,6 +282,7 @@ def test_collect_sam31_masks_tracks_visual_box_object_id(monkeypatch, tmp_path: 
 
         def handle_stream_request(self, *, request: dict[str, object]) -> list[dict[str, object]]:
             assert request["type"] == "propagate_in_video"
+            self.stream_requests.append(request)
             return [
                 {
                     "frame_index": 1,
@@ -290,5 +314,10 @@ def test_collect_sam31_masks_tracks_visual_box_object_id(monkeypatch, tmp_path: 
     assert diagnostics["visual_box_prompt"] is True
     assert diagnostics["visual_box_obj_id"] == 7
     assert diagnostics["active_obj_id"] == 7
+    assert [request["propagation_direction"] for request in predictor.stream_requests] == [
+        "forward",
+        "backward",
+    ]
+    assert {request["start_frame_index"] for request in predictor.stream_requests} == {0}
     assert sorted(masks) == [0, 1]
     assert masks[1].tolist() == [[1, 1], [0, 0]]

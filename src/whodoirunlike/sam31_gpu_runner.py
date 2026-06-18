@@ -22,6 +22,7 @@ from whodoirunlike.sam2_runner import (
 DEFAULT_SAM31_GPU_MODEL = "facebook/sam3.1"
 DEFAULT_SAM31_GPU_OBJ_ID = 1
 DEFAULT_SAM31_GPU_TRACK_PROMPT_ANCHORS = 6
+DEFAULT_SAM31_GPU_DISABLE_DEMO_SUPPRESSION = True
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -255,6 +256,98 @@ def _patch_multiplex_init_state_kwargs(predictor: Any) -> None:
     setattr(model, "init_state", filtered_init_state)
 
 
+def _configure_interactive_tracker_for_user_prompt(predictor: Any) -> dict[str, Any]:
+    model = getattr(predictor, "model", None)
+    if model is None:
+        return {"applied": False, "reason": "missing_model"}
+    if not _env_bool(
+        "WHODOIRUNLIKE_SAM31_GPU_DISABLE_DEMO_SUPPRESSION",
+        default=DEFAULT_SAM31_GPU_DISABLE_DEMO_SUPPRESSION,
+    ):
+        return {"applied": False, "reason": "disabled_by_env"}
+
+    overrides = {
+        "masklet_confirmation_enable": False,
+        "hotstart_delay": 0,
+        "hotstart_unmatch_thresh": 0,
+        "hotstart_dup_thresh": 0,
+        "suppress_unmatched_only_within_hotstart": True,
+        "suppress_overlapping_based_on_recent_occlusion_threshold": 1.1,
+    }
+    applied: dict[str, dict[str, Any]] = {}
+    for attr, value in overrides.items():
+        if hasattr(model, attr):
+            previous = getattr(model, attr)
+            setattr(model, attr, value)
+            applied[attr] = {"previous": previous, "current": value}
+    return {"applied": bool(applied), "overrides": applied}
+
+
+def _collect_stream_masks(
+    *,
+    predictor: Any,
+    session_id: str,
+    active_obj_id: int,
+    start_frame_index: int,
+    masks_by_frame: dict[int, np.ndarray],
+    direction: str,
+) -> dict[str, Any]:
+    responses = 0
+    masks = 0
+    try:
+        for stream_response in predictor.handle_stream_request(
+            request={
+                "type": "propagate_in_video",
+                "session_id": session_id,
+                "propagation_direction": direction,
+                "start_frame_index": start_frame_index,
+            }
+        ):
+            responses += 1
+            frame_index = int(stream_response["frame_index"])
+            mask = _mask_from_outputs(
+                stream_response.get("outputs", {}),
+                obj_id=active_obj_id,
+            )
+            if mask is not None:
+                masks_by_frame[frame_index] = mask
+                masks += 1
+    except RuntimeError as exc:
+        if "No prompts are received on any frames" not in str(exc):
+            raise
+        return {
+            "direction": direction,
+            "responses": responses,
+            "masks": masks,
+            "warning": str(exc),
+        }
+    return {"direction": direction, "responses": responses, "masks": masks}
+
+
+def _propagate_from_prompt_frame(
+    *,
+    predictor: Any,
+    session_id: str,
+    active_obj_id: int,
+    prompt_frame: int,
+    masks_by_frame: dict[int, np.ndarray],
+    label: str,
+) -> list[dict[str, Any]]:
+    diagnostics = []
+    for direction in ("forward", "backward"):
+        result = _collect_stream_masks(
+            predictor=predictor,
+            session_id=session_id,
+            active_obj_id=active_obj_id,
+            start_frame_index=prompt_frame,
+            masks_by_frame=masks_by_frame,
+            direction=direction,
+        )
+        result["pass"] = label
+        diagnostics.append(result)
+    return diagnostics
+
+
 def _collect_sam31_masks(
     *,
     predictor: Any,
@@ -280,6 +373,7 @@ def _collect_sam31_masks(
         "initial_obj_id": obj_id,
         "active_obj_id": obj_id,
         "visual_box_prompt": False,
+        "propagation": [],
     }
     try:
         prompt_frame = max(0, min(int(prompt["frame_index"]), max(frame_count - 1, 0)))
@@ -349,12 +443,34 @@ def _collect_sam31_masks(
             if prompt_mask is not None:
                 masks_by_frame[prompt_frame] = prompt_mask
 
-            if track_boxes:
-                for anchor_frame in _track_prompt_anchors(
+            diagnostics["propagation"].extend(
+                _propagate_from_prompt_frame(
+                    predictor=predictor,
+                    session_id=session_id,
+                    active_obj_id=active_obj_id,
                     prompt_frame=prompt_frame,
-                    frame_count=frame_count,
-                    track_boxes=track_boxes,
-                ):
+                    masks_by_frame=masks_by_frame,
+                    label="primary_prompt",
+                )
+            )
+
+            track_frame_target = len(track_boxes or {}) or frame_count
+            anchor_refine_threshold = max(12, int(track_frame_target * 0.65))
+            needs_anchor_refinement = len(masks_by_frame) < anchor_refine_threshold
+            diagnostics["anchor_refinement_threshold"] = anchor_refine_threshold
+            diagnostics["anchor_refinement_triggered"] = needs_anchor_refinement
+            if track_boxes:
+                anchor_frames = (
+                    _track_prompt_anchors(
+                        prompt_frame=prompt_frame,
+                        frame_count=frame_count,
+                        track_boxes=track_boxes,
+                    )
+                    if needs_anchor_refinement
+                    else []
+                )
+                diagnostics["anchor_refinement_frames"] = anchor_frames
+                for anchor_frame in anchor_frames:
                     if anchor_frame == prompt_frame:
                         continue
                     points = _support_points_from_box(track_boxes[anchor_frame])
@@ -380,24 +496,19 @@ def _collect_sam31_masks(
                     if anchor_mask is not None:
                         masks_by_frame[anchor_frame] = anchor_mask
 
-            try:
-                for stream_response in predictor.handle_stream_request(
-                    request={
-                        "type": "propagate_in_video",
-                        "session_id": session_id,
-                    }
-                ):
-                    frame_index = int(stream_response["frame_index"])
-                    mask = _mask_from_outputs(
-                        stream_response.get("outputs", {}),
-                        obj_id=active_obj_id,
+                if anchor_frames:
+                    diagnostics["propagation"].extend(
+                        _propagate_from_prompt_frame(
+                            predictor=predictor,
+                            session_id=session_id,
+                            active_obj_id=active_obj_id,
+                            prompt_frame=prompt_frame,
+                            masks_by_frame=masks_by_frame,
+                            label="anchor_refinement",
+                        )
                     )
-                    if mask is not None:
-                        masks_by_frame[frame_index] = mask
-            except RuntimeError as exc:
-                if "No prompts are received on any frames" not in str(exc):
-                    raise
-                diagnostics["propagation_warning"] = str(exc)
+            else:
+                diagnostics["anchor_refinement_frames"] = []
     finally:
         predictor.handle_request(
             request={
@@ -693,6 +804,7 @@ def run_sam31_gpu_mask(
         default_output_prob_thresh=float(os.getenv("WHODOIRUNLIKE_SAM31_GPU_THRESHOLD", "0.5")),
     )
     _patch_multiplex_init_state_kwargs(predictor)
+    tracker_config = _configure_interactive_tracker_for_user_prompt(predictor)
     masks_by_frame, sam_prompt_diagnostics = _collect_sam31_masks(
         predictor=predictor,
         video_path=source_segment,
@@ -704,6 +816,7 @@ def run_sam31_gpu_mask(
         track_boxes=track_boxes,
     )
     prompt_summary["sam31"] = sam_prompt_diagnostics
+    prompt_summary["sam31_tracker_config"] = tracker_config
     masks_by_frame, identity_filter = _filter_masks_to_track_boxes(masks_by_frame, track_boxes)
     prompt_summary["identity_filter"] = identity_filter
 

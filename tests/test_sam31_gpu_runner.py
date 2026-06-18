@@ -17,6 +17,7 @@ from whodoirunlike.sam31_gpu_runner import (
     _mask_from_outputs,
     _patch_multiplex_init_state_kwargs,
     _prompt_points_with_box_support,
+    _seed_points_for_frame,
     _support_points_from_box,
     _track_prompt_anchors,
     update_manifest_after_sam31_gpu,
@@ -127,6 +128,26 @@ def test_prompt_points_with_box_support_keeps_user_point_and_adds_runner_body_po
     assert points[1:].tolist() == _support_points_from_box(
         np.array([10, 10, 30, 50], dtype=np.float32)
     ).tolist()
+
+
+def test_seed_points_for_frame_uses_track_box_points_when_seed_frame_differs() -> None:
+    prompt = {
+        "points": np.array([[90, 90]], dtype=np.float32),
+        "labels": np.array([1], dtype=np.int32),
+    }
+    box = np.array([10, 10, 30, 50], dtype=np.float32)
+
+    points, labels = _seed_points_for_frame(
+        prompt=prompt,
+        box=box,
+        seed_frame=0,
+        prompt_frame=99,
+    )
+
+    assert points is not None
+    assert labels is not None
+    assert points.tolist() == _support_points_from_box(box).tolist()
+    assert labels.tolist() == [1, 1, 1]
 
 
 def test_has_prompt_points_handles_numpy_arrays() -> None:
@@ -314,10 +335,85 @@ def test_collect_sam31_masks_tracks_visual_box_object_id(monkeypatch, tmp_path: 
     assert diagnostics["visual_box_prompt"] is True
     assert diagnostics["visual_box_obj_id"] == 7
     assert diagnostics["active_obj_id"] == 7
-    assert [request["propagation_direction"] for request in predictor.stream_requests] == [
-        "forward",
-        "backward",
-    ]
+    assert [request["propagation_direction"] for request in predictor.stream_requests] == ["forward"]
     assert {request["start_frame_index"] for request in predictor.stream_requests} == {0}
     assert sorted(masks) == [0, 1]
     assert masks[1].tolist() == [[1, 1], [0, 0]]
+
+
+def test_collect_sam31_masks_seeds_from_first_target_track_frame(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    class FakeInferenceMode:
+        def __enter__(self) -> None:
+            return None
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+    fake_torch = types.SimpleNamespace(
+        float32="float32",
+        int32="int32",
+        tensor=lambda data, **_kwargs: np.asarray(data),
+        inference_mode=lambda: FakeInferenceMode(),
+    )
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+
+    class FakePredictor:
+        def __init__(self) -> None:
+            self.add_prompts: list[dict[str, object]] = []
+            self.stream_requests: list[dict[str, object]] = []
+
+        def handle_request(self, *, request: dict[str, object]) -> dict[str, object]:
+            request_type = request["type"]
+            if request_type == "start_session":
+                return {"session_id": "session-1"}
+            if request_type == "close_session":
+                return {}
+            if request_type == "add_prompt":
+                self.add_prompts.append(request)
+                return {
+                    "outputs": {
+                        "out_obj_ids": np.array([1]),
+                        "out_binary_masks": np.array([[[1, 0], [0, 0]]], dtype=np.uint8),
+                    }
+                }
+            raise AssertionError(f"unexpected request: {request_type}")
+
+        def handle_stream_request(self, *, request: dict[str, object]) -> list[dict[str, object]]:
+            self.stream_requests.append(request)
+            return []
+
+    predictor = FakePredictor()
+    _masks, diagnostics = _collect_sam31_masks(
+        predictor=predictor,
+        video_path=tmp_path / "clip.mp4",
+        prompt={
+            "frame_index": 99,
+            "box": np.array([70, 70, 90, 100], dtype=np.float32),
+            "points": np.array([[80, 90]], dtype=np.float32),
+            "labels": np.array([1], dtype=np.int32),
+        },
+        width=100,
+        height=100,
+        frame_count=120,
+        obj_id=1,
+        track_boxes={
+            0: np.array([10, 10, 30, 50], dtype=np.float32),
+            99: np.array([70, 70, 90, 100], dtype=np.float32),
+        },
+    )
+
+    assert diagnostics["seed_frame"] == 0
+    assert diagnostics["seed_source"] == "target_track_first_visible_frame"
+    assert predictor.add_prompts[0]["frame_index"] == 0
+    assert predictor.add_prompts[1]["frame_index"] == 0
+    point_prompt = predictor.add_prompts[1]
+    assert np.asarray(point_prompt["points"]).shape == (3, 2)
+    expected_points = _support_points_from_box(np.array([10, 10, 30, 50], dtype=np.float32))
+    expected_points[:, 0] /= 100
+    expected_points[:, 1] /= 100
+    assert np.asarray(point_prompt["points"]).tolist() == expected_points.tolist()
+    assert predictor.stream_requests[0]["start_frame_index"] == 0
+    assert predictor.stream_requests[0]["propagation_direction"] == "forward"

@@ -121,6 +121,21 @@ def _prompt_points_with_box_support(
     return np.vstack(point_parts).astype(np.float32), np.concatenate(label_parts).astype(np.int32)
 
 
+def _seed_points_for_frame(
+    *,
+    prompt: dict[str, Any],
+    box: np.ndarray | None,
+    seed_frame: int,
+    prompt_frame: int,
+) -> tuple[np.ndarray | None, np.ndarray | None]:
+    if seed_frame == prompt_frame:
+        return _prompt_points_with_box_support(prompt, box=box)
+    if box is None:
+        return None, None
+    support_points = _support_points_from_box(box)
+    return support_points, np.ones(len(support_points), dtype=np.int32)
+
+
 def _has_prompt_points(prompt: dict[str, Any]) -> bool:
     points = prompt.get("points")
     return points is not None and len(points) > 0
@@ -194,6 +209,17 @@ def _track_prompt_anchors(
         if len(anchors) >= max_anchors:
             break
     return sorted(anchors)
+
+
+def _first_track_prompt_frame(
+    *,
+    track_boxes: dict[int, np.ndarray],
+    frame_count: int,
+) -> tuple[int, np.ndarray] | None:
+    for frame_index in sorted(track_boxes):
+        if 0 <= frame_index < frame_count:
+            return frame_index, track_boxes[frame_index]
+    return None
 
 
 def _as_numpy(value: Any) -> np.ndarray:
@@ -324,22 +350,23 @@ def _collect_stream_masks(
     return {"direction": direction, "responses": responses, "masks": masks}
 
 
-def _propagate_from_prompt_frame(
+def _propagate_from_seed_frame(
     *,
     predictor: Any,
     session_id: str,
     active_obj_id: int,
-    prompt_frame: int,
+    seed_frame: int,
     masks_by_frame: dict[int, np.ndarray],
     label: str,
+    directions: tuple[str, ...] = ("forward", "backward"),
 ) -> list[dict[str, Any]]:
     diagnostics = []
-    for direction in ("forward", "backward"):
+    for direction in directions:
         result = _collect_stream_masks(
             predictor=predictor,
             session_id=session_id,
             active_obj_id=active_obj_id,
-            start_frame_index=prompt_frame,
+            start_frame_index=seed_frame,
             masks_by_frame=masks_by_frame,
             direction=direction,
         )
@@ -377,17 +404,39 @@ def _collect_sam31_masks(
     }
     try:
         prompt_frame = max(0, min(int(prompt["frame_index"]), max(frame_count - 1, 0)))
-        prompt_box = None
+        seed_frame = prompt_frame
+        seed_box = None
+        seed_source = "user_prompt"
         if track_boxes:
-            nearest_prompt_box = _nearest_track_box(
-                frame_index=prompt_frame,
+            first_track_box = _first_track_prompt_frame(
                 track_boxes=track_boxes,
-                max_distance=max(12, frame_count // 12),
+                frame_count=frame_count,
             )
-            if nearest_prompt_box is not None:
-                _, prompt_box = nearest_prompt_box
-        visual_box = prompt.get("box") if prompt.get("box") is not None else prompt_box
-        prompt_points, prompt_labels = _prompt_points_with_box_support(prompt, box=prompt_box)
+            if first_track_box is not None:
+                seed_frame, seed_box = first_track_box
+                seed_source = "target_track_first_visible_frame"
+        if seed_box is None:
+            if seed_frame == prompt_frame and prompt.get("box") is not None:
+                seed_box = np.asarray(prompt["box"], dtype=np.float32)
+            elif track_boxes:
+                nearest_prompt_box = _nearest_track_box(
+                    frame_index=prompt_frame,
+                    track_boxes=track_boxes,
+                    max_distance=max(12, frame_count // 12),
+                )
+                if nearest_prompt_box is not None:
+                    seed_frame, seed_box = nearest_prompt_box
+                    seed_source = "target_track_nearest_prompt_frame"
+        visual_box = seed_box if seed_box is not None else prompt.get("box")
+        seed_points, seed_labels = _seed_points_for_frame(
+            prompt=prompt,
+            box=seed_box,
+            seed_frame=seed_frame,
+            prompt_frame=prompt_frame,
+        )
+        diagnostics["prompt_frame"] = prompt_frame
+        diagnostics["seed_frame"] = seed_frame
+        diagnostics["seed_source"] = seed_source
 
         with torch.inference_mode():
             active_obj_id = obj_id
@@ -397,7 +446,7 @@ def _collect_sam31_masks(
                     request={
                         "type": "add_prompt",
                         "session_id": session_id,
-                        "frame_index": prompt_frame,
+                        "frame_index": seed_frame,
                         **_box_prompt_tensors(
                             box=np.asarray(visual_box, dtype=np.float32),
                             width=width,
@@ -413,12 +462,12 @@ def _collect_sam31_masks(
                     diagnostics["active_obj_id"] = active_obj_id
                 box_mask = _mask_from_outputs(box_outputs, obj_id=active_obj_id)
                 if box_mask is not None:
-                    masks_by_frame[prompt_frame] = box_mask
+                    masks_by_frame[seed_frame] = box_mask
 
-            if prompt_points is not None and prompt_labels is not None:
+            if seed_points is not None and seed_labels is not None:
                 prompt_inputs = _point_prompt_tensors(
-                    points=prompt_points,
-                    labels=prompt_labels,
+                    points=seed_points,
+                    labels=seed_labels,
                     width=width,
                     height=height,
                 )
@@ -428,7 +477,7 @@ def _collect_sam31_masks(
                 request={
                     "type": "add_prompt",
                     "session_id": session_id,
-                    "frame_index": prompt_frame,
+                    "frame_index": seed_frame,
                     "obj_id": active_obj_id,
                     **prompt_inputs,
                 }
@@ -441,16 +490,17 @@ def _collect_sam31_masks(
                 diagnostics["active_obj_id"] = active_obj_id
             prompt_mask = _mask_from_outputs(prompt_outputs, obj_id=active_obj_id)
             if prompt_mask is not None:
-                masks_by_frame[prompt_frame] = prompt_mask
+                masks_by_frame[seed_frame] = prompt_mask
 
             diagnostics["propagation"].extend(
-                _propagate_from_prompt_frame(
+                _propagate_from_seed_frame(
                     predictor=predictor,
                     session_id=session_id,
                     active_obj_id=active_obj_id,
-                    prompt_frame=prompt_frame,
+                    seed_frame=seed_frame,
                     masks_by_frame=masks_by_frame,
                     label="primary_prompt",
+                    directions=("forward",) if seed_frame == 0 else ("forward", "backward"),
                 )
             )
 
@@ -462,7 +512,7 @@ def _collect_sam31_masks(
             if track_boxes:
                 anchor_frames = (
                     _track_prompt_anchors(
-                        prompt_frame=prompt_frame,
+                        prompt_frame=seed_frame,
                         frame_count=frame_count,
                         track_boxes=track_boxes,
                     )
@@ -471,7 +521,7 @@ def _collect_sam31_masks(
                 )
                 diagnostics["anchor_refinement_frames"] = anchor_frames
                 for anchor_frame in anchor_frames:
-                    if anchor_frame == prompt_frame:
+                    if anchor_frame == seed_frame:
                         continue
                     points = _support_points_from_box(track_boxes[anchor_frame])
                     labels = np.ones(len(points), dtype=np.int32)
@@ -498,13 +548,14 @@ def _collect_sam31_masks(
 
                 if anchor_frames:
                     diagnostics["propagation"].extend(
-                        _propagate_from_prompt_frame(
+                        _propagate_from_seed_frame(
                             predictor=predictor,
                             session_id=session_id,
                             active_obj_id=active_obj_id,
-                            prompt_frame=prompt_frame,
+                            seed_frame=seed_frame,
                             masks_by_frame=masks_by_frame,
                             label="anchor_refinement",
+                            directions=("forward",) if seed_frame == 0 else ("forward", "backward"),
                         )
                     )
             else:

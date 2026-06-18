@@ -402,7 +402,7 @@ def _mask_backend() -> str:
 
 
 def sam31_gpu_setup_status() -> dict[str, Any]:
-    dependencies = _dependency_status(["torch", "sam3", "PIL", "cv2", "numpy"])
+    dependencies = _dependency_status(["torch", "sam3", "einops", "PIL", "cv2", "numpy"])
     missing = [name for name, available in dependencies.items() if not available]
     reasons: list[str] = []
     if missing:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import time
+import importlib
 import importlib.util
 from dataclasses import dataclass
 from pathlib import Path
@@ -63,15 +64,25 @@ def identity_setup_status(backend: str | None = None) -> dict[str, Any]:
             "install_command": None,
         }
 
-    missing = [
-        package
-        for package in ("ultralytics", "boxmot")
-        if importlib.util.find_spec(package) is None
-    ]
+    checks = {
+        "ultralytics": "ultralytics",
+        "boxmot": "boxmot.trackers.tracker_zoo",
+    }
+    reasons = []
+    for package, module_name in checks.items():
+        if importlib.util.find_spec(package) is None:
+            reasons.append(f"Missing Python package: {package}")
+            continue
+        try:
+            importlib.import_module(module_name)
+        except ModuleNotFoundError as exc:
+            reasons.append(f"{package} import failed: missing Python package: {exc.name}")
+        except Exception as exc:  # noqa: BLE001 - readiness should surface dependency failures.
+            reasons.append(f"{package} import failed: {type(exc).__name__}: {exc}")
     return {
         "backend": backend_name,
-        "ready": not missing,
-        "reasons": [f"Missing Python package: {package}" for package in missing],
+        "ready": not reasons,
+        "reasons": reasons,
         "install_command": 'python -m pip install -e ".[mot]"',
     }
 
@@ -596,7 +607,7 @@ def _load_yolo_model(detector_model: str) -> Any:
         from ultralytics import YOLO
     except ModuleNotFoundError as exc:
         raise RuntimeError(
-            "YOLO person detection needs ultralytics. Install with: "
+            f"YOLO person detection import failed; missing Python package: {exc.name}. Install with: "
             'python -m pip install -e ".[mot]"'
         ) from exc
     return YOLO(detector_model)

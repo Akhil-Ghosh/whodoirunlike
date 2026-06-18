@@ -35,18 +35,31 @@ def _relative_prompt_tensors(
     prompt: dict[str, Any],
     width: int,
     height: int,
-) -> tuple[Any, Any]:
+) -> dict[str, Any]:
     import torch
+
+    box = prompt.get("box")
+    if box is not None:
+        x1, y1, x2, y2 = [float(value) for value in np.asarray(box).tolist()]
+        rel_box = np.array(
+            [[
+                x1 / max(float(width), 1.0),
+                y1 / max(float(height), 1.0),
+                max(x2 - x1, 0.0) / max(float(width), 1.0),
+                max(y2 - y1, 0.0) / max(float(height), 1.0),
+            ]],
+            dtype=np.float32,
+        )
+        rel_box = np.clip(rel_box, 0.0, 1.0)
+        return {
+            "bounding_boxes": torch.tensor(rel_box, dtype=torch.float32, device="cuda"),
+            "bounding_box_labels": torch.tensor([1], dtype=torch.int32, device="cuda"),
+        }
 
     points = prompt.get("points")
     labels = prompt.get("labels")
     if points is None or len(points) == 0:
-        box = prompt.get("box")
-        if box is None:
-            raise ValueError("SAM 3.1 GPU requires at least one prompt point or box.")
-        x1, y1, x2, y2 = [float(value) for value in box.tolist()]
-        points = np.array([[(x1 + x2) / 2.0, (y1 + y2) / 2.0]], dtype=np.float32)
-        labels = np.array([1], dtype=np.int32)
+        raise ValueError("SAM 3.1 GPU requires at least one prompt point or box.")
 
     rel_points = np.asarray(points, dtype=np.float32).copy()
     rel_points[:, 0] = rel_points[:, 0] / max(float(width), 1.0)
@@ -54,10 +67,10 @@ def _relative_prompt_tensors(
     rel_points = np.clip(rel_points, 0.0, 1.0)
     rel_labels = np.asarray(labels, dtype=np.int32)
 
-    return (
-        torch.tensor(rel_points, dtype=torch.float32, device="cuda"),
-        torch.tensor(rel_labels, dtype=torch.int32, device="cuda"),
-    )
+    return {
+        "points": torch.tensor(rel_points, dtype=torch.float32, device="cuda"),
+        "point_labels": torch.tensor(rel_labels, dtype=torch.int32, device="cuda"),
+    }
 
 
 def _as_numpy(value: Any) -> np.ndarray:
@@ -128,16 +141,15 @@ def _collect_sam31_masks(
     masks_by_frame: dict[int, np.ndarray] = {}
     try:
         prompt_frame = max(0, min(int(prompt["frame_index"]), max(frame_count - 1, 0)))
-        points, point_labels = _relative_prompt_tensors(prompt=prompt, width=width, height=height)
+        prompt_inputs = _relative_prompt_tensors(prompt=prompt, width=width, height=height)
         with torch.inference_mode():
             prompt_response = predictor.handle_request(
                 request={
                     "type": "add_prompt",
                     "session_id": session_id,
                     "frame_index": prompt_frame,
-                    "points": points,
-                    "point_labels": point_labels,
                     "obj_id": obj_id,
+                    **prompt_inputs,
                 }
             )
             prompt_mask = _mask_from_outputs(prompt_response.get("outputs", {}), obj_id=obj_id)

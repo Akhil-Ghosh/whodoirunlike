@@ -189,6 +189,23 @@ def _box_iou_pixels(a: Sequence[int] | None, b: Sequence[int] | None) -> float:
     return intersection / union if union > 0 else 0.0
 
 
+def _mask_bbox_pixels(mask: np.ndarray | None) -> list[int] | None:
+    if mask is None:
+        return None
+    ys, xs = np.where(mask > 0)
+    if not len(xs):
+        return None
+    x = int(xs.min())
+    y = int(ys.min())
+    return [x, y, int(xs.max()) + 1 - x, int(ys.max()) + 1 - y]
+
+
+def _mask_area_ratio(mask: np.ndarray | None, width: int, height: int) -> float:
+    if mask is None:
+        return 0.0
+    return float((mask > 0).sum()) / float(max(width * height, 1))
+
+
 def _pose_bbox_pixels(pose_row: dict[str, Any], width: int, height: int) -> list[int] | None:
     bbox = pose_row.get("bbox")
     if not isinstance(bbox, dict):
@@ -269,18 +286,38 @@ def fuse_frame(
     key_weights = [joint["weight"] for joint in joint_weights if joint["name"] in KEY_JOINTS]
     key_joint_confidence = mean(key_weights) if key_weights else 0.0
     pose_confidence = float(pose_row.get("visibility_mean") or 0.0)
+    pose_reliable = pose_confidence >= 0.18 or key_joint_confidence >= 0.25
     densepose_confidence = _densepose_confidence(densepose_row)
+    densepose_usable = bool(densepose_row.get("usable"))
+    mask_area_ratio = _mask_area_ratio(mask, width, height)
+    mask_bbox = _mask_bbox_pixels(mask)
+    pose_bbox = _pose_bbox_pixels(pose_row, width, height)
+    identity_bbox = densepose_row.get("runner_bbox") if densepose_usable else mask_bbox
     pose_mask_iou = _box_iou_pixels(
-        _pose_bbox_pixels(pose_row, width, height),
-        densepose_row.get("runner_bbox"),
+        pose_bbox,
+        identity_bbox,
     )
-    mask_confidence = _clamp_score((pose_mask_iou * 0.55) + (min(float(densepose_row.get("mask_overlap") or 0.0) / 0.25, 1.0) * 0.45))
-    frame_confidence = _clamp_score(
-        (pose_confidence * 0.42)
-        + (key_joint_confidence * 0.24)
-        + (densepose_confidence * 0.22)
-        + (mask_confidence * 0.12)
-    )
+    if densepose_usable:
+        mask_confidence = _clamp_score(
+            (pose_mask_iou * 0.55)
+            + (min(float(densepose_row.get("mask_overlap") or 0.0) / 0.25, 1.0) * 0.45)
+        )
+        frame_confidence = _clamp_score(
+            (pose_confidence * 0.42)
+            + (key_joint_confidence * 0.24)
+            + (densepose_confidence * 0.22)
+            + (mask_confidence * 0.12)
+        )
+    else:
+        plausible_mask_size = 0.006 <= mask_area_ratio <= 0.45
+        mask_confidence = _clamp_score((pose_mask_iou * 0.7) + ((0.3 if plausible_mask_size else 0.0)))
+        pose_mask_confidence = _clamp_score(
+            (pose_confidence * 0.32)
+            + (key_joint_confidence * 0.28)
+            + (mask_confidence * 0.4)
+        )
+        mask_only_confidence = _clamp_score(mask_confidence * 0.85)
+        frame_confidence = max(pose_mask_confidence, mask_only_confidence) if pose_reliable else mask_only_confidence
     questionable = [
         joint["name"]
         for joint in joint_weights
@@ -288,7 +325,11 @@ def fuse_frame(
     ]
     if not pose_row.get("usable"):
         frame_state = "pose_rejected"
-    elif not densepose_row.get("usable"):
+    elif not densepose_usable and mask_bbox is not None and pose_reliable and frame_confidence >= 0.25:
+        frame_state = "pose_mask_fallback"
+    elif not densepose_usable and mask_bbox is not None and plausible_mask_size and frame_confidence >= 0.3:
+        frame_state = "target_mask_fallback"
+    elif not densepose_usable:
         frame_state = "densepose_missing"
     elif pose_mask_iou < 0.08:
         frame_state = "identity_risk"
@@ -300,11 +341,13 @@ def fuse_frame(
         "frame_index": int(pose_row.get("frame_index") or densepose_row.get("frame_index") or 0),
         "time_seconds": pose_row.get("time_seconds"),
         "frame_state": frame_state,
-        "usable": frame_state == "usable",
+        "usable": frame_state in {"usable", "pose_mask_fallback", "target_mask_fallback"},
         "frame_confidence": frame_confidence,
         "pose_confidence": round(pose_confidence, 4),
         "key_joint_confidence": round(key_joint_confidence, 4),
+        "pose_reliable": pose_reliable,
         "mask_confidence": mask_confidence,
+        "mask_area_ratio": round(mask_area_ratio, 6),
         "densepose_confidence": densepose_confidence,
         "pose_mask_iou": round(pose_mask_iou, 4),
         "densepose_group_coverage": coverage,
@@ -327,6 +370,14 @@ def _draw_fused_overlay(frame: np.ndarray, pose_row: dict[str, Any], fused_row: 
     height, width = output.shape[:2]
     landmarks = pose_row.get("landmarks") or []
     weights = {joint["index"]: joint for joint in fused_row.get("joint_weights", [])}
+    frame_state = str(fused_row.get("frame_state") or "")
+
+    if frame_state in {"target_mask_fallback", "densepose_missing", "pose_rejected"}:
+        confidence = int(round(float(fused_row.get("frame_confidence") or 0.0) * 100))
+        badge = f"Fused confidence {confidence}% | {frame_state.replace('_', ' ')}"
+        cv2.rectangle(output, (28, 26), (520, 76), (22, 25, 31), -1)
+        cv2.putText(output, badge, (44, 59), cv2.FONT_HERSHEY_SIMPLEX, 0.72, (245, 242, 233), 2, cv2.LINE_AA)
+        return output
 
     for start, end in POSE_CONNECTIONS:
         if start >= len(landmarks) or end >= len(landmarks):

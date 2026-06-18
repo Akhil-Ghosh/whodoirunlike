@@ -151,6 +151,51 @@ def test_fuse_frame_combines_pose_mask_and_densepose_confidence() -> None:
     assert any(joint["name"] == "left_knee" for joint in row["joint_weights"])
 
 
+def test_fuse_frame_uses_pose_mask_fallback_when_densepose_is_missing() -> None:
+    mask = np.zeros((48, 64), dtype=np.uint8)
+    mask[10:44, 12:56] = 255
+
+    row = fuse_frame(
+        _pose_row(0),
+        {"frame_index": 0, "usable": False, "drop_reason": "densepose_missing"},
+        mask=mask,
+        width=64,
+        height=48,
+    )
+
+    assert row["frame_state"] == "pose_mask_fallback"
+    assert row["usable"] is True
+    assert row["frame_confidence"] > 0.6
+    assert row["densepose_confidence"] == 0.0
+    assert row["mask_area_ratio"] > 0
+
+
+def test_fuse_frame_uses_target_mask_fallback_when_pose_is_unreliable() -> None:
+    pose_row = _pose_row(0)
+    pose_row["visibility_mean"] = 0.08
+    pose_row["bbox"] = {"x": 0.0, "y": 0.0, "width": 1.0, "height": 1.0}
+    for landmark in pose_row["landmarks"]:
+        landmark["visibility"] = 0.05
+        landmark["presence"] = 0.05
+        landmark["x"] = 0.0
+        landmark["y"] = 0.0
+    mask = np.zeros((48, 64), dtype=np.uint8)
+    mask[10:44, 18:42] = 255
+
+    row = fuse_frame(
+        pose_row,
+        {"frame_index": 0, "usable": False, "drop_reason": "densepose_missing"},
+        mask=mask,
+        width=64,
+        height=48,
+    )
+
+    assert row["frame_state"] == "target_mask_fallback"
+    assert row["usable"] is True
+    assert row["pose_reliable"] is False
+    assert row["frame_confidence"] >= 0.3
+
+
 def test_run_fused_form_writes_rows_overlay_and_manifest(tmp_path: Path) -> None:
     run_dir = _make_run_dir(tmp_path)
 

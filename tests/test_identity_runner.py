@@ -297,6 +297,55 @@ class LookalikeFakeBoxmotTracker:
         return np.array(rows, dtype=np.float32)
 
 
+class NearLookalikeGapFakeBoxes:
+    def __init__(self, frame_index: int) -> None:
+        target_x = 22 + frame_index
+        if frame_index <= 8:
+            self.xyxy = np.array([[21, 18, 35, 48]], dtype=np.float32)
+            self.conf = np.array([0.96], dtype=np.float32)
+            self.cls = np.array([0], dtype=np.float32)
+            return
+        self.xyxy = np.array(
+            [
+                [target_x, 18, target_x + 14, 48],
+                [21, 18, 35, 48],
+            ],
+            dtype=np.float32,
+        )
+        self.conf = np.array([0.91, 0.96], dtype=np.float32)
+        self.cls = np.array([0, 0], dtype=np.float32)
+
+
+class NearLookalikeGapFakeResult:
+    def __init__(self, frame_index: int) -> None:
+        self.boxes = NearLookalikeGapFakeBoxes(frame_index)
+
+
+class NearLookalikeGapFakeYolo:
+    def __init__(self) -> None:
+        self.frame_index = 0
+
+    def predict(self, frame: np.ndarray, **kwargs: object) -> list[NearLookalikeGapFakeResult]:
+        result = NearLookalikeGapFakeResult(self.frame_index)
+        self.frame_index += 1
+        return [result]
+
+
+class NearLookalikeGapFakeBoxmotTracker:
+    def update(self, detections: np.ndarray, frame: np.ndarray) -> np.ndarray:
+        if detections.size == 0:
+            return np.empty((0, 8), dtype=np.float32)
+        rows = []
+        if len(detections) > 1:
+            target = detections[0]
+            rows.append([*target[:4], 3, target[4], 0, 0])
+            lookalike = detections[1]
+        else:
+            lookalike = detections[0]
+        rows.append([*lookalike[:4], 6, lookalike[4], 0, 0])
+        return np.array(rows, dtype=np.float32)
+
+
 def test_boxmot_identity_tracking_uses_prompt_to_select_target_track(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -455,3 +504,50 @@ def test_boxmot_identity_tracking_rejects_impossible_lookalike_jump(
     }
     assert target_rows[10]["track_id"] == 3
     assert target_rows[11]["track_id"] == 3
+
+
+def test_boxmot_identity_tracking_marks_missing_instead_of_near_lookalike_handoff(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_dir = tmp_path / "cv_runs" / "identity-clip"
+    run_dir.mkdir(parents=True)
+    write_identity_run(run_dir)
+    write_lookalike_jump_video(run_dir / "source_segment.mp4")
+
+    monkeypatch.setattr(
+        identity_runner,
+        "identity_setup_status",
+        lambda backend=None: {"ready": True, "reasons": [], "install_command": None},
+    )
+    monkeypatch.setattr(
+        identity_runner,
+        "_load_yolo_model",
+        lambda detector_model: NearLookalikeGapFakeYolo(),
+    )
+    monkeypatch.setattr(
+        identity_runner,
+        "_create_boxmot_tracker",
+        lambda backend, reid_weights, device, half: NearLookalikeGapFakeBoxmotTracker(),
+    )
+
+    result = run_identity_tracking(run_dir=run_dir, backend="boxmot_botsort", device="cpu")
+
+    assert result["status"] == "complete"
+    assert result["metrics"]["target_track_ids"] == [3]
+
+    track_rows = pq.read_table(run_dir / "tracklets.parquet").to_pylist()
+    lookalike_target_rows = [
+        row
+        for row in track_rows
+        if row["is_target"] and row["track_id"] == 6 and row["identity_state"] == "usable"
+    ]
+    assert lookalike_target_rows == []
+
+    target_rows = {
+        int(row["frame_index"]): row
+        for row in track_rows
+        if row["is_target"]
+    }
+    assert target_rows[8]["track_id"] == 6
+    assert target_rows[8]["identity_state"] == "identity_risk"

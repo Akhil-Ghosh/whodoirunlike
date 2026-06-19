@@ -738,11 +738,15 @@ def _select_target_candidate(
     prompt_box_xyxy = _xywh_to_xyxy(prompt_box)
     best: dict[str, Any] | None = None
     best_score = -1.0
-    frame_indexes = [
-        index
-        for index in sorted(candidates_by_frame)
-        if abs(index - start_index) <= search_radius
-    ]
+    exact_frame_candidates = candidates_by_frame.get(start_index) or []
+    if exact_frame_candidates:
+        frame_indexes = [start_index]
+    else:
+        frame_indexes = [
+            index
+            for index in sorted(candidates_by_frame)
+            if abs(index - start_index) <= search_radius
+        ]
     if not frame_indexes:
         frame_indexes = sorted(candidates_by_frame)
         search_radius = max(search_radius, 1)
@@ -933,10 +937,18 @@ def _dynamic_candidate_state(
         and continuity_iou >= 0.55
         and center_score >= 0.72
     )
-    strong_recovery = prompt_similarity >= reid_accept
-    continuous_recovery = appearance_similarity >= reid_recover and (
-        continuity_iou >= 0.12 or center_score >= 0.35
+    same_track_recovery = same_track and appearance_similarity >= reid_recover and (
+        continuity_iou >= 0.08 or center_score >= 0.30
     )
+    handoff_recovery = (
+        not same_track
+        and appearance_similarity >= reid_recover
+        and (continuity_iou >= 0.30 or center_score >= 0.68)
+    )
+    strong_recovery = prompt_similarity >= reid_accept and (
+        same_track or continuity_iou >= 0.30 or center_score >= 0.68
+    )
+    continuous_recovery = same_track_recovery or handoff_recovery
     if not strong_recovery and not continuous_recovery and not continuity_locked:
         reasons.append("low_prompt_anchor_similarity")
     if impossible_motion:
@@ -975,10 +987,28 @@ def _score_dynamic_candidate(
         width=width,
         height=height,
     )
+    center_distance_ratio = 0.0
+    if previous_box is not None:
+        candidate_center = _box_center_xy(candidate["box"])
+        previous_center = _box_center_xy(previous_box)
+        center_distance_ratio = float(
+            np.hypot(
+                candidate_center[0] - previous_center[0],
+                candidate_center[1] - previous_center[1],
+            )
+            / max(width, height, 1)
+        )
     area_score = _area_similarity(candidate["box"], previous_box)
     confidence_score = _clamp(float(candidate.get("confidence") or 0.0), 0.0, 1.0)
     same_track = 1.0 if previous_track_id is not None and int(candidate["track_id"]) == previous_track_id else 0.0
-    impossible_motion = previous_box is not None and continuity_iou < 0.03 and center_score < 0.25
+    impossible_motion = previous_box is not None and (
+        (continuity_iou < 0.03 and center_score < 0.25)
+        or (
+            not bool(same_track)
+            and continuity_iou < 0.30
+            and center_distance_ratio > 0.10
+        )
+    )
     score = (
         0.48 * prompt_similarity
         + 0.12 * memory_similarity

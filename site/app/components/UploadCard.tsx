@@ -44,7 +44,8 @@ type RunnerBox = {
 };
 
 type PromptPreview = {
-  imageUrl: string;
+  videoUrl: string;
+  imageUrl: string | null;
   width: number;
   height: number;
   timeSeconds: number;
@@ -221,69 +222,126 @@ function promptFromBox(preview: PromptPreview, box: RunnerBox): TargetPromptPayl
   };
 }
 
+function waitForVideoEvent(video: HTMLVideoElement, eventName: keyof HTMLMediaElementEventMap, errorMessage: string, timeoutMs = 3500) {
+  return new Promise<void>((resolve, reject) => {
+    const timeout = window.setTimeout(() => {
+      cleanup();
+      reject(new Error(errorMessage));
+    }, timeoutMs);
+    const cleanup = () => {
+      window.clearTimeout(timeout);
+      video.removeEventListener(eventName, handleEvent);
+      video.removeEventListener("error", handleError);
+    };
+    const handleEvent = () => {
+      cleanup();
+      resolve();
+    };
+    const handleError = () => {
+      cleanup();
+      reject(new Error(errorMessage));
+    };
+    video.addEventListener(eventName, handleEvent, { once: true });
+    video.addEventListener("error", handleError, { once: true });
+  });
+}
+
+function waitForDrawableVideoFrame(video: HTMLVideoElement) {
+  const requestFrame = video.requestVideoFrameCallback?.bind(video);
+  if (requestFrame) {
+    return new Promise<void>((resolve) => {
+      const timeout = window.setTimeout(resolve, 500);
+      requestFrame(() => {
+        window.clearTimeout(timeout);
+        resolve();
+      });
+    });
+  }
+
+  return new Promise<void>((resolve) => {
+    window.requestAnimationFrame(() => {
+      window.requestAnimationFrame(() => resolve());
+    });
+  });
+}
+
+async function seekVideoPreview(video: HTMLVideoElement, timeSeconds: number) {
+  if (timeSeconds > 0.01) {
+    const seeked = waitForVideoEvent(video, "seeked", "Could not seek video preview.");
+    video.currentTime = timeSeconds;
+    await seeked;
+  } else if (video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) {
+    await waitForVideoEvent(video, "loadeddata", "Could not load video frame.");
+  }
+
+  await waitForDrawableVideoFrame(video);
+}
+
+function canvasHasVisibleVideoPixels(context: CanvasRenderingContext2D, width: number, height: number) {
+  const sampleWidth = Math.min(width, 160);
+  const sampleHeight = Math.min(height, 90);
+  const sampleCanvas = document.createElement("canvas");
+  sampleCanvas.width = sampleWidth;
+  sampleCanvas.height = sampleHeight;
+  const sampleContext = sampleCanvas.getContext("2d");
+  if (!sampleContext) return true;
+
+  sampleContext.drawImage(context.canvas, 0, 0, sampleWidth, sampleHeight);
+  const pixels = sampleContext.getImageData(0, 0, sampleWidth, sampleHeight).data;
+  let lumaSum = 0;
+  let visiblePixels = 0;
+
+  for (let index = 0; index < pixels.length; index += 4) {
+    const luma = 0.2126 * pixels[index] + 0.7152 * pixels[index + 1] + 0.0722 * pixels[index + 2];
+    lumaSum += luma;
+    if (luma > 8) visiblePixels += 1;
+  }
+
+  const pixelCount = pixels.length / 4;
+  return lumaSum / pixelCount > 10 && visiblePixels / pixelCount > 0.05;
+}
+
+function captureVideoFrameImage(video: HTMLVideoElement, width: number, height: number) {
+  const canvas = document.createElement("canvas");
+  canvas.width = width;
+  canvas.height = height;
+  const context = canvas.getContext("2d");
+  if (!context) return null;
+
+  context.drawImage(video, 0, 0, width, height);
+  if (!canvasHasVisibleVideoPixels(context, width, height)) return null;
+  return canvas.toDataURL("image/jpeg", 0.88);
+}
+
 async function capturePromptPreview(file: File): Promise<PromptPreview> {
   const objectUrl = URL.createObjectURL(file);
   const video = document.createElement("video");
   video.muted = true;
   video.playsInline = true;
-  video.preload = "metadata";
+  video.preload = "auto";
 
   try {
-    await new Promise<void>((resolve, reject) => {
-      video.onloadedmetadata = () => resolve();
-      video.onerror = () => reject(new Error("Could not load video metadata."));
-      video.src = objectUrl;
-      video.load();
-    });
+    video.src = objectUrl;
+    video.load();
+    await waitForVideoEvent(video, "loadedmetadata", "Could not load video metadata.");
 
     const duration = Number.isFinite(video.duration) ? video.duration : 0;
     const timeSeconds = duration > 0.4 ? Math.min(Math.max(duration * 0.38, 0.2), duration - 0.08) : 0;
-
-    if (timeSeconds > 0.01) {
-      await new Promise<void>((resolve, reject) => {
-        const timeout = window.setTimeout(() => reject(new Error("Could not seek video preview.")), 3500);
-        video.onseeked = () => {
-          window.clearTimeout(timeout);
-          resolve();
-        };
-        video.onerror = () => {
-          window.clearTimeout(timeout);
-          reject(new Error("Could not seek video preview."));
-        };
-        video.currentTime = timeSeconds;
-      });
-    } else if (video.readyState < 2) {
-      await new Promise<void>((resolve, reject) => {
-        const timeout = window.setTimeout(() => reject(new Error("Could not load video frame.")), 3500);
-        video.onloadeddata = () => {
-          window.clearTimeout(timeout);
-          resolve();
-        };
-        video.onerror = () => {
-          window.clearTimeout(timeout);
-          reject(new Error("Could not load video frame."));
-        };
-      });
-    }
-
     const width = video.videoWidth || 960;
     const height = video.videoHeight || 540;
-    const canvas = document.createElement("canvas");
-    canvas.width = width;
-    canvas.height = height;
-    const context = canvas.getContext("2d");
-    if (!context) {
-      throw new Error("Could not create preview canvas.");
-    }
-    context.drawImage(video, 0, 0, width, height);
+
+    await seekVideoPreview(video, timeSeconds);
+
     return {
-      imageUrl: canvas.toDataURL("image/jpeg", 0.88),
+      videoUrl: objectUrl,
+      imageUrl: captureVideoFrameImage(video, width, height),
       width,
       height,
       timeSeconds: Number(timeSeconds.toFixed(3)),
     };
-  } finally {
+  } catch (error) {
     URL.revokeObjectURL(objectUrl);
+    throw error;
   }
 }
 
@@ -324,6 +382,7 @@ function RunnerPromptDialog({
 }) {
   const [selectedBox, setSelectedBox] = useState<RunnerBox | null>(initialBox);
   const frameRef = useRef<HTMLDivElement | null>(null);
+  const videoRef = useRef<HTMLVideoElement | null>(null);
   const liveOverlayRef = useRef<HTMLDivElement | null>(null);
   const dragStartRef = useRef<{ x: number; y: number } | null>(null);
 
@@ -339,6 +398,36 @@ function RunnerPromptDialog({
       liveOverlayRef.current.style.opacity = "0";
     }
   }, [selectedBox]);
+
+  useEffect(() => {
+    if (!open || !preview) return;
+    const video = videoRef.current;
+    if (!video) return;
+    let cancelled = false;
+
+    const seekToPromptFrame = () => {
+      if (cancelled) return;
+      video.pause();
+      try {
+        if (Math.abs(video.currentTime - preview.timeSeconds) > 0.04) {
+          video.currentTime = preview.timeSeconds;
+        }
+      } catch {
+        // Some mobile browsers briefly reject currentTime before metadata settles.
+      }
+    };
+
+    if (video.readyState >= HTMLMediaElement.HAVE_METADATA) {
+      seekToPromptFrame();
+    } else {
+      video.addEventListener("loadedmetadata", seekToPromptFrame, { once: true });
+    }
+
+    return () => {
+      cancelled = true;
+      video.removeEventListener("loadedmetadata", seekToPromptFrame);
+    };
+  }, [open, preview]);
 
   if (!open || !preview) return null;
 
@@ -408,7 +497,20 @@ function RunnerPromptDialog({
                 dragStartRef.current = null;
               }}
             >
-              <img className="h-full w-full select-none object-contain" src={preview.imageUrl} alt="Selected video frame" draggable={false} />
+              {preview.imageUrl ? (
+                <img className="pointer-events-none h-full w-full select-none object-contain" src={preview.imageUrl} alt="" draggable={false} aria-hidden="true" />
+              ) : null}
+              <video
+                ref={videoRef}
+                className="pointer-events-none absolute inset-0 h-full w-full select-none object-contain"
+                src={preview.videoUrl}
+                poster={preview.imageUrl ?? undefined}
+                muted
+                playsInline
+                preload="auto"
+                aria-label="Selected video frame"
+                disablePictureInPicture
+              />
               <div ref={liveOverlayRef} className="pointer-events-none absolute rounded-[14px] border-2 border-[#5ce0c3] bg-[#5ce0c3]/12 opacity-0 shadow-[0_0_0_9999px_rgba(0,0,0,0.18)]">
                 <span className="absolute -left-0.5 -top-8 rounded-full bg-[#101113] px-3 py-1 text-[11px] font-semibold text-white shadow-[0_10px_28px_rgba(0,0,0,0.24)]">
                   Analyze this runner
@@ -614,6 +716,13 @@ export function UploadCard() {
 
   useEffect(() => setResult(null), [file]);
 
+  useEffect(() => {
+    const videoUrl = promptPreview?.videoUrl;
+    return () => {
+      if (videoUrl) URL.revokeObjectURL(videoUrl);
+    };
+  }, [promptPreview?.videoUrl]);
+
   async function preparePromptPreview(nextFile: File) {
     const requestId = previewRequestRef.current + 1;
     previewRequestRef.current = requestId;
@@ -624,7 +733,10 @@ export function UploadCard() {
 
     try {
       const preview = await capturePromptPreview(nextFile);
-      if (previewRequestRef.current !== requestId) return;
+      if (previewRequestRef.current !== requestId) {
+        URL.revokeObjectURL(preview.videoUrl);
+        return;
+      }
       setPromptPreview(preview);
       setPromptStatus("ready");
       setMessage("Choose the runner you want analyzed.");

@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import importlib.util
+import logging
 import mimetypes
 import os
 import platform
@@ -38,6 +39,7 @@ from whodoirunlike.sam31_gpu_runner import DEFAULT_SAM31_GPU_MODEL
 from whodoirunlike.sam31_mlx_runner import DEFAULT_SAM31_MLX_MODEL
 
 
+LOGGER = logging.getLogger(__name__)
 DEFAULT_HOSTED_RUN_ROOT = Path(os.getenv("WHODOIRUNLIKE_HOSTED_RUN_ROOT", "artifacts/hosted_runs"))
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEMO_ASSET_ROOT = REPO_ROOT / "site/public/assets/demos"
@@ -58,15 +60,51 @@ DEFAULT_HOSTED_MASK_BACKEND = "sam31_gpu"
 # report boundary; the larger deadline prevents partial status mutations under
 # normal remote-write latency.
 DEFAULT_REPORT_TIMEOUT_SECONDS = 10.0
-# Give the terminal telemetry event at least one full callback deadline plus
-# scheduling/backoff headroom before a Serverless invocation is allowed to end.
-# A degraded callback can therefore extend shutdown by up to 12 seconds.
-DEFAULT_TELEMETRY_DRAIN_TIMEOUT_SECONDS = 12.0
+# The Worker currently persists each event through several serial durable
+# writes. A five-minute processing run can leave roughly 90 events queued even
+# when every callback succeeds. Keep the invocation alive long enough to drain
+# that measured backlog before RunPod's idle shutdown. This can add up to three
+# minutes of billed worker time; batching or parallel delivery should replace
+# the larger safety window once implemented.
+DEFAULT_TELEMETRY_DRAIN_TIMEOUT_SECONDS = 180.0
 DEFAULT_TELEMETRY_SNAPSHOT_TIMEOUT_SECONDS = 0.25
 DEFAULT_CALLBACK_ORIGINS = (
     "https://api.whodoirunlike.com",
     "https://staging-api.whodoirunlike.com",
 )
+
+
+def _close_telemetry_delivery(
+    telemetry: ProcessingTelemetry,
+    *,
+    run_id: str,
+    attempt_id: str,
+) -> bool:
+    timeout = _env_float(
+        "WHODOIRUNLIKE_TELEMETRY_DRAIN_TIMEOUT_SECONDS",
+        DEFAULT_TELEMETRY_DRAIN_TIMEOUT_SECONDS,
+    )
+    delivered = telemetry.close(timeout=timeout)
+    if delivered:
+        return True
+
+    # Only validated identifiers, the configured deadline, and integer counters
+    # are logged. Event bodies, callback URLs, headers, and secrets stay out of
+    # the diagnostic record.
+    diagnostic = {
+        "event": "processing_telemetry_drain_exhausted",
+        "run_id": run_id,
+        "attempt_id": attempt_id,
+        "timeout_seconds": timeout,
+        **telemetry.delivery_measurements(),
+    }
+    LOGGER.error(
+        "Processing telemetry drain exhausted: %s",
+        json.dumps(diagnostic, separators=(",", ":"), sort_keys=True),
+    )
+    return False
+
+
 DEVELOPMENT_CALLBACK_ORIGINS = (
     "http://127.0.0.1:8787",
     "http://localhost:8787",
@@ -1243,11 +1281,10 @@ def process_hosted_job(payload: WorkerJobRequest, *, raise_on_error: bool = Fals
             "elapsed_seconds": round(time.monotonic() - started, 3),
         }
     finally:
-        telemetry.close(
-            timeout=_env_float(
-                "WHODOIRUNLIKE_TELEMETRY_DRAIN_TIMEOUT_SECONDS",
-                DEFAULT_TELEMETRY_DRAIN_TIMEOUT_SECONDS,
-            )
+        _close_telemetry_delivery(
+            telemetry,
+            run_id=payload.run_id,
+            attempt_id=attempt_id,
         )
 
 

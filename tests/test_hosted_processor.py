@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -893,7 +894,7 @@ def test_process_hosted_job_emits_complete_lifecycle_with_worker_attempt_id(
         for report in reports
     )
     assert terminal_seen_before_final_report == [True]
-    assert close_timeouts == [12.0]
+    assert close_timeouts == [180.0]
     events_path = run_root / payload.run_id / "processing_events.jsonl"
     events = [json.loads(line) for line in events_path.read_text().splitlines()]
     event_types = [event["event_type"] for event in events]
@@ -921,6 +922,50 @@ def test_process_hosted_job_emits_complete_lifecycle_with_worker_attempt_id(
     assert [
         event["stage"] for event in events if event["event_type"] == "stage_started"
     ] == ["source_download", "run_preparation", "analysis_complete", "artifact_publish"]
+
+
+def test_close_telemetry_delivery_logs_sanitized_counters_when_drain_expires(
+    monkeypatch: Any,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    from whodoirunlike import hosted_processor
+
+    class UndrainedTelemetry:
+        def __init__(self) -> None:
+            self.close_timeouts: list[float] = []
+
+        def close(self, *, timeout: float) -> bool:
+            self.close_timeouts.append(timeout)
+            return False
+
+        def delivery_measurements(self) -> dict[str, int]:
+            return {
+                "telemetry_delivery_pending": 9,
+                "telemetry_delivery_failures": 2,
+                "telemetry_delivery_dropped": 1,
+                "telemetry_local_write_failures": 0,
+            }
+
+    telemetry = UndrainedTelemetry()
+    monkeypatch.delenv("WHODOIRUNLIKE_TELEMETRY_DRAIN_TIMEOUT_SECONDS", raising=False)
+
+    with caplog.at_level(logging.ERROR, logger=hosted_processor.__name__):
+        delivered = hosted_processor._close_telemetry_delivery(
+            telemetry,  # type: ignore[arg-type]
+            run_id="12345678-1234-4234-9234-123456789abc",
+            attempt_id="77777777-7777-4777-8777-777777777777",
+        )
+
+    assert delivered is False
+    assert telemetry.close_timeouts == [180.0]
+    assert len(caplog.records) == 1
+    message = caplog.records[0].getMessage()
+    assert '"event":"processing_telemetry_drain_exhausted"' in message
+    assert '"run_id":"12345678-1234-4234-9234-123456789abc"' in message
+    assert '"attempt_id":"77777777-7777-4777-8777-777777777777"' in message
+    assert '"telemetry_delivery_pending":9' in message
+    assert '"telemetry_delivery_failures":2' in message
+    assert "secret" not in message.lower()
 
 
 def test_process_hosted_job_emits_failed_stage_and_attempt_on_processing_error(

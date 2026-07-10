@@ -394,7 +394,7 @@ def test_async_sender_close_drains_slow_terminal_success(tmp_path: Path) -> None
 
     def close_telemetry() -> None:
         close_started.set()
-        close_results.append(telemetry.close(timeout=12.0))
+        close_results.append(telemetry.close(timeout=180.0))
 
     close_thread = threading.Thread(target=close_telemetry)
     close_thread.start()

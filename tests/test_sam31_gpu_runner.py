@@ -18,6 +18,7 @@ from whodoirunlike.sam31_gpu_runner import (
     _patch_multiplex_init_state_kwargs,
     _prompt_points_with_box_support,
     _seed_points_for_frame,
+    _strict_mask_from_outputs,
     _support_points_from_box,
     _track_prompt_anchors,
     update_manifest_after_sam31_gpu,
@@ -52,6 +53,15 @@ def test_mask_from_outputs_falls_back_to_first_nonempty_mask() -> None:
 
     assert mask is not None
     assert mask.tolist() == [[0, 0], [1, 0]]
+
+
+def test_strict_mask_from_outputs_does_not_fall_back_to_another_object() -> None:
+    outputs = {
+        "out_obj_ids": np.array([3]),
+        "out_binary_masks": np.array([[[0, 0], [1, 0]]], dtype=np.uint8),
+    }
+
+    assert _strict_mask_from_outputs(outputs, obj_id=1) is None
 
 
 def test_first_nonempty_output_object_id_uses_mask_content() -> None:
@@ -427,3 +437,98 @@ def test_collect_sam31_masks_seeds_from_first_target_track_frame(
     assert np.asarray(point_prompt["points"]).tolist() == expected_points.tolist()
     assert predictor.stream_requests[0]["start_frame_index"] == 0
     assert predictor.stream_requests[0]["propagation_direction"] == "forward"
+
+
+def test_collect_sam31_masks_preseeds_track_anchors_before_single_propagation(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    class FakeInferenceMode:
+        def __enter__(self) -> None:
+            return None
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+    fake_torch = types.SimpleNamespace(
+        float32="float32",
+        int32="int32",
+        tensor=lambda data, **_kwargs: np.asarray(data),
+        inference_mode=lambda: FakeInferenceMode(),
+    )
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+
+    class FakePredictor:
+        def __init__(self) -> None:
+            self.events: list[tuple[str, int | None]] = []
+
+        def handle_request(self, *, request: dict[str, object]) -> dict[str, object]:
+            request_type = str(request["type"])
+            if request_type == "start_session":
+                self.events.append((request_type, None))
+                return {"session_id": "session-1"}
+            if request_type == "close_session":
+                self.events.append((request_type, None))
+                return {}
+            if request_type == "add_prompt":
+                frame_index = int(request["frame_index"])
+                self.events.append((request_type, frame_index))
+                return {
+                    "outputs": {
+                        "out_obj_ids": np.array([1]),
+                        "out_binary_masks": np.array([[[1, 0], [0, 0]]], dtype=np.uint8),
+                    }
+                }
+            raise AssertionError(f"unexpected request: {request_type}")
+
+        def handle_stream_request(self, *, request: dict[str, object]) -> list[dict[str, object]]:
+            self.events.append(("propagate_in_video", int(request["start_frame_index"])))
+            return [
+                {
+                    "frame_index": frame_index,
+                    "outputs": {
+                        "out_obj_ids": np.array([1]),
+                        "out_binary_masks": np.array([[[1, 1], [0, 0]]], dtype=np.uint8),
+                    },
+                }
+                for frame_index in range(6)
+            ]
+
+    predictor = FakePredictor()
+    boxes = {
+        frame_index: np.array([0, 0, 2, 2], dtype=np.float32) for frame_index in range(6)
+    }
+    masks, diagnostics = _collect_sam31_masks(
+        predictor=predictor,
+        video_path=tmp_path / "clip.mp4",
+        prompt={
+            "frame_index": 0,
+            "box": np.array([0, 0, 2, 2], dtype=np.float32),
+            "points": np.array([[1, 1]], dtype=np.float32),
+            "labels": np.array([1], dtype=np.int32),
+        },
+        width=2,
+        height=2,
+        frame_count=6,
+        obj_id=1,
+        track_boxes=boxes,
+        strategy="preseed_single_pass",
+        max_anchors=3,
+        strict_obj_id=True,
+    )
+
+    propagation_positions = [
+        index for index, event in enumerate(predictor.events) if event[0] == "propagate_in_video"
+    ]
+    anchor_positions = [
+        index
+        for index, event in enumerate(predictor.events)
+        if event[0] == "add_prompt" and event[1] in {2, 4}
+    ]
+    assert len(propagation_positions) == 1
+    assert anchor_positions
+    assert max(anchor_positions) < propagation_positions[0]
+    assert diagnostics["preseed_anchor_frames"] == [0, 2, 4]
+    assert diagnostics["anchor_refinement_triggered"] is False
+    assert len(diagnostics["propagation"]) == 1
+    assert sorted(masks) == list(range(6))

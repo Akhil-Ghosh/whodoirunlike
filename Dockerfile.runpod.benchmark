@@ -1,0 +1,17 @@
+FROM ghcr.io/akhil-ghosh/whodoirunlike-runpod-processor@sha256:e1d869de70ec62244c488d1d017aee94d075746488812ffcd67addf82181ed6e
+
+ARG WHODOIRUNLIKE_PROCESSOR_VERSION=unknown
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    WHODOIRUNLIKE_ENABLE_SAM31_BENCHMARK=true \
+    WHODOIRUNLIKE_ENVIRONMENT=benchmark \
+    WHODOIRUNLIKE_PROCESSOR_VERSION=${WHODOIRUNLIKE_PROCESSOR_VERSION}
+
+WORKDIR /app
+
+# The immutable base is the production-tested processor image. Only branch code
+# and the benchmark-only entry point change, preserving its exact CUDA/SAM stack.
+COPY src ./src
+
+CMD ["python", "-m", "whodoirunlike.sam31_benchmark_serverless"]

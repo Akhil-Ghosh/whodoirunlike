@@ -1,4 +1,4 @@
-name: Build RunPod Processor
+name: Build RunPod SAM 3.1 Speed Lab
 
 on:
   workflow_dispatch:
@@ -41,11 +41,10 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: Dockerfile.runpod
+          file: Dockerfile.runpod.benchmark
           push: true
           build-args: |
             WHODOIRUNLIKE_PROCESSOR_VERSION=${{ github.sha }}
           tags: |
-            ${{ env.IMAGE_NAME }}:latest
-            ${{ env.IMAGE_NAME }}:${{ github.sha }}
+            ${{ env.IMAGE_NAME }}:sam31-speed-lab-${{ github.sha }}
           provenance: false

@@ -22,6 +22,8 @@ DEFAULT_SAM31_GPU_MODEL = "facebook/sam3.1"
 DEFAULT_SAM31_GPU_OBJ_ID = 1
 DEFAULT_SAM31_GPU_TRACK_PROMPT_ANCHORS = 6
 DEFAULT_SAM31_GPU_DISABLE_DEMO_SUPPRESSION = True
+SAM31_GPU_STRATEGY_PRODUCTION_CONTROL = "production_control"
+SAM31_GPU_STRATEGY_PRESEED_SINGLE_PASS = "preseed_single_pass"
 Sam31GpuProgressCallback = Callable[[dict[str, Any]], None]
 
 
@@ -249,6 +251,34 @@ def _mask_from_outputs(outputs: dict[str, Any], *, obj_id: int) -> np.ndarray | 
     return (fallback > 0).astype("uint8") if fallback is not None else None
 
 
+def _strict_mask_from_outputs(outputs: dict[str, Any], *, obj_id: int) -> np.ndarray | None:
+    """Return only the requested object's mask.
+
+    Production historically falls back to the first non-empty object. The speed
+    benchmark intentionally disables that behavior so a wrong runner cannot look
+    like a successful optimization.
+    """
+    obj_ids = outputs.get("out_obj_ids")
+    masks = outputs.get("out_binary_masks")
+    if obj_ids is None or masks is None:
+        return None
+
+    ids = _as_numpy(obj_ids).reshape(-1).tolist()
+    for index, raw_id in enumerate(ids):
+        if int(raw_id) != obj_id:
+            continue
+        mask = np.squeeze(_as_numpy(masks[index]))
+        return (mask > 0).astype("uint8") if mask.any() else None
+    return None
+
+
+def _synchronize_cuda(torch_module: Any) -> None:
+    cuda = getattr(torch_module, "cuda", None)
+    synchronize = getattr(cuda, "synchronize", None)
+    if callable(synchronize):
+        synchronize()
+
+
 def _first_nonempty_output_object_id(outputs: dict[str, Any]) -> int | None:
     obj_ids = outputs.get("out_obj_ids")
     masks = outputs.get("out_binary_masks")
@@ -318,9 +348,15 @@ def _collect_stream_masks(
     masks_by_frame: dict[int, np.ndarray],
     direction: str,
     progress_callback: Callable[[int, int, str], None] | None = None,
+    strict_obj_id: bool = False,
 ) -> dict[str, Any]:
+    import torch
+
     responses = 0
     masks = 0
+    object_id_mismatches = 0
+    _synchronize_cuda(torch)
+    started_at = time.perf_counter()
     try:
         for stream_response in predictor.handle_stream_request(
             request={
@@ -332,10 +368,14 @@ def _collect_stream_masks(
         ):
             responses += 1
             frame_index = int(stream_response["frame_index"])
-            mask = _mask_from_outputs(
-                stream_response.get("outputs", {}),
+            outputs = stream_response.get("outputs") or {}
+            mask_reader = _strict_mask_from_outputs if strict_obj_id else _mask_from_outputs
+            mask = mask_reader(
+                outputs,
                 obj_id=active_obj_id,
             )
+            if strict_obj_id and mask is None and _first_nonempty_output_object_id(outputs) is not None:
+                object_id_mismatches += 1
             if mask is not None:
                 masks_by_frame[frame_index] = mask
                 masks += 1
@@ -348,9 +388,19 @@ def _collect_stream_masks(
             "direction": direction,
             "responses": responses,
             "masks": masks,
+            "object_id_mismatches": object_id_mismatches,
+            "elapsed_seconds": round(time.perf_counter() - started_at, 6),
             "warning": str(exc),
         }
-    return {"direction": direction, "responses": responses, "masks": masks}
+    finally:
+        _synchronize_cuda(torch)
+    return {
+        "direction": direction,
+        "responses": responses,
+        "masks": masks,
+        "object_id_mismatches": object_id_mismatches,
+        "elapsed_seconds": round(time.perf_counter() - started_at, 6),
+    }
 
 
 def _propagate_from_seed_frame(
@@ -363,6 +413,7 @@ def _propagate_from_seed_frame(
     label: str,
     directions: tuple[str, ...] = ("forward", "backward"),
     progress_callback: Callable[[int, int, str], None] | None = None,
+    strict_obj_id: bool = False,
 ) -> list[dict[str, Any]]:
     diagnostics = []
     for direction in directions:
@@ -374,6 +425,7 @@ def _propagate_from_seed_frame(
             masks_by_frame=masks_by_frame,
             direction=direction,
             progress_callback=progress_callback,
+            strict_obj_id=strict_obj_id,
         )
         result["pass"] = label
         diagnostics.append(result)
@@ -391,15 +443,35 @@ def _collect_sam31_masks(
     obj_id: int,
     track_boxes: dict[int, np.ndarray] | None = None,
     progress_callback: Callable[[int, int, str], None] | None = None,
+    strategy: str = SAM31_GPU_STRATEGY_PRODUCTION_CONTROL,
+    max_anchors: int = DEFAULT_SAM31_GPU_TRACK_PROMPT_ANCHORS,
+    offload_video_to_cpu: bool = False,
+    offload_state_to_cpu: bool = False,
+    strict_obj_id: bool = False,
 ) -> tuple[dict[int, np.ndarray], dict[str, Any]]:
     import torch
 
+    valid_strategies = {
+        SAM31_GPU_STRATEGY_PRODUCTION_CONTROL,
+        SAM31_GPU_STRATEGY_PRESEED_SINGLE_PASS,
+    }
+    if strategy not in valid_strategies:
+        raise ValueError(f"Unsupported SAM 3.1 propagation strategy: {strategy}")
+
+    start_session_request: dict[str, Any] = {
+        "type": "start_session",
+        "resource_path": str(video_path),
+    }
+    if offload_video_to_cpu:
+        start_session_request["offload_video_to_cpu"] = True
+    if offload_state_to_cpu:
+        start_session_request["offload_state_to_cpu"] = True
+    _synchronize_cuda(torch)
+    start_session_started_at = time.perf_counter()
     response = predictor.handle_request(
-        request={
-            "type": "start_session",
-            "resource_path": str(video_path),
-        }
+        request=start_session_request
     )
+    _synchronize_cuda(torch)
     session_id = response["session_id"]
     masks_by_frame: dict[int, np.ndarray] = {}
     diagnostics: dict[str, Any] = {
@@ -407,6 +479,11 @@ def _collect_sam31_masks(
         "active_obj_id": obj_id,
         "visual_box_prompt": False,
         "propagation": [],
+        "strategy": strategy,
+        "timings_seconds": {
+            "start_session": round(time.perf_counter() - start_session_started_at, 6),
+        },
+        "strict_obj_id": strict_obj_id,
     }
     try:
         prompt_frame = max(0, min(int(prompt["frame_index"]), max(frame_count - 1, 0)))
@@ -446,6 +523,8 @@ def _collect_sam31_masks(
 
         with torch.inference_mode():
             active_obj_id = obj_id
+            _synchronize_cuda(torch)
+            seed_prompt_started_at = time.perf_counter()
             if visual_box is not None:
                 diagnostics["visual_box_prompt"] = True
                 box_response = predictor.handle_request(
@@ -460,13 +539,14 @@ def _collect_sam31_masks(
                         ),
                     }
                 )
-                box_outputs = box_response.get("outputs", {})
+                box_outputs = box_response.get("outputs") or {}
                 box_obj_id = _first_nonempty_output_object_id(box_outputs)
                 if box_obj_id is not None:
                     active_obj_id = box_obj_id
                     diagnostics["visual_box_obj_id"] = box_obj_id
                     diagnostics["active_obj_id"] = active_obj_id
-                box_mask = _mask_from_outputs(box_outputs, obj_id=active_obj_id)
+                mask_reader = _strict_mask_from_outputs if strict_obj_id else _mask_from_outputs
+                box_mask = mask_reader(box_outputs, obj_id=active_obj_id)
                 if box_mask is not None:
                     masks_by_frame[seed_frame] = box_mask
 
@@ -488,15 +568,69 @@ def _collect_sam31_masks(
                     **prompt_inputs,
                 }
             )
-            prompt_outputs = prompt_response.get("outputs", {})
+            prompt_outputs = prompt_response.get("outputs") or {}
             prompt_obj_id = _first_nonempty_output_object_id(prompt_outputs)
             if prompt_obj_id is not None:
                 active_obj_id = prompt_obj_id
                 diagnostics["point_prompt_obj_id"] = prompt_obj_id
                 diagnostics["active_obj_id"] = active_obj_id
-            prompt_mask = _mask_from_outputs(prompt_outputs, obj_id=active_obj_id)
+            mask_reader = _strict_mask_from_outputs if strict_obj_id else _mask_from_outputs
+            prompt_mask = mask_reader(prompt_outputs, obj_id=active_obj_id)
             if prompt_mask is not None:
                 masks_by_frame[seed_frame] = prompt_mask
+            _synchronize_cuda(torch)
+            diagnostics["timings_seconds"]["seed_prompts"] = round(
+                time.perf_counter() - seed_prompt_started_at,
+                6,
+            )
+
+            preseed_anchors = strategy == SAM31_GPU_STRATEGY_PRESEED_SINGLE_PASS
+            anchor_frames = (
+                _track_prompt_anchors(
+                    prompt_frame=seed_frame,
+                    frame_count=frame_count,
+                    track_boxes=track_boxes or {},
+                    max_anchors=max_anchors,
+                )
+                if preseed_anchors and track_boxes
+                else []
+            )
+            if preseed_anchors and not anchor_frames:
+                raise ValueError("preseed_single_pass requires usable identity track boxes")
+            diagnostics["preseed_anchor_frames"] = anchor_frames
+            if anchor_frames:
+                _synchronize_cuda(torch)
+                anchor_started_at = time.perf_counter()
+                for anchor_frame in anchor_frames:
+                    if anchor_frame == seed_frame:
+                        continue
+                    points = _support_points_from_box(track_boxes[anchor_frame])
+                    labels = np.ones(len(points), dtype=np.int32)
+                    anchor_response = predictor.handle_request(
+                        request={
+                            "type": "add_prompt",
+                            "session_id": session_id,
+                            "frame_index": anchor_frame,
+                            "obj_id": active_obj_id,
+                            **_point_prompt_tensors(
+                                points=points,
+                                labels=labels,
+                                width=width,
+                                height=height,
+                            ),
+                        }
+                    )
+                    anchor_mask = mask_reader(
+                        anchor_response.get("outputs") or {},
+                        obj_id=active_obj_id,
+                    )
+                    if anchor_mask is not None:
+                        masks_by_frame[anchor_frame] = anchor_mask
+                _synchronize_cuda(torch)
+                diagnostics["timings_seconds"]["anchor_prompts"] = round(
+                    time.perf_counter() - anchor_started_at,
+                    6,
+                )
 
             diagnostics["propagation"].extend(
                 _propagate_from_seed_frame(
@@ -508,12 +642,16 @@ def _collect_sam31_masks(
                     label="primary_prompt",
                     directions=("forward",) if seed_frame == 0 else ("forward", "backward"),
                     progress_callback=progress_callback,
+                    strict_obj_id=strict_obj_id,
                 )
             )
 
             track_frame_target = len(track_boxes or {}) or frame_count
             anchor_refine_threshold = max(12, int(track_frame_target * 0.65))
-            needs_anchor_refinement = len(masks_by_frame) < anchor_refine_threshold
+            needs_anchor_refinement = (
+                strategy == SAM31_GPU_STRATEGY_PRODUCTION_CONTROL
+                and len(masks_by_frame) < anchor_refine_threshold
+            )
             diagnostics["anchor_refinement_threshold"] = anchor_refine_threshold
             diagnostics["anchor_refinement_triggered"] = needs_anchor_refinement
             if track_boxes:
@@ -522,6 +660,7 @@ def _collect_sam31_masks(
                         prompt_frame=seed_frame,
                         frame_count=frame_count,
                         track_boxes=track_boxes,
+                        max_anchors=max_anchors,
                     )
                     if needs_anchor_refinement
                     else []
@@ -546,8 +685,8 @@ def _collect_sam31_masks(
                             ),
                         }
                     )
-                    anchor_mask = _mask_from_outputs(
-                        anchor_response.get("outputs", {}),
+                    anchor_mask = mask_reader(
+                        anchor_response.get("outputs") or {},
                         obj_id=active_obj_id,
                     )
                     if anchor_mask is not None:
@@ -564,16 +703,24 @@ def _collect_sam31_masks(
                             label="anchor_refinement",
                             directions=("forward",) if seed_frame == 0 else ("forward", "backward"),
                             progress_callback=progress_callback,
+                            strict_obj_id=strict_obj_id,
                         )
                     )
             else:
                 diagnostics["anchor_refinement_frames"] = []
     finally:
+        _synchronize_cuda(torch)
+        cleanup_started_at = time.perf_counter()
         predictor.handle_request(
             request={
                 "type": "close_session",
                 "session_id": session_id,
             }
+        )
+        _synchronize_cuda(torch)
+        diagnostics["timings_seconds"]["close_session"] = round(
+            time.perf_counter() - cleanup_started_at,
+            6,
         )
     return masks_by_frame, diagnostics
 

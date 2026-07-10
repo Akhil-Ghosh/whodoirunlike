@@ -78,3 +78,20 @@ jobs:
         run: npm test
       - name: Synthesize CloudFormation
         run: npm run synth >/dev/null
+
+  analytics-dashboard:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: analytics-dashboard
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: analytics-dashboard/package-lock.json
+      - name: Install dependencies
+        run: npm ci
+      - name: Test, typecheck, and dry-run deploy
+        run: npm run check

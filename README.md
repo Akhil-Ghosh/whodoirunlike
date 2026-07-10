@@ -19,6 +19,7 @@ Live site: [whodoirunlike.com](https://whodoirunlike.com)
 - RunPod Serverless GPU processor for identity tracking, SAM 3.1 runner masks, pose, DensePose, fusion, and QC.
 - Attempt, stage, span, resource, and five-second progress telemetry with an R2 operational timeline.
 - Private AWS analytics adapter using API Gateway, FIFO SQS, Lambda, S3, Glue, and Athena.
+- Private processing dashboard at [analytics.whodoirunlike.com](https://analytics.whodoirunlike.com) for stage tails, attempt waterfalls, stalls, and sanitized failures.
 - Local FastAPI path for quick short-clip pose artifact checks.
 - Offline scripts for candidate clip discovery, review, and curation.
 
@@ -62,6 +63,7 @@ uv run --extra dev ruff check src tests scripts
 cd site && npm run typecheck && npm run build:pages
 cd worker && npm run check
 cd infra/analytics && npm test && npm run synth
+cd analytics-dashboard && npm run check
 ```
 
 ## Deploy notes
@@ -75,12 +77,12 @@ Build output directory: out
 Production branch: main
 ```
 
-Worker and processor setup live in:
+Hosted-service setup references:
 
 - [worker/README.md](worker/README.md)
 - [site/README.md](site/README.md)
-- [docs/runpod-serverless.md](docs/runpod-serverless.md)
 - [infra/analytics/README.md](infra/analytics/README.md)
+- [analytics-dashboard/README.md](analytics-dashboard/README.md)
 
 ## Repo map
 
@@ -88,6 +90,7 @@ Worker and processor setup live in:
 site/                         Next.js technical-preview site
 worker/                       Cloudflare Worker for uploads, jobs, and R2 artifacts
 infra/analytics/              private AWS processing-metadata analytics adapter
+analytics-dashboard/          private Cloudflare-hosted Athena analytics UI and query proxy
 src/whodoirunlike/api.py      local FastAPI upload endpoint
 src/whodoirunlike/full_pipeline.py
                               identity, SAM, pose, DensePose, fusion, features, QC
@@ -97,7 +100,7 @@ src/whodoirunlike/runpod_serverless.py
                               RunPod Serverless entrypoint
 scripts/                      ingestion, review, smoke-test, and curation commands
 schemas/                      JSON contracts for clips, runners, artifacts, and QC
-docs/                         design notes and deployment plans
+docs/adr/                     public architectural decision records
 ```
 
 ## Limits

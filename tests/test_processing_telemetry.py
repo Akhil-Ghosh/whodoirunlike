@@ -260,6 +260,7 @@ def test_worker_event_post_is_authenticated_and_local_write_happens_first(
     clock = FakeClock()
     local_path = tmp_path / "events.jsonl"
     requests: list[Any] = []
+    observed_timeouts: list[float] = []
 
     class FakeResponse:
         def __enter__(self) -> FakeResponse:
@@ -270,10 +271,11 @@ def test_worker_event_post_is_authenticated_and_local_write_happens_first(
 
     def fake_urlopen(request: Any, *, timeout: float) -> FakeResponse:
         assert local_path.read_text(encoding="utf-8").strip()
-        assert timeout == processing_telemetry.DEFAULT_DELIVERY_TIMEOUT_SECONDS
+        observed_timeouts.append(timeout)
         requests.append(request)
         return FakeResponse()
 
+    monkeypatch.delenv("WHODOIRUNLIKE_TELEMETRY_DELIVERY_TIMEOUT_SECONDS", raising=False)
     monkeypatch.setattr(processing_telemetry.urllib.request, "urlopen", fake_urlopen)
     telemetry = processing_telemetry.ProcessingTelemetry(
         run_id="12345678-1234-4234-9234-123456789abc",
@@ -290,6 +292,7 @@ def test_worker_event_post_is_authenticated_and_local_write_happens_first(
     telemetry.attempt_started()
 
     assert len(requests) == 1
+    assert observed_timeouts == [10.0]
     request = requests[0]
     assert request.full_url.endswith(
         "/v1/jobs/12345678-1234-4234-9234-123456789abc/events"
@@ -364,6 +367,46 @@ def test_async_sender_keeps_delivery_off_caller_thread(tmp_path: Path) -> None:
     assert telemetry.close(timeout=1.0) is True
     assert sender_threads == ["processing-telemetry-sender"]
     assert sender_threads[0] != caller_thread
+
+
+def test_async_sender_close_drains_slow_terminal_success(tmp_path: Path) -> None:
+    sender_started = threading.Event()
+    release_sender = threading.Event()
+    close_started = threading.Event()
+    delivered: list[str] = []
+    close_results: list[bool] = []
+
+    def slow_sender(event: dict[str, Any]) -> None:
+        sender_started.set()
+        assert release_sender.wait(timeout=1.0)
+        delivered.append(event["event_type"])
+
+    telemetry = processing_telemetry.ProcessingTelemetry(
+        run_id="12345678-1234-4234-9234-123456789abc",
+        attempt_id=ATTEMPT_ID,
+        local_path=tmp_path / "events.jsonl",
+        event_sender=slow_sender,
+        asynchronous_delivery=True,
+        resource_sampler=lambda: {},
+    )
+    telemetry.attempt_completed()
+    assert sender_started.wait(timeout=1.0)
+
+    def close_telemetry() -> None:
+        close_started.set()
+        close_results.append(telemetry.close(timeout=12.0))
+
+    close_thread = threading.Thread(target=close_telemetry)
+    close_thread.start()
+    assert close_started.wait(timeout=1.0)
+    assert close_thread.is_alive()
+
+    release_sender.set()
+    close_thread.join(timeout=1.0)
+
+    assert close_thread.is_alive() is False
+    assert close_results == [True]
+    assert delivered == ["attempt_completed"]
 
 
 def test_async_sender_opens_circuit_and_counts_drops_after_repeated_failures(

@@ -10,10 +10,12 @@ venv/
 node_modules/
 .next/
 out/
+/analytics-dashboard/dist/
 .wrangler/
 *.tsbuildinfo
 .dev.vars
 worker/worker-configuration.d.ts
+/analytics-dashboard/worker-configuration.d.ts
 
 # Local agent context and instructions
 CONTEXT.md
@@ -26,6 +28,7 @@ docs/agents/
 skills-lock.json
 
 # Local-only architecture and analytics working notes
+/internal-docs/
 docs/adr/0002-keep-processing-on-runpod-and-export-analytics-to-aws.md
 docs/processing-analytics-dashboard.md
 docs/processing-observability-plan.md
@@ -40,6 +43,7 @@ models/**
 !models/.gitkeep
 
 # Local secrets
+/.secrets/
 .env
 .env.*
 !.env.example

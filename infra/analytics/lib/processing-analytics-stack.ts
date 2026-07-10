@@ -113,6 +113,11 @@ export class ProcessingAnalyticsStack extends cdk.Stack {
           prefix: "athena-results/",
           expiration: cdk.Duration.days(30),
         },
+        {
+          id: "expire-dashboard-results",
+          prefix: "dashboard-results/",
+          expiration: cdk.Duration.days(7),
+        },
       ],
     });
 
@@ -137,6 +142,11 @@ export class ProcessingAnalyticsStack extends cdk.Stack {
 
     const ingestSecret = new secretsmanager.Secret(this, "IngestHmacSecret", {
       description: "HMAC secret used only by the Cloudflare Worker analytics exporter",
+      generateSecretString: { excludePunctuation: true, passwordLength: 64 },
+      removalPolicy: cdk.RemovalPolicy.RETAIN_ON_UPDATE_OR_DELETE,
+    });
+    const dashboardSecret = new secretsmanager.Secret(this, "DashboardHmacSecret", {
+      description: "HMAC secret used only by the private dashboard Cloudflare Worker",
       generateSecretString: { excludePunctuation: true, passwordLength: 64 },
       removalPolicy: cdk.RemovalPolicy.RETAIN_ON_UPDATE_OR_DELETE,
     });
@@ -353,6 +363,151 @@ export class ProcessingAnalyticsStack extends cdk.Stack {
         },
       },
     });
+
+    const dashboardWorkGroup = new athena.CfnWorkGroup(this, "DashboardWorkGroup", {
+      name: "whodoirunlike-dashboard",
+      description: "Strictly allowlisted, cost-bounded queries for the private analytics UI",
+      recursiveDeleteOption: false,
+      state: "ENABLED",
+      workGroupConfiguration: {
+        bytesScannedCutoffPerQuery: 268_435_456,
+        enforceWorkGroupConfiguration: true,
+        engineVersion: { selectedEngineVersion: "Athena engine version 3" },
+        publishCloudWatchMetricsEnabled: true,
+        requesterPaysEnabled: false,
+        resultConfiguration: {
+          outputLocation: `s3://${dataBucket.bucketName}/dashboard-results/`,
+          encryptionConfiguration: { encryptionOption: "SSE_S3" },
+        },
+      },
+    });
+
+    const dashboardQueryLogGroup = new logs.LogGroup(this, "DashboardQueryFunctionLogs", {
+      retention: logs.RetentionDays.ONE_MONTH,
+      removalPolicy: cdk.RemovalPolicy.DESTROY,
+    });
+    const dashboardQueryFunction = new lambda.Function(this, "DashboardQueryFunction", {
+      runtime: lambda.Runtime.PYTHON_3_12,
+      architecture: lambda.Architecture.ARM_64,
+      code: lambda.Code.fromAsset(lambdaSource),
+      handler: "dashboard_api.handler",
+      timeout: cdk.Duration.seconds(15),
+      memorySize: 256,
+      tracing: lambda.Tracing.ACTIVE,
+      logGroup: dashboardQueryLogGroup,
+      environment: {
+        ATHENA_DATABASE: databaseName,
+        ATHENA_TABLE: tableName,
+        ATHENA_WORKGROUP: dashboardWorkGroup.name,
+        ATHENA_RESULT_REUSE_MINUTES: "1",
+        DASHBOARD_SECRET_ARN: dashboardSecret.secretArn,
+        MAX_CLOCK_SKEW_SECONDS: "300",
+      },
+    });
+    dashboardSecret.grantRead(dashboardQueryFunction);
+    const dashboardWorkGroupArn = cdk.Stack.of(this).formatArn({
+      service: "athena",
+      resource: "workgroup",
+      resourceName: dashboardWorkGroup.name,
+    });
+    dashboardQueryFunction.addToRolePolicy(
+      new iam.PolicyStatement({
+        actions: ["athena:GetQueryExecution", "athena:GetQueryResults", "athena:StartQueryExecution"],
+        resources: [dashboardWorkGroupArn],
+      }),
+    );
+    dashboardQueryFunction.addToRolePolicy(
+      new iam.PolicyStatement({
+        actions: ["glue:GetDatabase", "glue:GetTable", "glue:GetPartitions"],
+        resources: [
+          cdk.Stack.of(this).formatArn({ service: "glue", resource: "catalog" }),
+          cdk.Stack.of(this).formatArn({
+            service: "glue",
+            resource: "database",
+            resourceName: databaseName,
+          }),
+          cdk.Stack.of(this).formatArn({
+            service: "glue",
+            resource: "table",
+            resourceName: `${databaseName}/${tableName}`,
+          }),
+        ],
+      }),
+    );
+    dashboardQueryFunction.addToRolePolicy(
+      new iam.PolicyStatement({
+        actions: ["s3:GetBucketLocation"],
+        resources: [dataBucket.bucketArn],
+      }),
+    );
+    dashboardQueryFunction.addToRolePolicy(
+      new iam.PolicyStatement({
+        actions: ["s3:ListBucket"],
+        resources: [dataBucket.bucketArn],
+        conditions: {
+          StringLike: {
+            "s3:prefix": ["validated/*", "dashboard-results/*"],
+          },
+        },
+      }),
+    );
+    dashboardQueryFunction.addToRolePolicy(
+      new iam.PolicyStatement({
+        actions: ["s3:GetObject"],
+        resources: [
+          dataBucket.arnForObjects("validated/*"),
+          dataBucket.arnForObjects("dashboard-results/*"),
+        ],
+      }),
+    );
+    dashboardQueryFunction.addToRolePolicy(
+      new iam.PolicyStatement({
+        actions: ["s3:AbortMultipartUpload", "s3:PutObject"],
+        resources: [dataBucket.arnForObjects("dashboard-results/*")],
+      }),
+    );
+
+    const dashboardApiAccessLogs = new logs.LogGroup(this, "DashboardApiAccessLogs", {
+      retention: logs.RetentionDays.ONE_MONTH,
+      removalPolicy: cdk.RemovalPolicy.DESTROY,
+    });
+    const dashboardApi = new apigateway.RestApi(this, "DashboardApi", {
+      description: "HMAC-authenticated API for private processing analytics",
+      cloudWatchRole: false,
+      deployOptions: {
+        stageName: "v1",
+        accessLogDestination: new apigateway.LogGroupLogDestination(dashboardApiAccessLogs),
+        accessLogFormat: apigateway.AccessLogFormat.jsonWithStandardFields({
+          caller: false,
+          httpMethod: true,
+          ip: true,
+          protocol: true,
+          requestTime: true,
+          resourcePath: true,
+          responseLength: true,
+          status: true,
+          user: false,
+        }),
+        dataTraceEnabled: false,
+        loggingLevel: apigateway.MethodLoggingLevel.ERROR,
+        metricsEnabled: true,
+        throttlingBurstLimit: 20,
+        throttlingRateLimit: 10,
+        tracingEnabled: true,
+      },
+      endpointTypes: [apigateway.EndpointType.REGIONAL],
+    });
+    // API Gateway has one CloudWatch role per account/region. Reuse the role configured by
+    // the ingest API and make fresh-stack creation wait until that account setting exists.
+    dashboardApi.deploymentStage.node.addDependency(ingestApi.deploymentStage);
+    const dashboardIntegration = new apigateway.LambdaIntegration(dashboardQueryFunction, {
+      proxy: true,
+    });
+    const dashboardQueries = dashboardApi.root.addResource("queries");
+    dashboardQueries.addMethod("POST", dashboardIntegration);
+    dashboardQueries
+      .addResource("{queryExecutionId}")
+      .addMethod("GET", dashboardIntegration);
 
     const aggregateLogGroup = new logs.LogGroup(this, "AggregateFunctionLogs", {
       retention: logs.RetentionDays.ONE_MONTH,
@@ -760,6 +915,17 @@ ORDER BY event_date DESC, p95_seconds DESC`,
     new cdk.CfnOutput(this, "EventLakeBucket", { value: dataBucket.bucketName });
     new cdk.CfnOutput(this, "AthenaDatabase", { value: databaseName });
     new cdk.CfnOutput(this, "AthenaWorkGroup", { value: workGroup.name });
+    new cdk.CfnOutput(this, "DashboardApiUrl", {
+      value: `${dashboardApi.url}queries`,
+      description: "Store only on the private dashboard Worker; never expose this endpoint to browsers",
+    });
+    new cdk.CfnOutput(this, "DashboardSecretArn", {
+      value: dashboardSecret.secretArn,
+      description: "Retrieve once and store as the dashboard Worker's AWS_DASHBOARD_SHARED_SECRET",
+    });
+    new cdk.CfnOutput(this, "DashboardAthenaWorkGroup", {
+      value: dashboardWorkGroup.name,
+    });
     new cdk.CfnOutput(this, "PrivateOperationsDashboard", {
       value: operationsDashboard.dashboardName,
     });

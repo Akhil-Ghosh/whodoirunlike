@@ -1,0 +1,2 @@
+DASHBOARD_PASSWORD=replace-with-a-local-password
+AWS_DASHBOARD_SHARED_SECRET=replace-with-the-aws-dashboard-secret

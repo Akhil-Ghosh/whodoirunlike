@@ -1,0 +1,37 @@
+{
+  "name": "whodoirunlike-analytics-dashboard",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 127.0.0.1 --port 4180",
+    "build": "npm run types && tsc --noEmit && vite build",
+    "preview": "vite preview --host 127.0.0.1 --port 4180",
+    "check": "npm run build && vitest run && wrangler deploy --dry-run",
+    "deploy": "npm run build && wrangler deploy",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "types": "wrangler types worker-configuration.d.ts --env-file .dev.vars.example --strict-vars false",
+    "types:check": "wrangler types worker-configuration.d.ts --env-file .dev.vars.example --strict-vars false --check",
+    "startup": "wrangler check startup"
+  },
+  "dependencies": {
+    "@phosphor-icons/react": "2.1.10",
+    "react": "19.2.6",
+    "react-dom": "19.2.6"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "5.20260710.1",
+    "@testing-library/jest-dom": "6.9.1",
+    "@testing-library/react": "16.3.1",
+    "@types/node": "25.9.1",
+    "@types/react": "19.2.15",
+    "@types/react-dom": "19.2.3",
+    "@vitejs/plugin-react": "5.0.4",
+    "jsdom": "26.1.0",
+    "typescript": "6.0.3",
+    "vite": "7.3.6",
+    "vitest": "3.2.7",
+    "wrangler": "4.110.0"
+  }
+}

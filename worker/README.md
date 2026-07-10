@@ -56,6 +56,8 @@ Every artifact upload must include `X-Processing-Attempt-Id`, and every report b
 
 Each accepted event is first written once under `telemetry/v1/events/`, ordered by zero-padded sequence, with a separate immutable event-ID index for idempotency. If `AWS_ANALYTICS_INGEST_URL` is set, the identical event is then placed under `telemetry/v1/outbox/`. Delivery runs with `ctx.waitUntil()`, and the five-minute cron reconciles missing outbox items before retrying retained items. After a 2xx response it writes an immutable delivered receipt before deleting the outbox object, preventing reconciliation from exporting the same event forever.
 
+The deployed RunPod template gives durable Worker mutations enough time to finish: `WHODOIRUNLIKE_TELEMETRY_DELIVERY_TIMEOUT_SECONDS=10`, `WHODOIRUNLIKE_REPORT_TIMEOUT_SECONDS=10`, and `WHODOIRUNLIKE_TELEMETRY_DRAIN_TIMEOUT_SECONDS=12`. The code carries the same defaults. The final drain is intentionally longer than one callback timeout so a slow successful `attempt_completed` event is not abandoned with a daemon sender; a Worker outage can therefore add up to that bounded drain/report latency to processor finalization.
+
 AWS requests contain the exact JSON body with these headers:
 
 - `X-WDIRL-Timestamp`: epoch seconds

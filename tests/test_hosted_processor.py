@@ -540,6 +540,39 @@ def test_artifact_put_sends_processing_attempt_header(
     )
 
 
+def test_worker_report_uses_durable_job_mutation_timeout(monkeypatch: Any) -> None:
+    from whodoirunlike import hosted_processor
+
+    observed_timeouts: list[float] = []
+
+    class FakeResponse:
+        def __enter__(self) -> FakeResponse:
+            return self
+
+        def __exit__(self, *_: Any) -> None:
+            return None
+
+    def fake_urlopen(request: Any, *, timeout: float) -> FakeResponse:
+        observed_timeouts.append(timeout)
+        return FakeResponse()
+
+    monkeypatch.setenv("WHODOIRUNLIKE_PROCESSOR_SHARED_SECRET", "secret")
+    monkeypatch.delenv("WHODOIRUNLIKE_REPORT_TIMEOUT_SECONDS", raising=False)
+    monkeypatch.setattr(hosted_processor.urllib.request, "urlopen", fake_urlopen)
+
+    hosted_processor._post_worker_report(
+        callback_base_url="https://api.whodoirunlike.com",
+        run_id="12345678-1234-4234-9234-123456789abc",
+        payload={
+            "attempt_id": "11111111-1111-4111-8111-111111111111",
+            "status": "running",
+            "progress": {"phase": "downloading_upload"},
+        },
+    )
+
+    assert observed_timeouts == [10.0]
+
+
 def test_job_payload_requires_exact_allowlisted_https_callback_origin(
     monkeypatch: Any,
 ) -> None:
@@ -765,6 +798,7 @@ def test_process_hosted_job_emits_complete_lifecycle_with_worker_attempt_id(
     run_root = tmp_path / "hosted"
     reports: list[dict[str, Any]] = []
     terminal_seen_before_final_report: list[bool] = []
+    close_timeouts: list[float] = []
     created_telemetry: list[ProcessingTelemetry] = []
     monkeypatch.setattr(hosted_processor, "DEFAULT_HOSTED_RUN_ROOT", run_root)
     monkeypatch.setenv("WHODOIRUNLIKE_PROCESSOR_SHARED_SECRET", "secret")
@@ -781,6 +815,13 @@ def test_process_hosted_job_emits_complete_lifecycle_with_worker_attempt_id(
             sequence_start=kwargs["sequence_start"],
             attempt_elapsed_offset_seconds=kwargs["attempt_elapsed_offset_seconds"],
         )
+        original_close = telemetry.close
+
+        def record_close(*, timeout: float = 2.0) -> bool:
+            close_timeouts.append(timeout)
+            return original_close(timeout=timeout)
+
+        telemetry.close = record_close  # type: ignore[method-assign]
         created_telemetry.append(telemetry)
         return telemetry
 
@@ -852,6 +893,7 @@ def test_process_hosted_job_emits_complete_lifecycle_with_worker_attempt_id(
         for report in reports
     )
     assert terminal_seen_before_final_report == [True]
+    assert close_timeouts == [12.0]
     events_path = run_root / payload.run_id / "processing_events.jsonl"
     events = [json.loads(line) for line in events_path.read_text().splitlines()]
     event_types = [event["event_type"] for event in events]

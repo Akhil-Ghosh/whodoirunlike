@@ -53,8 +53,15 @@ DENSEPOSE_DEFAULT_WEIGHTS = (
 RUN_ID_PATTERN = re.compile(r"^[a-f0-9-]{32,36}$", re.IGNORECASE)
 PROCESSOR_USER_AGENT = "Mozilla/5.0 (compatible; whodoirunlike-processor/1.0)"
 DEFAULT_HOSTED_MASK_BACKEND = "sam31_gpu"
-DEFAULT_REPORT_TIMEOUT_SECONDS = 1.0
-DEFAULT_TELEMETRY_DRAIN_TIMEOUT_SECONDS = 4.0
+# Job reports can require multiple conditional R2 writes. These calls are
+# best-effort but synchronous, so a Worker outage can add up to 10 seconds at a
+# report boundary; the larger deadline prevents partial status mutations under
+# normal remote-write latency.
+DEFAULT_REPORT_TIMEOUT_SECONDS = 10.0
+# Give the terminal telemetry event at least one full callback deadline plus
+# scheduling/backoff headroom before a Serverless invocation is allowed to end.
+# A degraded callback can therefore extend shutdown by up to 12 seconds.
+DEFAULT_TELEMETRY_DRAIN_TIMEOUT_SECONDS = 12.0
 DEFAULT_TELEMETRY_SNAPSHOT_TIMEOUT_SECONDS = 0.25
 DEFAULT_CALLBACK_ORIGINS = (
     "https://api.whodoirunlike.com",

@@ -24,7 +24,11 @@ SCHEMA_VERSION = 1
 PROCESSING_EVENTS_FILENAME = "processing_events.jsonl"
 DEFAULT_PROGRESS_INTERVAL_SECONDS = 5.0
 DEFAULT_DELIVERY_QUEUE_SIZE = 2048
-DEFAULT_DELIVERY_TIMEOUT_SECONDS = 1.0
+# A Worker callback performs several durable R2 writes before returning. The
+# sender runs off the processing thread, so allowing 10 seconds avoids treating
+# slow successful writes as failures. During a real outage, three attempts plus
+# backoff can occupy the sender for roughly 30 seconds before one event fails.
+DEFAULT_DELIVERY_TIMEOUT_SECONDS = 10.0
 DEFAULT_DELIVERY_ATTEMPTS = 3
 DEFAULT_DELIVERY_BACKOFF_SECONDS = 0.1
 DEFAULT_DELIVERY_FAILURE_THRESHOLD = 3

@@ -16,13 +16,16 @@ function template(): Template {
 
 test("builds the complete private event-lake path", () => {
   const output = template();
-  output.resourceCountIs("AWS::ApiGateway::RestApi", 1);
+  output.resourceCountIs("AWS::ApiGateway::RestApi", 2);
+  output.resourceCountIs("AWS::ApiGateway::Authorizer", 0);
+  output.resourceCountIs("AWS::ApiGateway::Account", 1);
   output.resourceCountIs("AWS::SQS::Queue", 2);
-  output.resourceCountIs("AWS::Lambda::Function", 3);
+  output.resourceCountIs("AWS::Lambda::Function", 4);
+  output.resourceCountIs("AWS::SecretsManager::Secret", 2);
   output.resourceCountIs("AWS::S3::Bucket", 1);
   output.resourceCountIs("AWS::Glue::Database", 1);
   output.resourceCountIs("AWS::Glue::Table", 2);
-  output.resourceCountIs("AWS::Athena::WorkGroup", 1);
+  output.resourceCountIs("AWS::Athena::WorkGroup", 2);
   output.resourceCountIs("AWS::Athena::NamedQuery", 10);
   output.resourceCountIs("AWS::CloudWatch::Dashboard", 1);
   output.resourceCountIs("AWS::Logs::MetricFilter", 3);
@@ -48,6 +51,7 @@ test("keeps processing metadata encrypted, private, and lifecycle bounded", () =
           TagFilters: [{ Key: "event-class", Value: "progress" }],
         }),
         Match.objectLike({ Id: "expire-athena-results", ExpirationInDays: 30 }),
+        Match.objectLike({ Id: "expire-dashboard-results", ExpirationInDays: 7 }),
       ]),
     },
   });
@@ -147,4 +151,115 @@ test("queries expose complete attempt attribution and per-attempt span totals", 
 
   const stalledQuery = queryByName("stalled_attempts");
   assert.match(stalledQuery, /processing_was_requested = 1/);
+});
+
+test("dashboard queries run in a separate low-scan Athena workgroup", () => {
+  const output = template();
+  output.hasResourceProperties("AWS::Athena::WorkGroup", {
+    Name: "whodoirunlike-dashboard",
+    WorkGroupConfiguration: Match.objectLike({
+      BytesScannedCutoffPerQuery: 268_435_456,
+      EnforceWorkGroupConfiguration: true,
+      EngineVersion: { SelectedEngineVersion: "Athena engine version 3" },
+      ResultConfiguration: Match.objectLike({
+        EncryptionConfiguration: { EncryptionOption: "SSE_S3" },
+        OutputLocation: Match.anyValue(),
+      }),
+    }),
+  });
+
+  const workgroups = Object.values(output.findResources("AWS::Athena::WorkGroup"));
+  const dashboard = workgroups.find(
+    (resource) => resource.Properties?.Name === "whodoirunlike-dashboard",
+  );
+  assert.ok(dashboard);
+  assert.match(JSON.stringify(dashboard), /dashboard-results\//);
+});
+
+test("routes both dashboard API methods through the HMAC-verifying query Lambda", () => {
+  const output = template();
+  const methods = Object.values(output.findResources("AWS::ApiGateway::Method")).filter(
+    (resource) =>
+      ["POST", "GET"].includes(resource.Properties?.HttpMethod) &&
+      JSON.stringify(resource.Properties?.Integration).includes("DashboardQueryFunction"),
+  );
+  assert.equal(methods.length, 2);
+  assert.deepEqual(
+    new Set(methods.map((resource) => resource.Properties?.HttpMethod)),
+    new Set(["POST", "GET"]),
+  );
+  for (const method of methods) {
+    assert.equal(method.Properties?.AuthorizationType, "NONE");
+    assert.equal(method.Properties?.AuthorizerId, undefined);
+    assert.equal(method.Properties?.Integration?.Type, "AWS_PROXY");
+  }
+
+  output.hasResourceProperties("AWS::Lambda::Function", {
+    Handler: "dashboard_api.handler",
+    Environment: {
+      Variables: Match.objectLike({
+        DASHBOARD_SECRET_ARN: { Ref: Match.stringLikeRegexp("DashboardHmacSecret") },
+        MAX_CLOCK_SKEW_SECONDS: "300",
+      }),
+    },
+  });
+  output.hasResourceProperties("AWS::SecretsManager::Secret", {
+    Description: "HMAC secret used only by the private dashboard Cloudflare Worker",
+    GenerateSecretString: { ExcludePunctuation: true, PasswordLength: 64 },
+  });
+
+  const stages = output.findResources("AWS::ApiGateway::Stage");
+  const dashboardStage = Object.entries(stages).find(([logicalId]) =>
+    logicalId.startsWith("DashboardApiDeploymentStage"),
+  );
+  assert.ok(dashboardStage, "dashboard API stage is missing");
+  assert.ok(
+    (dashboardStage[1].DependsOn || []).some((dependency: string) =>
+      dependency.startsWith("IngestApiDeploymentStage"),
+    ),
+    "dashboard stage must wait for the shared API Gateway CloudWatch account role",
+  );
+});
+
+test("gives the dashboard query Lambda only fixed table and result-prefix access", () => {
+  const output = template();
+  output.hasResourceProperties("AWS::Lambda::Function", {
+    Handler: "dashboard_api.handler",
+    Environment: {
+      Variables: Match.objectLike({
+        ATHENA_DATABASE: "whodoirunlike_analytics",
+        ATHENA_TABLE: "processing_events",
+        ATHENA_WORKGROUP: "whodoirunlike-dashboard",
+        ATHENA_RESULT_REUSE_MINUTES: "1",
+      }),
+    },
+  });
+
+  const policies = Object.values(output.findResources("AWS::IAM::Policy"));
+  const dashboardPolicy = policies.find((resource) =>
+    String(resource.Properties?.PolicyName).startsWith("DashboardQueryFunction"),
+  );
+  assert.ok(dashboardPolicy, "dashboard query role policy is missing");
+  const document = JSON.stringify(dashboardPolicy.Properties?.PolicyDocument);
+  assert.match(document, /athena:GetQueryResults/);
+  assert.match(document, /workgroup\/whodoirunlike-dashboard/);
+  assert.match(document, /validated\/\*/);
+  assert.match(document, /dashboard-results\/\*/);
+  assert.doesNotMatch(document, /raw\/\*/);
+  assert.doesNotMatch(document, /aggregate\/\*/);
+  assert.doesNotMatch(document, /s3:DeleteObject/);
+});
+
+test("does not provision QuickSight", () => {
+  const output = template();
+  assert.equal(Object.keys(output.findResources("AWS::QuickSight::Dashboard")).length, 0);
+  assert.equal(Object.keys(output.findResources("AWS::QuickSight::DataSource")).length, 0);
+});
+
+test("exports only the server-side dashboard connection values", () => {
+  const output = template();
+  output.hasOutput("DashboardApiUrl", {});
+  output.hasOutput("DashboardSecretArn", {});
+  output.hasOutput("DashboardAthenaWorkGroup", { Value: "whodoirunlike-dashboard" });
+  assert.equal(Object.keys(output.findOutputs("DashboardAccessHeader")).length, 0);
 });

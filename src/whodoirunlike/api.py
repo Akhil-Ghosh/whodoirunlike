@@ -17,6 +17,7 @@ from whodoirunlike.cv_flow import utc_now_iso
 from whodoirunlike.form_features import compile_form_features
 from whodoirunlike.hosted_processor import router as hosted_processor_router
 from whodoirunlike.pose_runner import process_pose_video, update_manifest_after_pose
+from whodoirunlike.running_clip_run import RunningClipRun
 from whodoirunlike.sam2_runner import inspect_video, write_json
 from whodoirunlike.video_eval import POSE_MODEL_URLS, ensure_pose_model
 
@@ -144,48 +145,47 @@ def _write_initial_manifest(
     fps = float(video_meta.get("fps") or 0.0)
     frame_count = int(video_meta.get("frame_count") or 0)
     duration_seconds = round(frame_count / fps, 3) if fps else None
-    manifest_path = run_dir / "cv_run_manifest.json"
-    write_json(
-        manifest_path,
-        {
-            "version": 1,
-            "candidate_id": run_id,
-            "runner_name": "Uploaded clip",
-            "runner_slug": "uploaded-clip",
-            "created_at": utc_now_iso(),
-            "source": {
-                "platform": "api_upload",
-                "filename": upload.filename,
-                "content_type": upload.content_type,
-                "size_bytes": size_bytes,
-                "video_path": str(source_path),
-            },
-            "review": {
-                "quality": "api_upload",
-                "camera_angle": "unknown",
-                "primary_bucket": "running",
-                "duration_seconds": duration_seconds,
-            },
-            "paths": {
-                "source_segment": str(source_path),
-                "person_prompt": str(prompt_path),
-                "pose_landmarks": str(pose_landmarks_path),
-                "skeleton_render": str(skeleton_render_path),
-                "qa_overlay": str(qa_overlay_path),
-                "features": str(features_path),
-                "form_features": str(form_features_path),
-                "form_feature_arrays": str(form_feature_arrays_path),
-            },
-            "stages": {
-                "upload": {"status": "complete", "output": str(source_path)},
-                "pose": {"status": "pending"},
-                "renders": {"status": "pending"},
-                "features": {"status": "pending"},
-                "form_features": {"status": "pending"},
-            },
+    run = RunningClipRun(run_dir)
+    paths = {
+        "source_segment": str(source_path),
+        "person_prompt": str(prompt_path),
+        "pose_landmarks": str(pose_landmarks_path),
+        "skeleton_render": str(skeleton_render_path),
+        "qa_overlay": str(qa_overlay_path),
+        "features": str(features_path),
+        "form_features": str(form_features_path),
+        "form_feature_arrays": str(form_feature_arrays_path),
+    }
+    manifest = {
+        "version": 1,
+        "candidate_id": run_id,
+        "runner_name": "Uploaded clip",
+        "runner_slug": "uploaded-clip",
+        "created_at": utc_now_iso(),
+        "source": {
+            "platform": "api_upload",
+            "filename": upload.filename,
+            "content_type": upload.content_type,
+            "size_bytes": size_bytes,
+            "video_path": str(source_path),
         },
-    )
-    return manifest_path
+        "review": {
+            "quality": "api_upload",
+            "camera_angle": "unknown",
+            "primary_bucket": "running",
+            "duration_seconds": duration_seconds,
+        },
+        "paths": paths,
+        "stages": {
+            "upload": {"status": "complete", "output": str(source_path)},
+            "pose": {"status": "pending"},
+            "renders": {"status": "pending"},
+            "features": {"status": "pending"},
+            "form_features": {"status": "pending"},
+        },
+    }
+    manifest = run.ensure_paths(manifest, keys=paths.keys())
+    return run.write_manifest(manifest)
 
 
 def _process_clip(

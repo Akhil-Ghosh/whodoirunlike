@@ -8,6 +8,10 @@ This context describes the language for the running-form similarity product and 
 A short video segment containing one runner whose movement can be compared against the reference library.
 _Avoid_: raw video, source video when referring to the reviewed movement sample
 
+**Running Clip Run**:
+A local, manifest-backed processing workspace for one **Running Clip**. It preserves pipeline stage state and the canonical paths for artifacts produced from that clip.
+_Avoid_: run folder, output folder, job when referring to the persisted processing state
+
 **Reference Segment**:
 A human-approved running clip from a known athlete in the internal comparison library.
 _Avoid_: scrape, download, candidate once it has been approved
@@ -39,6 +43,7 @@ _Avoid_: diagnosis, coaching assessment, biometric identification
 ## Relationships
 
 - A **Running Clip** has exactly one **Target Runner**.
+- A **Running Clip Run** belongs to exactly one **Running Clip** and records its local manifest, stage state, and artifact paths.
 - A **Target Runner** has one **Runner Mask** per processed clip.
 - A **Pose Sequence** belongs to one **Target Runner** and is the primary input to a **Form Match**.
 - A **DensePose Body Map** belongs to one **Target Runner** and refines confidence, occlusion handling, and visual QA.

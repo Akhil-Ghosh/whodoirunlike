@@ -13,6 +13,7 @@ import cv2
 import numpy as np
 
 from whodoirunlike.cv_flow import read_json, utc_now_iso, write_json
+from whodoirunlike.running_clip_run import RunningClipRun
 
 
 DEFAULT_IDENTITY_BACKEND = "boxmot_botsort"
@@ -1292,35 +1293,42 @@ def update_manifest_after_identity_tracking(
     qc_metrics_path: Path,
     result: dict[str, Any],
 ) -> None:
-    manifest = read_json(manifest_path)
-    paths = manifest.setdefault("paths", {})
-    paths["tracklets"] = str(tracklets_path)
-    paths["tracklets_jsonl"] = str(tracklets_jsonl_path)
-    paths["reid"] = str(reid_path)
-    paths["reid_jsonl"] = str(reid_jsonl_path)
-    paths["qc_metrics"] = str(qc_metrics_path)
-    stages = manifest.setdefault("stages", {})
-    detector_tracker = stages.setdefault("detector_tracker", {})
-    detector_tracker.update(
-        {
-            "status": "complete",
-            "backend": result["backend"],
-            "track_seed": str(result["track_seed_path"]),
-            "tracklets": str(tracklets_path),
-            "tracklets_jsonl": str(tracklets_jsonl_path),
-            "reid": str(reid_path),
-            "reid_jsonl": str(reid_jsonl_path),
-            "qc_metrics": str(qc_metrics_path),
-            "metrics": result["metrics"],
-            "completed_at": utc_now_iso(),
-        }
-    )
-    whole_runner_mask = stages.setdefault("whole_runner_mask", {})
-    if whole_runner_mask.get("status") in (None, "", "pending_prompt", "pending_tracker"):
-        whole_runner_mask["status"] = "pending_run"
-    whole_runner_mask["identity_gate"] = "detector_tracker"
+    clip_run = RunningClipRun(manifest_path.parent)
+    manifest = clip_run.read_manifest()
+    paths = dict(manifest.get("paths") or {})
+    for key, path in {
+        "tracklets": tracklets_path,
+        "tracklets_jsonl": tracklets_jsonl_path,
+        "reid": reid_path,
+        "reid_jsonl": reid_jsonl_path,
+        "qc_metrics": qc_metrics_path,
+    }.items():
+        paths.setdefault(key, str(path))
+    manifest["paths"] = paths
+    completed_at = utc_now_iso()
     manifest["updated_at"] = utc_now_iso()
-    write_json(manifest_path, manifest)
+    whole_runner_mask = manifest.get("stages", {}).get("whole_runner_mask", {})
+    whole_runner_mask_values: dict[str, Any] = {"identity_gate": "detector_tracker"}
+    if whole_runner_mask.get("status") in (None, "", "pending_prompt", "pending_tracker"):
+        whole_runner_mask_values["status"] = "pending_run"
+    clip_run.update_stages(
+        {
+            "detector_tracker": {
+                "status": "complete",
+                "backend": result["backend"],
+                "track_seed": str(result["track_seed_path"]),
+                "tracklets": str(tracklets_path),
+                "tracklets_jsonl": str(tracklets_jsonl_path),
+                "reid": str(reid_path),
+                "reid_jsonl": str(reid_jsonl_path),
+                "qc_metrics": str(qc_metrics_path),
+                "metrics": result["metrics"],
+                "completed_at": completed_at,
+            },
+            "whole_runner_mask": whole_runner_mask_values,
+        },
+        manifest=manifest,
+    )
 
 
 def update_manifest_after_identity_failure(
@@ -1329,13 +1337,14 @@ def update_manifest_after_identity_failure(
     error: str,
     backend: str = DEFAULT_IDENTITY_BACKEND,
 ) -> None:
-    manifest = read_json(manifest_path)
-    stage = manifest.setdefault("stages", {}).setdefault("detector_tracker", {})
-    stage["status"] = "failed"
-    stage["backend"] = backend
-    stage["error"] = error
+    clip_run = RunningClipRun(manifest_path.parent)
+    manifest = clip_run.read_manifest()
     manifest["updated_at"] = utc_now_iso()
-    write_json(manifest_path, manifest)
+    clip_run.update_stage(
+        "detector_tracker",
+        {"status": "failed", "backend": backend, "error": error},
+        manifest=manifest,
+    )
 
 
 def run_boxmot_identity_tracking(
@@ -1356,17 +1365,17 @@ def run_boxmot_identity_tracking(
         raise ValueError(f"{backend} is not a BoxMOT identity backend")
 
     started_at = time.monotonic()
-    manifest_path = run_dir / "cv_run_manifest.json"
-    manifest = read_json(manifest_path)
-    paths = manifest["paths"]
-    source_segment = Path(str(paths["source_segment"]))
-    prompt_path = Path(str(paths.get("person_prompt") or run_dir / "person_prompt.json"))
-    track_seed_path = Path(str(paths.get("track_seed") or run_dir / "track_seed.json"))
-    tracklets_path = Path(str(paths.get("tracklets") or run_dir / "tracklets.parquet"))
-    reid_path = Path(str(paths.get("reid") or run_dir / "reid.parquet"))
-    tracklets_jsonl_path = Path(str(paths.get("tracklets_jsonl") or run_dir / "tracklets.jsonl"))
-    reid_jsonl_path = Path(str(paths.get("reid_jsonl") or run_dir / "reid.jsonl"))
-    qc_metrics_path = Path(str(paths.get("qc_metrics") or run_dir / "qc_metrics.json"))
+    clip_run = RunningClipRun(run_dir)
+    manifest_path = clip_run.manifest_path
+    manifest = clip_run.read_manifest()
+    source_segment = clip_run.artifact_path("source_segment", manifest)
+    prompt_path = clip_run.artifact_path("person_prompt", manifest)
+    track_seed_path = clip_run.artifact_path("track_seed", manifest)
+    tracklets_path = clip_run.artifact_path("tracklets", manifest)
+    reid_path = clip_run.artifact_path("reid", manifest)
+    tracklets_jsonl_path = clip_run.artifact_path("tracklets_jsonl", manifest)
+    reid_jsonl_path = clip_run.artifact_path("reid_jsonl", manifest)
+    qc_metrics_path = clip_run.artifact_path("qc_metrics", manifest)
 
     try:
         setup = identity_setup_status(backend)
@@ -1723,17 +1732,17 @@ def run_template_identity_tracking(
 ) -> dict[str, Any]:
     backend = TEMPLATE_IDENTITY_BACKEND
     started_at = time.monotonic()
-    manifest_path = run_dir / "cv_run_manifest.json"
-    manifest = read_json(manifest_path)
-    paths = manifest["paths"]
-    source_segment = Path(str(paths["source_segment"]))
-    prompt_path = Path(str(paths.get("person_prompt") or run_dir / "person_prompt.json"))
-    track_seed_path = Path(str(paths.get("track_seed") or run_dir / "track_seed.json"))
-    tracklets_path = Path(str(paths.get("tracklets") or run_dir / "tracklets.parquet"))
-    reid_path = Path(str(paths.get("reid") or run_dir / "reid.parquet"))
-    tracklets_jsonl_path = run_dir / "tracklets.jsonl"
-    reid_jsonl_path = run_dir / "reid.jsonl"
-    qc_metrics_path = Path(str(paths.get("qc_metrics") or run_dir / "qc_metrics.json"))
+    clip_run = RunningClipRun(run_dir)
+    manifest_path = clip_run.manifest_path
+    manifest = clip_run.read_manifest()
+    source_segment = clip_run.artifact_path("source_segment", manifest)
+    prompt_path = clip_run.artifact_path("person_prompt", manifest)
+    track_seed_path = clip_run.artifact_path("track_seed", manifest)
+    tracklets_path = clip_run.artifact_path("tracklets", manifest)
+    reid_path = clip_run.artifact_path("reid", manifest)
+    tracklets_jsonl_path = clip_run.artifact_path("tracklets_jsonl", manifest)
+    reid_jsonl_path = clip_run.artifact_path("reid_jsonl", manifest)
+    qc_metrics_path = clip_run.artifact_path("qc_metrics", manifest)
 
     try:
         frames = load_video_frames(source_segment)

@@ -23,6 +23,7 @@ from pydantic import BaseModel
 from whodoirunlike.cv_flow import utc_now_iso, write_json
 from whodoirunlike.full_pipeline import run_full_cv_pipeline
 from whodoirunlike.identity_runner import DEFAULT_IDENTITY_BACKEND, identity_setup_status
+from whodoirunlike.running_clip_run import RunningClipRun
 from whodoirunlike.sam2_runner import inspect_video
 from whodoirunlike.sam31_gpu_runner import DEFAULT_SAM31_GPU_MODEL
 from whodoirunlike.sam31_mlx_runner import DEFAULT_SAM31_MLX_MODEL
@@ -50,6 +51,32 @@ COLE_DEMO_PROMPT_BOX = {
     "width": 0.182908,
     "height": 0.772011,
 }
+_HOSTED_PUBLISHABLE_ARTIFACTS = (
+    ("person_prompt", "person_prompt.json"),
+    ("track_seed", "track_seed.json"),
+    ("view_bucket", "view_bucket.json"),
+    ("tracklets_jsonl", "tracklets.jsonl"),
+    ("tracklets", "tracklets.parquet"),
+    ("reid_jsonl", "reid.jsonl"),
+    ("reid", "reid.parquet"),
+    ("runner_mask", "runner_mask.mp4"),
+    ("masked_runner", "masked_runner.mp4"),
+    ("qa_overlay", "qa_overlay.mp4"),
+    ("skeleton_render", "skeleton_render.mp4"),
+    ("fused_overlay", "fused_overlay.mp4"),
+    ("pose_landmarks", "pose_landmarks.jsonl"),
+    ("mmpose_landmarks", "mmpose_landmarks.jsonl"),
+    ("openpose_landmarks", "openpose_landmarks.jsonl"),
+    ("densepose", "densepose.jsonl"),
+    ("densepose_parquet", "densepose.parquet"),
+    ("fused_form", "fused_form.jsonl"),
+    ("fused_form_parquet", "fused_form.parquet"),
+    ("features", "features.json"),
+    ("form_features", "form_features.json"),
+    ("form_feature_arrays", "form_features.npz"),
+    ("qc_metrics", "qc_metrics.json"),
+    ("hosted_pipeline_result", "hosted_pipeline_result.json"),
+)
 
 router = APIRouter()
 
@@ -335,43 +362,6 @@ def _uploaded_prompt_frame_index(
     return max(0, frame_index)
 
 
-def _manifest_paths(run_dir: Path) -> dict[str, str]:
-    return {
-        "source_segment": str(run_dir / "source_segment.mp4"),
-        "prompt_frame": str(run_dir / "prompt_frame.jpg"),
-        "person_prompt": str(run_dir / "person_prompt.json"),
-        "target_prompt": str(run_dir / "person_prompt.json"),
-        "track_seed": str(run_dir / "track_seed.json"),
-        "view_bucket": str(run_dir / "view_bucket.json"),
-        "tracklets": str(run_dir / "tracklets.parquet"),
-        "tracklets_jsonl": str(run_dir / "tracklets.jsonl"),
-        "reid": str(run_dir / "reid.parquet"),
-        "reid_jsonl": str(run_dir / "reid.jsonl"),
-        "masks_jsonl": str(run_dir / "masks.jsonl"),
-        "mask_logits": str(run_dir / "mask_logits.zarr"),
-        "poses": str(run_dir / "poses.parquet"),
-        "pose_landmarks": str(run_dir / "pose_landmarks.jsonl"),
-        "runner_mask": str(run_dir / "runner_mask.mp4"),
-        "densepose": str(run_dir / "densepose.jsonl"),
-        "densepose_parquet": str(run_dir / "densepose.parquet"),
-        "fused_form": str(run_dir / "fused_form.jsonl"),
-        "fused_form_parquet": str(run_dir / "fused_form.parquet"),
-        "skeleton_render": str(run_dir / "skeleton_render.mp4"),
-        "masked_runner": str(run_dir / "masked_runner.mp4"),
-        "qa_overlay": str(run_dir / "qa_overlay.mp4"),
-        "fused_overlay": str(run_dir / "fused_overlay.mp4"),
-        "qc_metrics": str(run_dir / "qc_metrics.json"),
-        "features": str(run_dir / "features.json"),
-        "form_features": str(run_dir / "form_features.json"),
-        "form_feature_arrays": str(run_dir / "form_features.npz"),
-        "mmpose_landmarks": str(run_dir / "mmpose_landmarks.jsonl"),
-        "openpose_landmarks": str(run_dir / "openpose_landmarks.jsonl"),
-        "openpose_skeleton_render": str(run_dir / "openpose_skeleton_render.mp4"),
-        "openpose_qa_overlay": str(run_dir / "openpose_qa_overlay.mp4"),
-        "pose_comparison": str(run_dir / "pose_comparison.json"),
-    }
-
-
 def _write_hosted_manifest(
     *,
     run_dir: Path,
@@ -381,6 +371,7 @@ def _write_hosted_manifest(
     demo_profile: dict[str, Any] | None = None,
     uploaded_prompt: dict[str, Any] | None = None,
 ) -> Path:
+    run = RunningClipRun(run_dir)
     demo_profile = _active_demo_profile(demo_profile, uploaded_prompt)
     prompt_frame_path = run_dir / "prompt_frame.jpg"
     prompt_frame_index = (
@@ -402,7 +393,7 @@ def _write_hosted_manifest(
     )
     write_json(prompt_path, prompt)
 
-    paths = _manifest_paths(run_dir)
+    paths = run.canonical_paths()
     fps = float(video_meta.get("fps") or 0.0)
     frame_count = int(video_meta.get("frame_count") or 0)
     duration_seconds = round(frame_count / fps, 3) if fps else None
@@ -489,9 +480,7 @@ def _write_hosted_manifest(
             "qc_metrics": {"status": "pending"},
         },
     }
-    manifest_path = run_dir / "cv_run_manifest.json"
-    write_json(manifest_path, manifest)
-    return manifest_path
+    return run.write_manifest(manifest)
 
 
 def _apply_demo_reference_artifacts(
@@ -502,6 +491,7 @@ def _apply_demo_reference_artifacts(
     if not demo_profile:
         return []
 
+    run = RunningClipRun(run_dir)
     copied: list[str] = []
     for output_name, asset_name in demo_profile["reference_artifacts"].items():
         source = DEMO_ASSET_ROOT / asset_name
@@ -512,16 +502,17 @@ def _apply_demo_reference_artifacts(
         shutil.copyfile(source, target)
         copied.append(output_name)
 
-    manifest_path = run_dir / "cv_run_manifest.json"
-    if manifest_path.is_file():
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        manifest.setdefault("stages", {})["demo_reference_artifacts"] = {
-            "status": "complete",
-            "profile_id": demo_profile["id"],
-            "outputs": copied,
-            "updated_at": utc_now_iso(),
-        }
-        write_json(manifest_path, manifest)
+    if run.manifest_path.is_file():
+        run.update_stage(
+            "demo_reference_artifacts",
+            {
+                "status": "complete",
+                "profile_id": demo_profile["id"],
+                "outputs": copied,
+                "updated_at": utc_now_iso(),
+            },
+            manifest=run.read_manifest(),
+        )
 
     return copied
 
@@ -556,46 +547,41 @@ def _attach_demo_reference_summary(
 
 
 def _artifact_files(run_dir: Path) -> list[Path]:
-    candidates = [
-        "cv_run_manifest.json",
-        "person_prompt.json",
-        "track_seed.json",
-        "view_bucket.json",
-        "tracklets.jsonl",
-        "tracklets.parquet",
-        "reid.jsonl",
-        "reid.parquet",
-        "runner_mask.mp4",
-        "masked_runner.mp4",
-        "qa_overlay.mp4",
-        "skeleton_render.mp4",
-        "fused_overlay.mp4",
-        "pose_landmarks.jsonl",
-        "mmpose_landmarks.jsonl",
-        "openpose_landmarks.jsonl",
-        "densepose.jsonl",
-        "densepose.parquet",
-        "fused_form.jsonl",
-        "fused_form.parquet",
-        "features.json",
-        "form_features.json",
-        "form_features.npz",
-        "qc_metrics.json",
-        "hosted_pipeline_result.json",
+    run = RunningClipRun(run_dir)
+    return [
+        *run.existing_artifacts(keys=(), extra_names=("cv_run_manifest.json",)),
+        *run.existing_artifacts(
+            keys=(key for key, _ in _HOSTED_PUBLISHABLE_ARTIFACTS),
+        ),
     ]
-    return [run_dir / name for name in candidates if (run_dir / name).is_file()]
+
+
+def _public_artifact_name(
+    run: RunningClipRun,
+    path: Path,
+    manifest: dict[str, Any] | None,
+) -> str:
+    if path == run.manifest_path:
+        return "cv_run_manifest.json"
+    for key, public_name in _HOSTED_PUBLISHABLE_ARTIFACTS:
+        if path == run.artifact_path(key, manifest=manifest):
+            return public_name
+    return path.name
 
 
 def _upload_artifacts(payload: WorkerJobRequest, run_dir: Path) -> list[str]:
+    run = RunningClipRun(run_dir)
+    manifest = run.read_manifest() if run.manifest_path.is_file() else None
     uploaded: list[str] = []
     for path in _artifact_files(run_dir):
+        public_name = _public_artifact_name(run, path, manifest)
         _put_worker_artifact(
             callback_base_url=payload.callback_base_url,
             run_id=payload.run_id,
-            name=path.name,
+            name=public_name,
             path=path,
         )
-        uploaded.append(path.name)
+        uploaded.append(public_name)
     return uploaded
 
 

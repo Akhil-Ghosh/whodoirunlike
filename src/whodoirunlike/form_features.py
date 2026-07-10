@@ -12,6 +12,7 @@ import numpy as np
 from whodoirunlike.cv_flow import utc_now_iso
 from whodoirunlike.fusion_runner import DENSEPOSE_PART_GROUPS
 from whodoirunlike.pose_runner import LANDMARK_NAMES, POSE_CONNECTIONS
+from whodoirunlike.running_clip_run import RunningClipRun
 from whodoirunlike.sam2_runner import inspect_video, read_json, write_json
 
 
@@ -414,29 +415,31 @@ def update_manifest_after_features(
     arrays_path: Path,
     summary: dict[str, Any],
 ) -> None:
-    manifest = read_json(manifest_path)
+    run = RunningClipRun(manifest_path.parent)
+    manifest = run.read_manifest()
+    manifest["updated_at"] = utc_now_iso()
     paths = manifest.setdefault("paths", {})
     paths["form_features"] = str(metadata_path)
     paths["form_feature_arrays"] = str(arrays_path)
-    stages = manifest.setdefault("stages", {})
-    stages["form_features"] = {
-        "status": "complete",
-        "recommended_tool": "Pose sequence + fused confidence feature compiler",
-        "output": str(metadata_path),
-        "arrays": str(arrays_path),
-        "summary": summary,
-    }
-    manifest["updated_at"] = utc_now_iso()
-    write_json(manifest_path, manifest)
+    manifest.setdefault("stages", {}).setdefault("form_features", {}).pop("error", None)
+    run.update_stage(
+        "form_features",
+        {
+            "status": "complete",
+            "recommended_tool": "Pose sequence + fused confidence feature compiler",
+            "output": str(metadata_path),
+            "arrays": str(arrays_path),
+            "summary": summary,
+        },
+        manifest,
+    )
 
 
 def update_manifest_after_features_failure(manifest_path: Path, error: str) -> None:
-    manifest = read_json(manifest_path)
-    stage = manifest.setdefault("stages", {}).setdefault("form_features", {})
-    stage["status"] = "failed"
-    stage["error"] = error
+    run = RunningClipRun(manifest_path.parent)
+    manifest = run.read_manifest()
     manifest["updated_at"] = utc_now_iso()
-    write_json(manifest_path, manifest)
+    run.update_stage("form_features", {"status": "failed", "error": error}, manifest)
 
 
 def compile_form_features(
@@ -447,15 +450,15 @@ def compile_form_features(
     progress_callback: FormFeatureProgressCallback | None = None,
 ) -> dict[str, Any]:
     started_at = time.monotonic()
-    manifest_path = run_dir / "cv_run_manifest.json"
-    manifest = read_json(manifest_path)
-    paths = manifest.setdefault("paths", {})
-    pose_path = Path(str(paths.get("pose_landmarks") or run_dir / "pose_landmarks.jsonl"))
-    fused_path = Path(str(paths.get("fused_form") or run_dir / "fused_form.jsonl"))
-    densepose_path = Path(str(paths.get("densepose") or run_dir / "densepose.jsonl"))
-    source_path = Path(str(paths.get("source_segment") or run_dir / "source_segment.mp4"))
-    metadata_path = metadata_path or Path(str(paths.get("form_features") or run_dir / "form_features.json"))
-    arrays_path = arrays_path or Path(str(paths.get("form_feature_arrays") or run_dir / "form_features.npz"))
+    run = RunningClipRun(run_dir)
+    manifest_path = run.manifest_path
+    manifest = run.read_manifest()
+    pose_path = run.artifact_path("pose_landmarks", manifest)
+    fused_path = run.artifact_path("fused_form", manifest)
+    densepose_path = run.artifact_path("densepose", manifest)
+    source_path = run.artifact_path("source_segment", manifest)
+    metadata_path = metadata_path or run.artifact_path("form_features", manifest)
+    arrays_path = arrays_path or run.artifact_path("form_feature_arrays", manifest)
 
     try:
         if progress_callback:

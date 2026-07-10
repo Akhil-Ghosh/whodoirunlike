@@ -11,7 +11,8 @@ import numpy as np
 
 from whodoirunlike.cv_flow import utc_now_iso
 from whodoirunlike.pose_runner import POSE_CONNECTIONS
-from whodoirunlike.sam2_runner import inspect_video, read_json, write_json
+from whodoirunlike.running_clip_run import RunningClipRun
+from whodoirunlike.sam2_runner import inspect_video
 from whodoirunlike.video_io import make_browser_playable_mp4
 
 
@@ -422,32 +423,37 @@ def update_manifest_after_fusion(
     fused_overlay_path: Path,
     summary: dict[str, Any],
 ) -> None:
-    manifest = read_json(manifest_path)
+    run = RunningClipRun(manifest_path.parent)
+    manifest = run.read_manifest()
+    manifest["updated_at"] = utc_now_iso()
     paths = manifest.setdefault("paths", {})
     paths["fused_form"] = str(fused_form_path)
     paths["fused_overlay"] = str(fused_overlay_path)
     stages = manifest.setdefault("stages", {})
-    stages["fused_form"] = {
-        "status": "complete",
-        "recommended_tool": "MediaPipe + SAM mask + DensePose fusion",
-        "output": str(fused_form_path),
-        "overlay": str(fused_overlay_path),
-        "summary": summary,
-    }
-    stages.setdefault("renders", {}).setdefault("outputs", [])
-    if str(fused_overlay_path) not in stages["renders"]["outputs"]:
-        stages["renders"]["outputs"].append(str(fused_overlay_path))
-    manifest["updated_at"] = utc_now_iso()
-    write_json(manifest_path, manifest)
+    stages.setdefault("fused_form", {}).pop("error", None)
+    outputs = list(manifest.get("stages", {}).get("renders", {}).get("outputs") or [])
+    if str(fused_overlay_path) not in outputs:
+        outputs.append(str(fused_overlay_path))
+    run.update_stages(
+        {
+            "fused_form": {
+                "status": "complete",
+                "recommended_tool": "MediaPipe + SAM mask + DensePose fusion",
+                "output": str(fused_form_path),
+                "overlay": str(fused_overlay_path),
+                "summary": summary,
+            },
+            "renders": {"outputs": outputs},
+        },
+        manifest,
+    )
 
 
 def update_manifest_after_fusion_failure(manifest_path: Path, error: str) -> None:
-    manifest = read_json(manifest_path)
-    stages = manifest.setdefault("stages", {})
-    stages.setdefault("fused_form", {})["status"] = "failed"
-    stages["fused_form"]["error"] = error
+    run = RunningClipRun(manifest_path.parent)
+    manifest = run.read_manifest()
     manifest["updated_at"] = utc_now_iso()
-    write_json(manifest_path, manifest)
+    run.update_stage("fused_form", {"status": "failed", "error": error}, manifest)
 
 
 def summarize_fusion(rows: Sequence[dict[str, Any]]) -> dict[str, Any]:
@@ -479,17 +485,19 @@ def run_fused_form(
     progress_callback: FusionProgressCallback | None = None,
 ) -> dict[str, Any]:
     started_at = time.monotonic()
-    manifest_path = run_dir / "cv_run_manifest.json"
-    manifest = read_json(manifest_path)
-    paths = manifest.setdefault("paths", {})
+    run = RunningClipRun(run_dir)
+    manifest_path = run.manifest_path
+    manifest = run.read_manifest()
 
-    source_segment = _resolve_path(paths, "source_segment", run_dir / "source_segment.mp4")
-    pose_path = _resolve_path(paths, "pose_landmarks", run_dir / "pose_landmarks.jsonl")
-    densepose_path = _resolve_path(paths, "densepose", run_dir / "densepose.jsonl")
-    runner_mask = _resolve_path(paths, "runner_mask", run_dir / "runner_mask.mp4")
-    base_overlay = _resolve_path(paths, "qa_overlay", source_segment)
-    fused_form_path = _resolve_path(paths, "fused_form", run_dir / "fused_form.jsonl")
-    fused_overlay_path = _resolve_path(paths, "fused_overlay", run_dir / "fused_overlay.mp4")
+    source_segment = run.artifact_path("source_segment", manifest)
+    pose_path = run.artifact_path("pose_landmarks", manifest)
+    densepose_path = run.artifact_path("densepose", manifest)
+    runner_mask = run.artifact_path("runner_mask", manifest)
+    base_overlay = run.artifact_path("qa_overlay", manifest)
+    if not base_overlay.exists():
+        base_overlay = source_segment
+    fused_form_path = run.artifact_path("fused_form", manifest)
+    fused_overlay_path = run.artifact_path("fused_overlay", manifest)
 
     pose_rows = read_jsonl(pose_path)
     densepose_rows = read_jsonl(densepose_path)

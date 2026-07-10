@@ -9,12 +9,11 @@ import numpy as np
 
 from whodoirunlike.cv_flow import utc_now_iso
 from whodoirunlike.mask_artifacts import write_masks_jsonl_from_video
+from whodoirunlike.running_clip_run import RunningClipRun
 from whodoirunlike.sam2_runner import (
     extract_video_frames,
     inspect_video,
     load_prompt,
-    read_json,
-    write_json,
     write_mask_outputs,
 )
 
@@ -771,29 +770,43 @@ def update_manifest_after_sam31_gpu(
     fallback: dict[str, Any] | None = None,
     prompt_summary: dict[str, Any] | None = None,
 ) -> None:
-    manifest = read_json(manifest_path)
-    stages = manifest.setdefault("stages", {})
-    whole_runner_mask = stages.setdefault("whole_runner_mask", {})
-    whole_runner_mask["status"] = "complete"
-    whole_runner_mask["recommended_tool"] = "SAM 3.1 CUDA via facebookresearch/sam3"
-    whole_runner_mask["backend"] = "sam31_gpu"
-    whole_runner_mask["model"] = DEFAULT_SAM31_GPU_MODEL
-    whole_runner_mask["checkpoint_path"] = checkpoint_path
-    whole_runner_mask["elapsed_seconds"] = round(elapsed_seconds, 3)
-    whole_runner_mask["metadata"] = str(metadata_path)
-    whole_runner_mask["masks_jsonl"] = str(masks_jsonl_path)
-    whole_runner_mask["mask_summary"] = mask_summary
-    if prompt_summary:
-        whole_runner_mask["prompting"] = prompt_summary
-    if fallback:
-        whole_runner_mask["fallback"] = fallback
-    else:
-        whole_runner_mask.pop("fallback", None)
+    clip_run = RunningClipRun(manifest_path.parent)
+    manifest = clip_run.read_manifest()
+    paths = dict(manifest.get("paths") or {})
+    paths.setdefault("masks_jsonl", str(masks_jsonl_path))
+    manifest["paths"] = paths
+
+    stages = dict(manifest.get("stages") or {})
+    whole_runner_mask = dict(stages.get("whole_runner_mask") or {})
     whole_runner_mask.pop("error", None)
-    manifest.setdefault("paths", {})["masks_jsonl"] = str(masks_jsonl_path)
-    stages.setdefault("renders", {})["status"] = "partial_complete"
+    if not fallback:
+        whole_runner_mask.pop("fallback", None)
+    stages["whole_runner_mask"] = whole_runner_mask
+    manifest["stages"] = stages
+
+    values: dict[str, Any] = {
+        "status": "complete",
+        "recommended_tool": "SAM 3.1 CUDA via facebookresearch/sam3",
+        "backend": "sam31_gpu",
+        "model": DEFAULT_SAM31_GPU_MODEL,
+        "checkpoint_path": checkpoint_path,
+        "elapsed_seconds": round(elapsed_seconds, 3),
+        "metadata": str(metadata_path),
+        "masks_jsonl": str(masks_jsonl_path),
+        "mask_summary": mask_summary,
+    }
+    if prompt_summary:
+        values["prompting"] = prompt_summary
+    if fallback:
+        values["fallback"] = fallback
     manifest["updated_at"] = utc_now_iso()
-    write_json(manifest_path, manifest)
+    clip_run.update_stages(
+        {
+            "whole_runner_mask": values,
+            "renders": {"status": "partial_complete"},
+        },
+        manifest=manifest,
+    )
 
 
 def run_sam31_gpu_mask(
@@ -812,16 +825,20 @@ def run_sam31_gpu_mask(
         ) from exc
 
     start = time.perf_counter()
-    manifest_path = run_dir / "cv_run_manifest.json"
-    manifest = read_json(manifest_path)
-    paths = manifest["paths"]
-    source_segment = Path(paths["source_segment"])
-    prompt_path = Path(paths["person_prompt"])
-    runner_mask_path = Path(paths["runner_mask"])
-    masked_runner_path = Path(paths["masked_runner"])
-    qa_overlay_path = Path(paths["qa_overlay"])
-    metadata_path = run_dir / "runner_mask_metadata.jsonl"
-    masks_jsonl_path = Path(str(paths.get("masks_jsonl") or run_dir / "masks.jsonl"))
+    clip_run = RunningClipRun(run_dir)
+    manifest_path = clip_run.manifest_path
+    manifest = clip_run.read_manifest()
+    source_segment = clip_run.artifact_path("source_segment", manifest)
+    prompt_path = clip_run.artifact_path("person_prompt", manifest)
+    runner_mask_path = clip_run.artifact_path("runner_mask", manifest)
+    masked_runner_path = clip_run.artifact_path("masked_runner", manifest)
+    qa_overlay_path = clip_run.artifact_path("qa_overlay", manifest)
+    metadata_path = clip_run.artifact_path("runner_mask_metadata", manifest)
+    masks_jsonl_path = clip_run.artifact_path("masks_jsonl", manifest)
+    track_paths = {
+        key: str(clip_run.artifact_path(key, manifest))
+        for key in ("tracklets_jsonl", "tracklets")
+    }
     frame_dir = run_dir / "sam31_gpu_frames"
 
     video_meta = inspect_video(source_segment)
@@ -829,7 +846,7 @@ def run_sam31_gpu_mask(
     prompt = load_prompt(prompt_path, video_meta["width"], video_meta["height"])
     prompt_frame = max(0, min(prompt["frame_index"], len(frame_paths) - 1))
     track_boxes = _load_identity_track_boxes(
-        paths=paths,
+        paths=track_paths,
         width=video_meta["width"],
         height=video_meta["height"],
     )
@@ -893,7 +910,7 @@ def run_sam31_gpu_mask(
 
     if fallback_reason:
         fallback_masks, fallback = _identity_track_box_fallback_masks(
-            paths=paths,
+            paths=track_paths,
             width=video_meta["width"],
             height=video_meta["height"],
             frame_count=len(frame_paths),

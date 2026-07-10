@@ -11,12 +11,12 @@ from PIL import Image
 from whodoirunlike.cv_flow import utc_now_iso
 from whodoirunlike.artifact_tables import read_jsonl
 from whodoirunlike.mask_artifacts import write_masks_jsonl_from_video
+from whodoirunlike.running_clip_run import RunningClipRun
 from whodoirunlike.sam2_runner import (
     extract_video_frames,
     inspect_video,
     load_prompt,
     read_json,
-    write_json,
     write_mask_outputs,
 )
 
@@ -369,11 +369,10 @@ def detect_sam31_subject_candidates(
         ) from exc
 
     start = time.perf_counter()
-    manifest_path = run_dir / "cv_run_manifest.json"
-    manifest = read_json(manifest_path)
-    paths = manifest["paths"]
-    source_segment = Path(paths["source_segment"])
-    prompt_path = Path(paths["person_prompt"])
+    clip_run = RunningClipRun(run_dir)
+    manifest = clip_run.read_manifest()
+    source_segment = clip_run.artifact_path("source_segment", manifest)
+    prompt_path = clip_run.artifact_path("person_prompt", manifest)
     frame_dir = run_dir / "sam31_mlx_frames"
 
     video_meta = inspect_video(source_segment)
@@ -458,26 +457,40 @@ def update_manifest_after_sam31_mlx(
     elapsed_seconds: float,
     mask_summary: dict[str, Any] | None = None,
 ) -> None:
-    manifest = read_json(manifest_path)
-    stages = manifest.setdefault("stages", {})
-    whole_runner_mask = stages.setdefault("whole_runner_mask", {})
-    whole_runner_mask["status"] = "complete"
-    whole_runner_mask["recommended_tool"] = "SAM 3.1 MLX via mlx-vlm"
-    whole_runner_mask["backend"] = "sam31_mlx"
-    whole_runner_mask["model"] = model_path
-    whole_runner_mask["prompts"] = list(prompts)
-    whole_runner_mask["quality_mode"] = quality_mode
-    whole_runner_mask["resolution"] = resolution
-    whole_runner_mask["elapsed_seconds"] = round(elapsed_seconds, 3)
-    whole_runner_mask["metadata"] = str(metadata_path)
-    whole_runner_mask["masks_jsonl"] = str(masks_jsonl_path)
+    clip_run = RunningClipRun(manifest_path.parent)
+    manifest = clip_run.read_manifest()
+    paths = dict(manifest.get("paths") or {})
+    paths.setdefault("masks_jsonl", str(masks_jsonl_path))
+    manifest["paths"] = paths
+
+    stages = dict(manifest.get("stages") or {})
+    whole_runner_mask = dict(stages.get("whole_runner_mask") or {})
     whole_runner_mask.pop("error", None)
-    manifest.setdefault("paths", {})["masks_jsonl"] = str(masks_jsonl_path)
+    stages["whole_runner_mask"] = whole_runner_mask
+    manifest["stages"] = stages
+
+    values: dict[str, Any] = {
+        "status": "complete",
+        "recommended_tool": "SAM 3.1 MLX via mlx-vlm",
+        "backend": "sam31_mlx",
+        "model": model_path,
+        "prompts": list(prompts),
+        "quality_mode": quality_mode,
+        "resolution": resolution,
+        "elapsed_seconds": round(elapsed_seconds, 3),
+        "metadata": str(metadata_path),
+        "masks_jsonl": str(masks_jsonl_path),
+    }
     if mask_summary:
-        whole_runner_mask["mask_summary"] = mask_summary
-    stages.setdefault("renders", {})["status"] = "partial_complete"
+        values["mask_summary"] = mask_summary
     manifest["updated_at"] = utc_now_iso()
-    write_json(manifest_path, manifest)
+    clip_run.update_stages(
+        {
+            "whole_runner_mask": values,
+            "renders": {"status": "partial_complete"},
+        },
+        manifest=manifest,
+    )
 
 
 def run_sam31_mlx_mask(
@@ -502,15 +515,16 @@ def run_sam31_mlx_mask(
         ) from exc
 
     start = time.perf_counter()
-    manifest_path = run_dir / "cv_run_manifest.json"
-    manifest = read_json(manifest_path)
-    paths = manifest["paths"]
-    source_segment = Path(paths["source_segment"])
-    prompt_path = Path(paths["person_prompt"])
-    runner_mask_path = Path(paths["runner_mask"])
-    masked_runner_path = Path(paths["masked_runner"])
-    qa_overlay_path = Path(paths["qa_overlay"])
-    metadata_path = run_dir / "runner_mask_metadata.jsonl"
+    clip_run = RunningClipRun(run_dir)
+    manifest_path = clip_run.manifest_path
+    manifest = clip_run.read_manifest()
+    source_segment = clip_run.artifact_path("source_segment", manifest)
+    prompt_path = clip_run.artifact_path("person_prompt", manifest)
+    runner_mask_path = clip_run.artifact_path("runner_mask", manifest)
+    masked_runner_path = clip_run.artifact_path("masked_runner", manifest)
+    qa_overlay_path = clip_run.artifact_path("qa_overlay", manifest)
+    metadata_path = clip_run.artifact_path("runner_mask_metadata", manifest)
+    masks_jsonl_path = clip_run.artifact_path("masks_jsonl", manifest)
     frame_dir = run_dir / "sam31_mlx_frames"
 
     video_meta = inspect_video(source_segment)
@@ -525,10 +539,14 @@ def run_sam31_mlx_mask(
     prompt_box = prompt.get("box")
     prompt_anchor = normalized_prompt_anchor(prompt, video_meta["width"], video_meta["height"])
     detector_tracker = manifest.get("stages", {}).get("detector_tracker", {})
-    track_paths = {**paths}
+    manifest_paths = manifest.get("paths", {})
+    track_paths = {
+        key: str(clip_run.artifact_path(key, manifest))
+        for key in ("tracklets_jsonl", "tracklets")
+    }
     if isinstance(detector_tracker, dict):
         for key in ("tracklets_jsonl", "tracklets"):
-            if detector_tracker.get(key):
+            if manifest_paths.get(key) in (None, "") and detector_tracker.get(key):
                 track_paths[key] = detector_tracker[key]
     track_boxes = load_track_boxes(track_paths, width=video_meta["width"], height=video_meta["height"])
     strict_identity_gate = bool(track_boxes)
@@ -660,7 +678,6 @@ def run_sam31_mlx_mask(
         qa_overlay_path=qa_overlay_path,
         metadata_path=metadata_path,
     )
-    masks_jsonl_path = Path(str(paths.get("masks_jsonl") or run_dir / "masks.jsonl"))
     mask_summary = write_masks_jsonl_from_video(runner_mask_path, masks_jsonl_path)
     elapsed_seconds = time.perf_counter() - start
     emit_progress("completed", total_frames)

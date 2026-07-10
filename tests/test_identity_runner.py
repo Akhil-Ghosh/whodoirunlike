@@ -165,6 +165,42 @@ def test_run_identity_tracking_writes_parquet_and_updates_manifest(tmp_path: Pat
     assert qc_metrics["identity"]["frame_count"] == 18
 
 
+def test_template_identity_tracking_uses_configured_jsonl_paths(tmp_path: Path) -> None:
+    run_dir = tmp_path / "cv_runs" / "identity-clip"
+    run_dir.mkdir(parents=True)
+    write_identity_run(run_dir)
+
+    configured_dir = tmp_path / "custom-layout" / "identity"
+    configured_tracklets = configured_dir / "runner-tracklets.jsonl"
+    configured_reid = configured_dir / "runner-reid.jsonl"
+    manifest_path = run_dir / "cv_run_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["paths"]["tracklets_jsonl"] = str(configured_tracklets)
+    manifest["paths"]["reid_jsonl"] = str(configured_reid)
+    write_json(manifest_path, manifest)
+
+    default_tracklets = run_dir / "tracklets.jsonl"
+    default_reid = run_dir / "reid.jsonl"
+    default_tracklets.write_text("poisoned default tracklets\n", encoding="utf-8")
+    default_reid.write_text("poisoned default reid\n", encoding="utf-8")
+
+    result = run_identity_tracking(run_dir=run_dir, backend="prompt_template_tracker_v1")
+
+    assert result["tracklets_jsonl_path"] == str(configured_tracklets)
+    assert result["reid_jsonl_path"] == str(configured_reid)
+    assert len(configured_tracklets.read_text(encoding="utf-8").splitlines()) == 18
+    assert len(configured_reid.read_text(encoding="utf-8").splitlines()) == 18
+    assert default_tracklets.read_text(encoding="utf-8") == "poisoned default tracklets\n"
+    assert default_reid.read_text(encoding="utf-8") == "poisoned default reid\n"
+    updated_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert updated_manifest["paths"]["tracklets_jsonl"] == str(configured_tracklets)
+    assert updated_manifest["paths"]["reid_jsonl"] == str(configured_reid)
+    assert updated_manifest["stages"]["detector_tracker"]["tracklets_jsonl"] == str(
+        configured_tracklets
+    )
+    assert updated_manifest["stages"]["detector_tracker"]["reid_jsonl"] == str(configured_reid)
+
+
 def test_canonical_identity_backend_accepts_plan_aliases() -> None:
     assert canonical_identity_backend("botsort") == "boxmot_botsort"
     assert canonical_identity_backend("deep-oc-sort") == "boxmot_deepocsort"

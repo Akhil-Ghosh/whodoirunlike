@@ -10,6 +10,7 @@ import numpy as np
 
 from whodoirunlike.cv_flow import utc_now_iso
 from whodoirunlike.mask_artifacts import write_masks_jsonl_from_video
+from whodoirunlike.running_clip_run import RunningClipRun
 from whodoirunlike.video_io import make_browser_playable_mp4s
 
 
@@ -173,6 +174,9 @@ def write_mask_outputs(
     height, width = first.shape[:2]
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     runner_mask_path.parent.mkdir(parents=True, exist_ok=True)
+    masked_runner_path.parent.mkdir(parents=True, exist_ok=True)
+    qa_overlay_path.parent.mkdir(parents=True, exist_ok=True)
+    metadata_path.parent.mkdir(parents=True, exist_ok=True)
     mask_writer = cv2.VideoWriter(str(runner_mask_path), fourcc, fps, (width, height), True)
     masked_writer = cv2.VideoWriter(str(masked_runner_path), fourcc, fps, (width, height), True)
     qa_writer = cv2.VideoWriter(str(qa_overlay_path), fourcc, fps, (width, height), True)
@@ -242,17 +246,24 @@ def update_manifest_after_sam2(
     masks_jsonl_path: Path | None = None,
     mask_summary: dict[str, Any] | None = None,
 ) -> None:
-    manifest = read_json(manifest_path)
-    stages = manifest.setdefault("stages", {})
-    stages.setdefault("whole_runner_mask", {})["status"] = "complete"
-    stages["whole_runner_mask"]["metadata"] = str(metadata_path)
+    clip_run = RunningClipRun(manifest_path.parent)
+    manifest = clip_run.read_manifest()
+    values: dict[str, Any] = {
+        "status": "complete",
+        "metadata": str(metadata_path),
+    }
     if masks_jsonl_path:
-        stages["whole_runner_mask"]["masks_jsonl"] = str(masks_jsonl_path)
+        values["masks_jsonl"] = str(masks_jsonl_path)
     if mask_summary:
-        stages["whole_runner_mask"]["mask_summary"] = mask_summary
-    stages.setdefault("renders", {})["status"] = "partial_complete"
+        values["mask_summary"] = mask_summary
     manifest["updated_at"] = utc_now_iso()
-    write_json(manifest_path, manifest)
+    clip_run.update_stages(
+        {
+            "whole_runner_mask": values,
+            "renders": {"status": "partial_complete"},
+        },
+        manifest=manifest,
+    )
 
 
 def choose_device() -> str:
@@ -282,16 +293,16 @@ def run_sam2_mask(
             "facebookresearch/sam2 with SAM2_BUILD_CUDA=0 on this Mac."
         ) from exc
 
-    manifest_path = run_dir / "cv_run_manifest.json"
-    manifest = read_json(manifest_path)
-    paths = manifest["paths"]
-    source_segment = Path(paths["source_segment"])
-    prompt_path = Path(paths["person_prompt"])
-    runner_mask_path = Path(paths["runner_mask"])
-    masked_runner_path = Path(paths["masked_runner"])
-    qa_overlay_path = Path(paths["qa_overlay"])
-    metadata_path = run_dir / "runner_mask_metadata.jsonl"
-    masks_jsonl_path = Path(str(paths.get("masks_jsonl") or run_dir / "masks.jsonl"))
+    clip_run = RunningClipRun(run_dir)
+    manifest_path = clip_run.manifest_path
+    manifest = clip_run.read_manifest()
+    source_segment = clip_run.artifact_path("source_segment", manifest)
+    prompt_path = clip_run.artifact_path("person_prompt", manifest)
+    runner_mask_path = clip_run.artifact_path("runner_mask", manifest)
+    masked_runner_path = clip_run.artifact_path("masked_runner", manifest)
+    qa_overlay_path = clip_run.artifact_path("qa_overlay", manifest)
+    metadata_path = clip_run.artifact_path("runner_mask_metadata", manifest)
+    masks_jsonl_path = clip_run.artifact_path("masks_jsonl", manifest)
     frame_dir = run_dir / "sam2_frames"
 
     video_meta = inspect_video(source_segment)

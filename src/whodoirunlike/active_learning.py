@@ -6,6 +6,7 @@ from typing import Any
 
 from whodoirunlike.cv_flow import utc_now_iso
 from whodoirunlike.qc import run_qc_metrics
+from whodoirunlike.running_clip_run import RunningClipRun
 
 
 def _read_json(path: Path) -> dict[str, Any]:
@@ -37,11 +38,12 @@ def build_uncertainty_queue(cv_run_root: Path, output_path: Path) -> dict[str, A
     entries: list[dict[str, Any]] = []
     for manifest_path in sorted(cv_run_root.glob("*/cv_run_manifest.json")):
         run_dir = manifest_path.parent
-        manifest = _read_json(manifest_path)
+        run = RunningClipRun(run_dir)
+        manifest = run.read_manifest()
+        qc_path = run.artifact_path("qc_metrics", manifest)
         try:
             qc = run_qc_metrics(run_dir)
         except Exception:
-            qc_path = Path(str(manifest.get("paths", {}).get("qc_metrics") or run_dir / "qc_metrics.json"))
             qc = _read_json(qc_path)
         score = float(qc.get("uncertainty_score") or 0.0)
         entries.append(
@@ -52,7 +54,7 @@ def build_uncertainty_queue(cv_run_root: Path, output_path: Path) -> dict[str, A
                 "uncertainty_score": round(score, 6),
                 "reason_tags": _reason_tags(qc),
                 "review_url_hint": f"/subject.html?candidate_id={run_dir.name}",
-                "qc_metrics": str(manifest.get("paths", {}).get("qc_metrics") or run_dir / "qc_metrics.json"),
+                "qc_metrics": str(qc_path),
             }
         )
     entries.sort(key=lambda row: (-float(row["uncertainty_score"]), str(row["candidate_id"])))

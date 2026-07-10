@@ -8,6 +8,7 @@ import numpy as np
 
 from whodoirunlike.artifact_tables import read_jsonl
 from whodoirunlike.cv_flow import read_json, utc_now_iso
+from whodoirunlike.running_clip_run import RunningClipRun
 
 
 def cosine_similarity(a: list[float] | np.ndarray, b: list[float] | np.ndarray) -> float:
@@ -20,9 +21,9 @@ def cosine_similarity(a: list[float] | np.ndarray, b: list[float] | np.ndarray) 
 
 
 def representative_reid_embedding(run_dir: Path) -> list[float] | None:
-    manifest = read_json(run_dir / "cv_run_manifest.json")
-    paths = manifest.get("paths", {})
-    reid_jsonl = Path(str(paths.get("reid_jsonl") or run_dir / "reid.jsonl"))
+    run = RunningClipRun(run_dir)
+    manifest = run.read_manifest()
+    reid_jsonl = run.artifact_path("reid_jsonl", manifest)
     rows = read_jsonl(reid_jsonl)
     embeddings = [row.get("embedding") for row in rows if isinstance(row.get("embedding"), list)]
     if not embeddings:
@@ -31,8 +32,9 @@ def representative_reid_embedding(run_dir: Path) -> list[float] | None:
 
 
 def view_bucket(run_dir: Path) -> str:
-    manifest = read_json(run_dir / "cv_run_manifest.json")
-    bucket_path = Path(str(manifest.get("paths", {}).get("view_bucket") or run_dir / "view_bucket.json"))
+    run = RunningClipRun(run_dir)
+    manifest = run.read_manifest()
+    bucket_path = run.artifact_path("view_bucket", manifest)
     if bucket_path.exists():
         payload = read_json(bucket_path)
         return str(payload.get("view_bucket") or "unknown")

@@ -4,7 +4,8 @@ import json
 from pathlib import Path
 from typing import Any
 
-from whodoirunlike.cv_flow import read_json, utc_now_iso, write_json
+from whodoirunlike.cv_flow import utc_now_iso
+from whodoirunlike.running_clip_run import RunningClipRun
 
 
 def read_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -31,9 +32,8 @@ def write_parquet(path: Path, rows: list[dict[str, Any]]) -> int:
 
 
 def export_cv_tables(run_dir: Path) -> dict[str, Any]:
-    manifest_path = run_dir / "cv_run_manifest.json"
-    manifest = read_json(manifest_path)
-    paths = manifest.get("paths", {})
+    run = RunningClipRun(run_dir)
+    manifest = run.read_manifest()
     exports: dict[str, dict[str, Any]] = {}
     mappings = {
         "poses": ("pose_landmarks", "poses"),
@@ -41,8 +41,8 @@ def export_cv_tables(run_dir: Path) -> dict[str, Any]:
         "fused_form_parquet": ("fused_form", "fused_form_parquet"),
     }
     for output_key, (input_key, manifest_output_key) in mappings.items():
-        input_path = Path(str(paths.get(input_key) or ""))
-        output_path = Path(str(paths.get(manifest_output_key) or run_dir / f"{output_key}.parquet"))
+        input_path = run.artifact_path(input_key, manifest)
+        output_path = run.artifact_path(manifest_output_key, manifest)
         if not input_path.exists():
             exports[output_key] = {
                 "status": "missing_input",
@@ -60,10 +60,14 @@ def export_cv_tables(run_dir: Path) -> dict[str, Any]:
             "row_count": row_count,
         }
 
-    stages = manifest.setdefault("stages", {})
-    stages.setdefault("artifact_tables", {})["status"] = "complete"
-    stages["artifact_tables"]["exports"] = exports
-    stages["artifact_tables"]["completed_at"] = utc_now_iso()
     manifest["updated_at"] = utc_now_iso()
-    write_json(manifest_path, manifest)
+    run.update_stage(
+        "artifact_tables",
+        {
+            "status": "complete",
+            "exports": exports,
+            "completed_at": utc_now_iso(),
+        },
+        manifest,
+    )
     return {"candidate_id": manifest.get("candidate_id"), "exports": exports}

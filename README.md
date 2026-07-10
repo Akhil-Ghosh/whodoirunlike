@@ -85,6 +85,8 @@ worker/                       Cloudflare Worker for uploads, jobs, and R2 artifa
 src/whodoirunlike/api.py      local FastAPI upload endpoint
 src/whodoirunlike/full_pipeline.py
                               identity, SAM, pose, DensePose, fusion, features, QC
+src/whodoirunlike/running_clip_run.py
+                              canonical run manifest, stage state, and artifact paths
 src/whodoirunlike/runpod_serverless.py
                               RunPod Serverless entrypoint
 scripts/                      ingestion, review, smoke-test, and curation commands

@@ -18,6 +18,8 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, unquote, urlparse
 
+from whodoirunlike.running_clip_run import RunningClipRun
+
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 BEST_QUALITY_REVIEW_SOURCE = REPO_ROOT / "artifacts/evaluation/video_candidates.review20_best.json"
@@ -73,6 +75,13 @@ CV_ARTIFACT_LABELS = {
     "openpose_skeleton_render": "OpenPose skeleton",
     "openpose_qa_overlay": "OpenPose QA overlay",
     "pose_comparison": "Pose comparison",
+}
+_LOCAL_CV_ARTIFACT_LABELS = {
+    "person_prompt": "Prompt",
+    "runner_mask": "Runner Mask",
+    "pose_landmarks": "Pose Sequence",
+    "densepose": "DensePose Body Map",
+    "fused_form": "Fused Form Signal",
 }
 SAM2_CHECKPOINT = Path("models/sam2/sam2.1_hiera_tiny.pt")
 SAM2_MODEL_CFG = "configs/sam2.1/sam2.1_hiera_t.yaml"
@@ -466,7 +475,8 @@ def prepare_cv_run_from_review(
 ) -> dict[str, Any]:
     candidate_id = _safe_candidate_id(candidate_id)
     run_dir = _cv_run_dir(config, candidate_id)
-    if (run_dir / "cv_run_manifest.json").exists() and not force:
+    run = RunningClipRun(run_dir)
+    if run.manifest_path.exists() and not force:
         return load_cv_run_payload(config, candidate_id)
 
     from whodoirunlike.cv_flow import prepare_single_clip_cv_run
@@ -531,6 +541,22 @@ def _is_relative_to(path: Path, root: Path) -> bool:
     return path == root or root in path.parents
 
 
+def _local_cv_artifact_paths(
+    run: RunningClipRun,
+    manifest: dict[str, Any],
+) -> dict[str, Path]:
+    run_dir = run.run_dir.resolve()
+    artifact_paths: dict[str, Path] = {}
+    for key, label in _LOCAL_CV_ARTIFACT_LABELS.items():
+        artifact_path = run.artifact_path(key, manifest).resolve()
+        if not _is_relative_to(artifact_path, run_dir):
+            raise ValueError(
+                f"{label} path must resolve inside the Running Clip Run directory: {artifact_path}"
+            )
+        artifact_paths[key] = artifact_path
+    return artifact_paths
+
+
 def _artifact_kind(path: Path) -> str:
     suffix = path.suffix.lower()
     if suffix in {".jpg", ".jpeg", ".png", ".webp"}:
@@ -577,19 +603,20 @@ def _stage_payload(manifest: dict[str, Any], prompt: dict[str, Any]) -> dict[str
 def load_cv_run_payload(config: ReviewAppConfig, candidate_id: str) -> dict[str, Any]:
     candidate_id = _safe_candidate_id(candidate_id)
     run_dir = _cv_run_dir(config, candidate_id)
-    manifest_path = run_dir / "cv_run_manifest.json"
-    if not manifest_path.exists():
+    run = RunningClipRun(run_dir)
+    if not run.manifest_path.exists():
         raise FileNotFoundError(f"CV run not found: {candidate_id}")
 
-    manifest = _read_json(manifest_path, {})
-    paths = manifest.get("paths", {})
-    prompt_path = Path(str(paths.get("person_prompt") or run_dir / "person_prompt.json")).resolve()
+    manifest = run.read_manifest()
+    local_artifact_paths = _local_cv_artifact_paths(run, manifest)
+    prompt_path = local_artifact_paths["person_prompt"]
     prompt = _read_json(prompt_path, {"selection": {"type": "unset"}})
     artifacts: dict[str, dict[str, Any]] = {}
 
     for key, label in CV_ARTIFACT_LABELS.items():
-        raw_path = paths.get(key)
-        artifact_path = Path(str(raw_path)).resolve() if raw_path else (run_dir / f"{key}.missing")
+        artifact_path = local_artifact_paths.get(key)
+        if artifact_path is None:
+            artifact_path = run.artifact_path(key, manifest).resolve()
         artifacts[key] = {
             "key": key,
             "label": label,
@@ -614,9 +641,13 @@ def list_cv_runs(config: ReviewAppConfig) -> list[dict[str, Any]]:
     if not root.exists():
         return []
 
+    clip_runs = [RunningClipRun(path) for path in root.iterdir() if path.is_dir()]
     runs: list[dict[str, Any]] = []
-    for manifest_path in sorted(root.glob("*/cv_run_manifest.json"), key=lambda p: p.stat().st_mtime):
-        candidate_id = manifest_path.parent.name
+    for run in sorted(
+        (run for run in clip_runs if run.manifest_path.exists()),
+        key=lambda run: run.manifest_path.stat().st_mtime,
+    ):
+        candidate_id = run.run_dir.name
         try:
             payload = load_cv_run_payload(config, candidate_id)
         except (FileNotFoundError, ValueError, json.JSONDecodeError):
@@ -716,15 +747,12 @@ def sanitize_prompt_selection(selection: dict[str, Any]) -> dict[str, Any]:
 
 def save_cv_prompt(config: ReviewAppConfig, candidate_id: str, data: dict[str, Any]) -> dict[str, Any]:
     run_dir = _cv_run_dir(config, candidate_id)
-    manifest_path = run_dir / "cv_run_manifest.json"
-    if not manifest_path.exists():
+    run = RunningClipRun(run_dir)
+    if not run.manifest_path.exists():
         raise FileNotFoundError(f"CV run not found: {candidate_id}")
 
-    manifest = _read_json(manifest_path, {})
-    prompt_path = Path(str(manifest.get("paths", {}).get("person_prompt") or run_dir / "person_prompt.json"))
-    prompt_path = prompt_path.resolve()
-    if not _is_relative_to(prompt_path, run_dir):
-        raise ValueError("Prompt path must stay inside the CV run directory")
+    manifest = run.read_manifest()
+    prompt_path = _local_cv_artifact_paths(run, manifest)["person_prompt"]
 
     prompt = _read_json(prompt_path, {"version": 1, "candidate_id": candidate_id})
     prompt["selection"] = sanitize_prompt_selection(data.get("selection", data))
@@ -740,7 +768,7 @@ def save_cv_prompt(config: ReviewAppConfig, candidate_id: str, data: dict[str, A
     if whole_runner_mask.get("status") in (None, "", "pending_prompt"):
         whole_runner_mask["status"] = "pending_tracker"
     manifest["updated_at"] = utc_now_iso()
-    _write_json(manifest_path, manifest)
+    run.write_manifest(manifest)
     return load_cv_run_payload(config, candidate_id)
 
 
@@ -888,8 +916,8 @@ def _set_cv_stage_status(
 ) -> None:
     stage = _validate_cv_stage(stage)
     run_dir = _cv_run_dir(config, candidate_id)
-    manifest_path = run_dir / "cv_run_manifest.json"
-    manifest = _read_json(manifest_path, {})
+    run = RunningClipRun(run_dir)
+    manifest = run.read_manifest() if run.manifest_path.exists() else {}
     stages = manifest.setdefault("stages", {})
     stage_payload = stages.setdefault(_manifest_stage_key(stage), {})
     stage_payload["status"] = status
@@ -900,7 +928,7 @@ def _set_cv_stage_status(
     elif "error" in stage_payload:
         del stage_payload["error"]
     manifest["updated_at"] = utc_now_iso()
-    _write_json(manifest_path, manifest)
+    run.write_manifest(manifest)
 
 
 def _initial_cv_stage_progress(stage: str) -> dict[str, Any]:
@@ -944,8 +972,8 @@ def _set_mask_stage_status(
     error: str | None = None,
 ) -> None:
     run_dir = _cv_run_dir(config, candidate_id)
-    manifest_path = run_dir / "cv_run_manifest.json"
-    manifest = _read_json(manifest_path, {})
+    run = RunningClipRun(run_dir)
+    manifest = run.read_manifest() if run.manifest_path.exists() else {}
     stages = manifest.setdefault("stages", {})
     whole_runner_mask = stages.setdefault("whole_runner_mask", {})
     whole_runner_mask["status"] = status
@@ -956,7 +984,7 @@ def _set_mask_stage_status(
     elif "error" in whole_runner_mask:
         del whole_runner_mask["error"]
     manifest["updated_at"] = utc_now_iso()
-    _write_json(manifest_path, manifest)
+    run.write_manifest(manifest)
 
 
 def _sanitize_mask_options(data: dict[str, Any]) -> dict[str, Any]:
@@ -1073,8 +1101,10 @@ def start_mask_job(
     options = _sanitize_mask_options(options) if backend == "sam31_mlx" else {}
     candidate_id = _safe_candidate_id(candidate_id)
     run_dir = _cv_run_dir(config, candidate_id)
-    if not (run_dir / "cv_run_manifest.json").exists():
+    run = RunningClipRun(run_dir)
+    if not run.manifest_path.exists():
         raise FileNotFoundError(f"CV run not found: {candidate_id}")
+    _local_cv_artifact_paths(run, run.read_manifest())
     if backend == "sam2":
         checkpoint = _sam2_checkpoint(config)
         if not checkpoint.exists():
@@ -1243,10 +1273,18 @@ def _start_cv_stage_job(
     options = options or {}
     candidate_id = _safe_candidate_id(candidate_id)
     run_dir = _cv_run_dir(config, candidate_id)
-    if not (run_dir / "cv_run_manifest.json").exists():
+    run = RunningClipRun(run_dir)
+    if not run.manifest_path.exists():
         raise FileNotFoundError(f"CV run not found: {candidate_id}")
+    manifest = run.read_manifest()
+    local_artifact_paths = _local_cv_artifact_paths(run, manifest)
+    prompt_path = local_artifact_paths["person_prompt"]
+    runner_mask_path = local_artifact_paths["runner_mask"]
+    pose_landmarks_path = local_artifact_paths["pose_landmarks"]
+    densepose_path = local_artifact_paths["densepose"]
+    fused_form_path = local_artifact_paths["fused_form"]
     if stage == "identity":
-        prompt = _read_json(run_dir / "person_prompt.json", {})
+        prompt = _read_json(prompt_path, {})
         if prompt.get("selection", {}).get("type") in (None, "", "unset"):
             raise ValueError("Select and save the runner before identity tracking")
     if stage == "pose":
@@ -1254,7 +1292,7 @@ def _start_cv_stage_job(
         if pose_backend == "openpose":
             from whodoirunlike.openpose_runner import openpose_setup_status
 
-            if not (run_dir / "runner_mask.mp4").exists():
+            if not runner_mask_path.exists():
                 raise FileNotFoundError("Runner mask not found; run SAM 3.1 before OpenPose")
             setup = openpose_setup_status()
             if not setup["ready"]:
@@ -1262,27 +1300,27 @@ def _start_cv_stage_job(
         elif _is_mmpose_backend(pose_backend):
             from whodoirunlike.mmpose_runner import mmpose_setup_status
 
-            if not (run_dir / "runner_mask.mp4").exists():
+            if not runner_mask_path.exists():
                 raise FileNotFoundError("Runner mask not found; run SAM 3.1 before RTMW/RTMPose")
             setup = mmpose_setup_status(pose_backend)
             if not setup["ready"]:
                 raise ValueError("RTMW/RTMPose is not configured: " + "; ".join(setup["reasons"]))
-    if stage == "densepose" and not (run_dir / "runner_mask.mp4").exists():
+    if stage == "densepose" and not runner_mask_path.exists():
         raise FileNotFoundError("Runner mask not found; run a mask backend before DensePose")
     if stage == "fusion":
-        if not (run_dir / "pose_landmarks.jsonl").exists():
+        if not pose_landmarks_path.exists():
             raise FileNotFoundError("Pose landmarks not found; run Pose before Fusion")
-        if not (run_dir / "densepose.jsonl").exists():
+        if not densepose_path.exists():
             raise FileNotFoundError("DensePose not found; run DensePose before Fusion")
     if stage == "features":
-        if not (run_dir / "pose_landmarks.jsonl").exists():
+        if not pose_landmarks_path.exists():
             raise FileNotFoundError("Pose landmarks not found; run Pose before Features")
-        if not (run_dir / "fused_form.jsonl").exists():
+        if not fused_form_path.exists():
             raise FileNotFoundError("Fused form not found; run Fusion before Features")
     if stage == "openpose":
-        if not (run_dir / "pose_landmarks.jsonl").exists():
+        if not pose_landmarks_path.exists():
             raise FileNotFoundError("Pose landmarks not found; run Pose before OpenPose")
-        if not (run_dir / "runner_mask.mp4").exists():
+        if not runner_mask_path.exists():
             raise FileNotFoundError("Runner mask not found; run a mask backend before OpenPose")
     if stage == "densepose":
         setup = densepose_setup_status(config)
@@ -1627,9 +1665,12 @@ def start_pipeline_job(
 ) -> dict[str, Any]:
     candidate_id = _safe_candidate_id(candidate_id)
     run_dir = _cv_run_dir(config, candidate_id)
-    if not (run_dir / "cv_run_manifest.json").exists():
+    run = RunningClipRun(run_dir)
+    if not run.manifest_path.exists():
         raise FileNotFoundError(f"CV run not found: {candidate_id}")
-    prompt = _read_json(run_dir / "person_prompt.json", {})
+    manifest = run.read_manifest()
+    prompt_path = _local_cv_artifact_paths(run, manifest)["person_prompt"]
+    prompt = _read_json(prompt_path, {})
     if prompt.get("selection", {}).get("type") in (None, "", "unset"):
         raise ValueError("Select and save the runner before starting the pipeline")
     pose_backend = _validate_pose_backend(pose_backend)
@@ -1672,7 +1713,8 @@ def load_subject_candidates(
     quality_mode: str = "native",
 ) -> dict[str, Any]:
     run_dir = _cv_run_dir(config, candidate_id)
-    if not (run_dir / "cv_run_manifest.json").exists():
+    run = RunningClipRun(run_dir)
+    if not run.manifest_path.exists():
         raise FileNotFoundError(f"CV run not found: {candidate_id}")
     path = _subject_candidates_path(run_dir, quality_mode)
     if not path.exists():
@@ -1696,8 +1738,10 @@ def detect_subject_candidates(
     data = data or {}
     candidate_id = _safe_candidate_id(candidate_id)
     run_dir = _cv_run_dir(config, candidate_id)
-    if not (run_dir / "cv_run_manifest.json").exists():
+    run = RunningClipRun(run_dir)
+    if not run.manifest_path.exists():
         raise FileNotFoundError(f"CV run not found: {candidate_id}")
+    _local_cv_artifact_paths(run, run.read_manifest())
 
     options = _sanitize_mask_options(data)
     quality_mode = str(options.get("quality_mode") or "native")
@@ -1912,7 +1956,8 @@ class ReviewRequestHandler(BaseHTTPRequestHandler):
         ).strip("/")
         try:
             run_dir = _cv_run_dir(self.config, candidate_id)
-            if not (run_dir / "cv_run_manifest.json").exists():
+            run = RunningClipRun(run_dir)
+            if not run.manifest_path.exists():
                 raise FileNotFoundError(f"CV run not found: {candidate_id}")
             self._send_json({"job": identity_job_status(candidate_id)})
         except (FileNotFoundError, ValueError) as exc:
@@ -1935,7 +1980,8 @@ class ReviewRequestHandler(BaseHTTPRequestHandler):
             from whodoirunlike.openpose_runner import openpose_setup_status
 
             run_dir = _cv_run_dir(self.config, candidate_id)
-            if not (run_dir / "cv_run_manifest.json").exists():
+            run = RunningClipRun(run_dir)
+            if not run.manifest_path.exists():
                 raise FileNotFoundError(f"CV run not found: {candidate_id}")
             self._send_json(
                 {
@@ -1979,7 +2025,8 @@ class ReviewRequestHandler(BaseHTTPRequestHandler):
         ).strip("/")
         try:
             run_dir = _cv_run_dir(self.config, candidate_id)
-            if not (run_dir / "cv_run_manifest.json").exists():
+            run = RunningClipRun(run_dir)
+            if not run.manifest_path.exists():
                 raise FileNotFoundError(f"CV run not found: {candidate_id}")
             self._send_json(
                 {
@@ -2010,7 +2057,8 @@ class ReviewRequestHandler(BaseHTTPRequestHandler):
         candidate_id = unquote(path.removeprefix("/api/cv-runs/").removesuffix("/fusion")).strip("/")
         try:
             run_dir = _cv_run_dir(self.config, candidate_id)
-            if not (run_dir / "cv_run_manifest.json").exists():
+            run = RunningClipRun(run_dir)
+            if not run.manifest_path.exists():
                 raise FileNotFoundError(f"CV run not found: {candidate_id}")
             self._send_json({"job": fusion_job_status(candidate_id)})
         except (FileNotFoundError, ValueError) as exc:
@@ -2031,7 +2079,8 @@ class ReviewRequestHandler(BaseHTTPRequestHandler):
         ).strip("/")
         try:
             run_dir = _cv_run_dir(self.config, candidate_id)
-            if not (run_dir / "cv_run_manifest.json").exists():
+            run = RunningClipRun(run_dir)
+            if not run.manifest_path.exists():
                 raise FileNotFoundError(f"CV run not found: {candidate_id}")
             self._send_json({"job": features_job_status(candidate_id)})
         except (FileNotFoundError, ValueError) as exc:
@@ -2056,7 +2105,8 @@ class ReviewRequestHandler(BaseHTTPRequestHandler):
             from whodoirunlike.openpose_runner import openpose_setup_status
 
             run_dir = _cv_run_dir(self.config, candidate_id)
-            if not (run_dir / "cv_run_manifest.json").exists():
+            run = RunningClipRun(run_dir)
+            if not run.manifest_path.exists():
                 raise FileNotFoundError(f"CV run not found: {candidate_id}")
             self._send_json(
                 {
@@ -2093,7 +2143,8 @@ class ReviewRequestHandler(BaseHTTPRequestHandler):
             from whodoirunlike.openpose_runner import openpose_setup_status
 
             run_dir = _cv_run_dir(self.config, candidate_id)
-            if not (run_dir / "cv_run_manifest.json").exists():
+            run = RunningClipRun(run_dir)
+            if not run.manifest_path.exists():
                 raise FileNotFoundError(f"CV run not found: {candidate_id}")
             self._send_json(
                 {
@@ -2171,7 +2222,8 @@ class ReviewRequestHandler(BaseHTTPRequestHandler):
         candidate_id = unquote(path.removeprefix("/api/cv-runs/").removesuffix("/sam2")).strip("/")
         try:
             run_dir = _cv_run_dir(self.config, candidate_id)
-            if not (run_dir / "cv_run_manifest.json").exists():
+            run = RunningClipRun(run_dir)
+            if not run.manifest_path.exists():
                 raise FileNotFoundError(f"CV run not found: {candidate_id}")
             self._send_json({"job": mask_job_status(candidate_id)})
         except (FileNotFoundError, ValueError) as exc:
@@ -2190,7 +2242,8 @@ class ReviewRequestHandler(BaseHTTPRequestHandler):
         candidate_id = unquote(path.removeprefix("/api/cv-runs/").removesuffix("/mask")).strip("/")
         try:
             run_dir = _cv_run_dir(self.config, candidate_id)
-            if not (run_dir / "cv_run_manifest.json").exists():
+            run = RunningClipRun(run_dir)
+            if not run.manifest_path.exists():
                 raise FileNotFoundError(f"CV run not found: {candidate_id}")
             self._send_json(
                 {

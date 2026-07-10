@@ -4,10 +4,12 @@ from pathlib import Path
 from typing import Any
 
 from whodoirunlike.artifact_tables import export_cv_tables
+from whodoirunlike.cv_flow import utc_now_iso
 from whodoirunlike.form_features import compile_form_features
 from whodoirunlike.fusion_runner import run_fused_form
 from whodoirunlike.identity_runner import DEFAULT_IDENTITY_BACKEND, run_identity_tracking
 from whodoirunlike.qc import run_qc_metrics
+from whodoirunlike.running_clip_run import RunningClipRun
 from whodoirunlike.sam31_mlx_runner import run_sam31_mlx_mask
 
 
@@ -116,9 +118,21 @@ def run_full_cv_pipeline(
         if densepose.get("status") == "failed":
             raise RuntimeError(str(densepose.get("error") or "DensePose failed"))
     else:
-        densepose_path = run_dir / "densepose.jsonl"
+        run = RunningClipRun(run_dir)
+        manifest = run.read_manifest()
+        densepose_path = run.artifact_path("densepose", manifest)
         if not densepose_path.exists():
+            densepose_path.parent.mkdir(parents=True, exist_ok=True)
             densepose_path.write_text("", encoding="utf-8")
+        densepose_stage = manifest.setdefault("stages", {}).setdefault("densepose", {})
+        densepose_stage.pop("error", None)
+        densepose_stage.pop("setup_instructions", None)
+        manifest["updated_at"] = utc_now_iso()
+        run.update_stage(
+            "densepose",
+            {"status": "skipped", "output": str(densepose_path)},
+            manifest,
+        )
         result["steps"].append({"stage": "densepose", "result": {"status": "skipped"}})
 
     fusion = run_fused_form(run_dir=run_dir)

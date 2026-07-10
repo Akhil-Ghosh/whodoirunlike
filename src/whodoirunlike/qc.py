@@ -6,8 +6,9 @@ from statistics import mean
 from typing import Any
 
 from whodoirunlike.artifact_tables import read_jsonl
-from whodoirunlike.cv_flow import read_json, utc_now_iso, write_json
+from whodoirunlike.cv_flow import utc_now_iso, write_json
 from whodoirunlike.mask_artifacts import mask_rows_from_video, write_masks_jsonl_from_video
+from whodoirunlike.running_clip_run import RunningClipRun
 
 
 def _mean(values: list[float]) -> float:
@@ -124,16 +125,15 @@ def overall_uncertainty_score(metrics: dict[str, Any]) -> float:
 
 
 def run_qc_metrics(run_dir: Path) -> dict[str, Any]:
-    manifest_path = run_dir / "cv_run_manifest.json"
-    manifest = read_json(manifest_path)
-    paths = manifest.get("paths", {})
-    tracklets = Path(str(paths.get("tracklets_jsonl") or run_dir / "tracklets.jsonl"))
+    run = RunningClipRun(run_dir)
+    manifest = run.read_manifest()
+    tracklets = run.artifact_path("tracklets_jsonl", manifest)
     if not tracklets.exists():
-        tracklets = Path(str(paths.get("tracklets") or run_dir / "tracklets.parquet"))
-    masks_jsonl = Path(str(paths.get("masks_jsonl") or run_dir / "masks.jsonl"))
-    runner_mask = Path(str(paths["runner_mask"])) if paths.get("runner_mask") else run_dir / "missing_runner_mask.mp4"
-    pose_path = Path(str(paths["pose_landmarks"])) if paths.get("pose_landmarks") else run_dir / "missing_pose.jsonl"
-    fused_path = Path(str(paths["fused_form"])) if paths.get("fused_form") else run_dir / "missing_fused.jsonl"
+        tracklets = run.artifact_path("tracklets", manifest)
+    masks_jsonl = run.artifact_path("masks_jsonl", manifest)
+    runner_mask = run.artifact_path("runner_mask", manifest)
+    pose_path = run.artifact_path("pose_landmarks", manifest)
+    fused_path = run.artifact_path("fused_form", manifest)
     payload = {
         "version": 1,
         "candidate_id": manifest.get("candidate_id"),
@@ -145,14 +145,18 @@ def run_qc_metrics(run_dir: Path) -> dict[str, Any]:
     }
     payload["uncertainty_score"] = overall_uncertainty_score(payload)
 
-    qc_path = Path(str(paths.get("qc_metrics") or run_dir / "qc_metrics.json"))
+    qc_path = run.artifact_path("qc_metrics", manifest)
     write_json(qc_path, payload)
 
-    stages = manifest.setdefault("stages", {})
-    stages.setdefault("qc_metrics", {})["status"] = "complete"
-    stages["qc_metrics"]["output"] = str(qc_path)
-    stages["qc_metrics"]["uncertainty_score"] = payload["uncertainty_score"]
-    stages["qc_metrics"]["completed_at"] = utc_now_iso()
     manifest["updated_at"] = utc_now_iso()
-    write_json(manifest_path, manifest)
+    run.update_stage(
+        "qc_metrics",
+        {
+            "status": "complete",
+            "output": str(qc_path),
+            "uncertainty_score": payload["uncertainty_score"],
+            "completed_at": utc_now_iso(),
+        },
+        manifest,
+    )
     return payload

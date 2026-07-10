@@ -11,7 +11,8 @@ import cv2
 import numpy as np
 
 from whodoirunlike.cv_flow import utc_now_iso
-from whodoirunlike.sam2_runner import inspect_video, read_json, write_json
+from whodoirunlike.running_clip_run import RunningClipRun
+from whodoirunlike.sam2_runner import inspect_video
 from whodoirunlike.video_io import make_browser_playable_mp4
 
 
@@ -96,23 +97,25 @@ def update_manifest_densepose(
     error: str | None = None,
     setup_instructions: str | None = None,
 ) -> None:
-    manifest = read_json(manifest_path)
-    stages = manifest.setdefault("stages", {})
-    densepose_stage = stages.setdefault("densepose", {})
-    densepose_stage["status"] = status
-    densepose_stage["output"] = str(densepose_path)
-    densepose_stage["frame_count"] = int(frame_count)
-    densepose_stage["usable_frames"] = int(usable_frames)
+    run = RunningClipRun(manifest_path.parent)
+    manifest = run.read_manifest()
+    manifest["updated_at"] = utc_now_iso()
+    densepose_stage = manifest.setdefault("stages", {}).setdefault("densepose", {})
+    values: dict[str, Any] = {
+        "status": status,
+        "output": str(densepose_path),
+        "frame_count": int(frame_count),
+        "usable_frames": int(usable_frames),
+    }
     if error:
-        densepose_stage["error"] = error
+        values["error"] = error
     else:
         densepose_stage.pop("error", None)
     if setup_instructions:
-        densepose_stage["setup_instructions"] = setup_instructions
+        values["setup_instructions"] = setup_instructions
     else:
         densepose_stage.pop("setup_instructions", None)
-    manifest["updated_at"] = utc_now_iso()
-    write_json(manifest_path, manifest)
+    run.update_stage("densepose", values, manifest)
 
 
 def load_densepose_backend(
@@ -400,13 +403,13 @@ def run_densepose(
     progress_callback: DensePoseProgressCallback | None = None,
 ) -> dict[str, Any]:
     started_at = time.monotonic()
-    manifest_path = run_dir / "cv_run_manifest.json"
-    manifest = read_json(manifest_path)
-    paths = manifest["paths"]
-    source_segment = Path(paths["source_segment"])
-    runner_mask = Path(paths["runner_mask"])
-    densepose_path = Path(paths["densepose"])
-    qa_overlay_path = Path(paths["qa_overlay"])
+    run = RunningClipRun(run_dir)
+    manifest_path = run.manifest_path
+    manifest = run.read_manifest()
+    source_segment = run.artifact_path("source_segment", manifest)
+    runner_mask = run.artifact_path("runner_mask", manifest)
+    densepose_path = run.artifact_path("densepose", manifest)
+    qa_overlay_path = run.artifact_path("qa_overlay", manifest)
 
     if progress_callback:
         progress_callback(

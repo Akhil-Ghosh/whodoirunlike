@@ -13,6 +13,7 @@ import mediapipe as mp
 import numpy as np
 
 from whodoirunlike.cv_flow import utc_now_iso
+from whodoirunlike.running_clip_run import RunningClipRun
 from whodoirunlike.sam2_runner import inspect_video, read_json, write_json
 from whodoirunlike.video_io import make_browser_playable_mp4s
 from whodoirunlike.video_eval import FOOT_LANDMARKS, POSE_MODEL_URLS, ensure_pose_model
@@ -586,6 +587,7 @@ def process_pose_video(
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     skeleton_render_path.parent.mkdir(parents=True, exist_ok=True)
     skeleton_writer = cv2.VideoWriter(str(skeleton_render_path), fourcc, fps, (width, height), True)
+    qa_overlay_path.parent.mkdir(parents=True, exist_ok=True)
     qa_writer = cv2.VideoWriter(str(qa_overlay_path), fourcc, fps, (width, height), True)
     if not skeleton_writer.isOpened() or not qa_writer.isOpened():
         input_capture.release()
@@ -712,30 +714,35 @@ def update_manifest_after_pose(
     features_path: Path,
     result: dict[str, Any],
 ) -> None:
-    manifest = read_json(manifest_path)
-    stages = manifest.setdefault("stages", {})
-    stages.setdefault("pose", {})["status"] = "complete"
-    stages["pose"]["output"] = str(pose_landmarks_path)
-    stages["pose"]["summary"] = {
-        "pose_hit_rate": result.get("quality", {}).get("pose_hit_rate"),
-        "usable_rate": result.get("quality", {}).get("usable_rate"),
-        "visibility_mean": result.get("quality", {}).get("visibility_mean"),
-    }
-    stages.setdefault("renders", {})["status"] = "partial_complete"
-    stages["renders"]["skeleton_render"] = str(skeleton_render_path)
-    stages.setdefault("features", {})["status"] = "complete"
-    stages["features"]["output"] = str(features_path)
+    run = RunningClipRun(manifest_path.parent)
+    manifest = run.read_manifest()
     manifest["updated_at"] = utc_now_iso()
-    write_json(manifest_path, manifest)
+    run.update_stages(
+        {
+            "pose": {
+                "status": "complete",
+                "output": str(pose_landmarks_path),
+                "summary": {
+                    "pose_hit_rate": result.get("quality", {}).get("pose_hit_rate"),
+                    "usable_rate": result.get("quality", {}).get("usable_rate"),
+                    "visibility_mean": result.get("quality", {}).get("visibility_mean"),
+                },
+            },
+            "renders": {
+                "status": "partial_complete",
+                "skeleton_render": str(skeleton_render_path),
+            },
+            "features": {"status": "complete", "output": str(features_path)},
+        },
+        manifest,
+    )
 
 
 def update_manifest_after_pose_failure(manifest_path: Path, error: str) -> None:
-    manifest = read_json(manifest_path)
-    stages = manifest.setdefault("stages", {})
-    stages.setdefault("pose", {})["status"] = "failed"
-    stages["pose"]["error"] = error
+    run = RunningClipRun(manifest_path.parent)
+    manifest = run.read_manifest()
     manifest["updated_at"] = utc_now_iso()
-    write_json(manifest_path, manifest)
+    run.update_stage("pose", {"status": "failed", "error": error}, manifest)
 
 
 def run_pose_landmarks(
@@ -750,9 +757,23 @@ def run_pose_landmarks(
         valid = ", ".join(sorted(POSE_MODEL_URLS))
         raise ValueError(f"model_variant must be one of: {valid}")
 
-    manifest_path = run_dir / "cv_run_manifest.json"
-    manifest = read_json(manifest_path)
-    paths = manifest["paths"]
+    run = RunningClipRun(run_dir)
+    manifest_path = run.manifest_path
+    manifest = run.read_manifest()
+    resolved_manifest = run.ensure_paths(
+        manifest,
+        keys=(
+            "source_segment",
+            "masked_runner",
+            "runner_mask",
+            "person_prompt",
+            "pose_landmarks",
+            "skeleton_render",
+            "qa_overlay",
+            "features",
+        ),
+    )
+    paths = resolved_manifest["paths"]
     source_segment = Path(str(paths["source_segment"]))
     input_video = _resolve_pose_input(paths, input_mode)
     mask_video = Path(str(paths.get("runner_mask") or "")) if paths.get("runner_mask") else None

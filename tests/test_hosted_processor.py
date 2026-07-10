@@ -53,6 +53,54 @@ def test_hosted_manifest_seeds_center_target_prompt(tmp_path: Path) -> None:
     assert prompt["frame"]["frame_index"] == 0
 
 
+def test_local_and_hosted_manifests_share_canonical_path_map(tmp_path: Path) -> None:
+    from whodoirunlike import hosted_processor
+    from whodoirunlike.cv_flow import ReviewedClip, build_cv_run_manifest
+
+    run_dir = tmp_path / "run"
+    source_path = tmp_path / "source.mp4"
+    _write_tiny_video(source_path)
+    payload = hosted_processor.WorkerJobRequest(
+        run_id="12345678-1234-4234-9234-123456789abc",
+        callback_base_url="https://api.whodoirunlike.com",
+        source={
+            "url": "https://api.whodoirunlike.com/v1/jobs/12345678-1234-4234-9234-123456789abc/source",
+            "key": "uploads/12345678-1234-4234-9234-123456789abc/source.mp4",
+            "filename": "clip.mp4",
+            "content_type": "video/mp4",
+            "size_bytes": source_path.stat().st_size,
+        },
+    )
+    hosted_manifest_path = hosted_processor._write_hosted_manifest(
+        run_dir=run_dir,
+        payload=payload,
+        source_path=source_path,
+        video_meta={"width": 64, "height": 48, "fps": 10.0, "frame_count": 3},
+    )
+    local_manifest = build_cv_run_manifest(
+        ReviewedClip(
+            candidate_id=payload.run_id,
+            runner_name="Test Runner",
+            runner_slug="test-runner",
+            title="Test clip",
+            source_url="",
+            channel="",
+            video_path=source_path,
+            quality="good",
+            camera_angle="side",
+            start_seconds=0.0,
+            end_seconds=0.3,
+            notes="",
+            primary_bucket="running",
+        ),
+        run_dir,
+    )
+    hosted_manifest = json.loads(hosted_manifest_path.read_text(encoding="utf-8"))
+
+    assert hosted_manifest["paths"] == local_manifest["paths"]
+    assert hosted_manifest["paths"]["target_prompt"] == hosted_manifest["paths"]["person_prompt"]
+
+
 def test_write_prompt_frame_can_select_middle_frame(tmp_path: Path) -> None:
     from whodoirunlike import hosted_processor
 
@@ -234,7 +282,16 @@ def test_apply_demo_reference_artifacts_replaces_selected_outputs(
     (run_dir / "fused_overlay.mp4").write_bytes(b"bad fused")
     (run_dir / "skeleton_render.mp4").write_bytes(b"bad skeleton")
     (run_dir / "cv_run_manifest.json").write_text(
-        json.dumps({"stages": {}}),
+        json.dumps(
+            {
+                "version": 1,
+                "future_field": {"keep": True},
+                "stages": {
+                    "future_stage": {"status": "future"},
+                    "demo_reference_artifacts": {"future_value": 7},
+                },
+            }
+        ),
         encoding="utf-8",
     )
     monkeypatch.setattr(hosted_processor, "DEMO_ASSET_ROOT", asset_root)
@@ -256,6 +313,73 @@ def test_apply_demo_reference_artifacts_replaces_selected_outputs(
     assert (run_dir / "fused_overlay.mp4").read_bytes() == b"reference fused"
     assert (run_dir / "skeleton_render.mp4").read_bytes() == b"reference skeleton"
     assert manifest["stages"]["demo_reference_artifacts"]["status"] == "complete"
+    assert manifest["stages"]["demo_reference_artifacts"]["future_value"] == 7
+    assert manifest["stages"]["future_stage"] == {"status": "future"}
+    assert manifest["future_field"] == {"keep": True}
+
+
+def test_upload_artifacts_uses_configured_files_with_stable_public_names(
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    from whodoirunlike import hosted_processor
+
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    configured_dir = tmp_path / "substituted"
+    configured_dir.mkdir()
+    configured_features = configured_dir / "renamed-features.json"
+    configured_result = configured_dir / "renamed-result.json"
+    configured_features.write_text("{}", encoding="utf-8")
+    configured_result.write_text("{}", encoding="utf-8")
+    (run_dir / "person_prompt.json").write_text("{}", encoding="utf-8")
+    (run_dir / "source_segment.mp4").write_bytes(b"not publishable")
+    (run_dir / "runner_mask_metadata.jsonl").write_text("{}", encoding="utf-8")
+    (run_dir / "cv_run_manifest.json").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "paths": {
+                    "features": str(configured_features),
+                    "hosted_pipeline_result": str(configured_result),
+                },
+                "stages": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+    payload = hosted_processor.WorkerJobRequest(
+        run_id="12345678-1234-4234-9234-123456789abc",
+        callback_base_url="https://api.whodoirunlike.com",
+        source={
+            "url": "https://api.whodoirunlike.com/v1/jobs/12345678-1234-4234-9234-123456789abc/source",
+            "key": "uploads/12345678-1234-4234-9234-123456789abc/source.mp4",
+            "filename": "clip.mp4",
+            "content_type": "video/mp4",
+            "size_bytes": 123,
+        },
+    )
+    uploads: list[tuple[str, Path]] = []
+
+    def capture_upload(**kwargs: Any) -> None:
+        uploads.append((kwargs["name"], kwargs["path"]))
+
+    monkeypatch.setattr(hosted_processor, "_put_worker_artifact", capture_upload)
+
+    uploaded = hosted_processor._upload_artifacts(payload, run_dir)
+
+    assert uploaded == [
+        "cv_run_manifest.json",
+        "person_prompt.json",
+        "features.json",
+        "hosted_pipeline_result.json",
+    ]
+    assert uploads == [
+        ("cv_run_manifest.json", run_dir / "cv_run_manifest.json"),
+        ("person_prompt.json", run_dir / "person_prompt.json"),
+        ("features.json", configured_features),
+        ("hosted_pipeline_result.json", configured_result),
+    ]
 
 
 def test_processor_job_requires_shared_secret(monkeypatch: Any) -> None:

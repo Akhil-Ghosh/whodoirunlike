@@ -11,6 +11,8 @@ from typing import Any
 import cv2
 import imageio_ffmpeg
 
+from whodoirunlike.running_clip_run import RunningClipRun
+
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_REVIEW_MANIFEST = REPO_ROOT / "artifacts/evaluation/video_candidates.review20_best.json"
@@ -271,41 +273,7 @@ def build_view_bucket_payload(clip: ReviewedClip) -> dict[str, Any]:
 
 
 def build_cv_run_manifest(clip: ReviewedClip, run_dir: Path) -> dict[str, Any]:
-    prompt_path = run_dir / "person_prompt.json"
-    paths = {
-        "source_segment": str(run_dir / "source_segment.mp4"),
-        "prompt_frame": str(run_dir / "prompt_frame.jpg"),
-        "person_prompt": str(prompt_path),
-        "target_prompt": str(prompt_path),
-        "track_seed": str(run_dir / "track_seed.json"),
-        "view_bucket": str(run_dir / "view_bucket.json"),
-        "tracklets": str(run_dir / "tracklets.parquet"),
-        "tracklets_jsonl": str(run_dir / "tracklets.jsonl"),
-        "reid": str(run_dir / "reid.parquet"),
-        "reid_jsonl": str(run_dir / "reid.jsonl"),
-        "masks_jsonl": str(run_dir / "masks.jsonl"),
-        "mask_logits": str(run_dir / "mask_logits.zarr"),
-        "poses": str(run_dir / "poses.parquet"),
-        "pose_landmarks": str(run_dir / "pose_landmarks.jsonl"),
-        "runner_mask": str(run_dir / "runner_mask.mp4"),
-        "densepose": str(run_dir / "densepose.jsonl"),
-        "densepose_parquet": str(run_dir / "densepose.parquet"),
-        "fused_form": str(run_dir / "fused_form.jsonl"),
-        "fused_form_parquet": str(run_dir / "fused_form.parquet"),
-        "skeleton_render": str(run_dir / "skeleton_render.mp4"),
-        "masked_runner": str(run_dir / "masked_runner.mp4"),
-        "qa_overlay": str(run_dir / "qa_overlay.mp4"),
-        "fused_overlay": str(run_dir / "fused_overlay.mp4"),
-        "qc_metrics": str(run_dir / "qc_metrics.json"),
-        "features": str(run_dir / "features.json"),
-        "form_features": str(run_dir / "form_features.json"),
-        "form_feature_arrays": str(run_dir / "form_features.npz"),
-        "mmpose_landmarks": str(run_dir / "mmpose_landmarks.jsonl"),
-        "openpose_landmarks": str(run_dir / "openpose_landmarks.jsonl"),
-        "openpose_skeleton_render": str(run_dir / "openpose_skeleton_render.mp4"),
-        "openpose_qa_overlay": str(run_dir / "openpose_qa_overlay.mp4"),
-        "pose_comparison": str(run_dir / "pose_comparison.json"),
-    }
+    paths = RunningClipRun(run_dir).canonical_paths()
     return {
         "version": 1,
         "created_at": utc_now_iso(),
@@ -441,11 +409,10 @@ def prepare_single_clip_cv_run(
         annotations_path=annotations_path,
     )
     run_dir = output_root / clip.candidate_id
+    run = RunningClipRun(run_dir)
     segment_path = run_dir / "source_segment.mp4"
     prompt_frame_path = run_dir / "prompt_frame.jpg"
     prompt_path = run_dir / "person_prompt.json"
-    manifest_output_path = run_dir / "cv_run_manifest.json"
-
     trim_reviewed_segment(clip, segment_path, force=force)
     frame_meta = extract_prompt_frame(segment_path, prompt_frame_path, force=force)
     if force or not prompt_path.exists():
@@ -457,5 +424,5 @@ def prepare_single_clip_cv_run(
     if force or not view_bucket_path.exists():
         write_json(view_bucket_path, build_view_bucket_payload(clip))
     manifest = build_cv_run_manifest(clip, run_dir)
-    write_json(manifest_output_path, manifest)
+    run.write_manifest(manifest)
     return manifest

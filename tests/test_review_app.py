@@ -23,7 +23,10 @@ from whodoirunlike.review_app import (
     sam2_job_status,
     start_densepose_job,
     start_features_job,
+    start_fusion_job,
+    start_identity_job,
     start_mask_job,
+    start_pipeline_job,
     start_pose_job,
     start_sam2_job,
 )
@@ -251,6 +254,231 @@ def test_save_cv_prompt_updates_selection_and_stage_state(tmp_path: Path) -> Non
     assert saved_manifest["stages"]["whole_runner_mask"]["status"] == "pending_tracker"
     assert payload["stages"]["person_prompt"]["status"] == "ready"
     assert list_cv_runs(config)[0]["prompt_ready"] is True
+
+
+def test_custom_layout_drives_payload_prompt_save_and_stage_preflights(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    candidate_id = "custom-layout"
+    run_dir = write_cv_run(tmp_path, candidate_id=candidate_id)
+    manifest_path = run_dir / "cv_run_manifest.json"
+    configured_paths = {
+        "person_prompt": run_dir / "runner-prompt.custom.json",
+        "runner_mask": run_dir / "whole-runner.custom.mp4",
+        "pose_landmarks": run_dir / "pose-sequence.custom.jsonl",
+        "densepose": run_dir / "body-map.custom.jsonl",
+        "fused_form": run_dir / "form-signal.custom.jsonl",
+    }
+    configured_paths["person_prompt"].write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "candidate_id": candidate_id,
+                "custom_prompt_field": "keep",
+                "selection": {
+                    "type": "point",
+                    "positive_points": [{"x": 0.4, "y": 0.5}],
+                    "negative_points": [],
+                    "box": None,
+                    "mask_path": None,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    configured_paths["runner_mask"].write_bytes(b"configured mask")
+    for key in ("pose_landmarks", "densepose", "fused_form"):
+        configured_paths[key].write_text('{"configured": true}\n', encoding="utf-8")
+
+    default_prompt_path = run_dir / "person_prompt.json"
+    default_prompt_path.write_text(
+        json.dumps({"selection": {"type": "unset"}, "poisoned_default": True}),
+        encoding="utf-8",
+    )
+    for default_name in (
+        "runner_mask.mp4",
+        "pose_landmarks.jsonl",
+        "densepose.jsonl",
+        "fused_form.jsonl",
+    ):
+        assert not (run_dir / default_name).exists()
+
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["paths"].update({key: str(path) for key, path in configured_paths.items()})
+    manifest["custom_top_level"] = {"keep": True}
+    manifest["stages"]["person_prompt"]["custom_stage_field"] = "keep"
+    manifest["stages"]["future_stage"] = {"status": "vendor-specific", "keep": 7}
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    config = ReviewAppConfig(
+        source_path=tmp_path / "source.json",
+        annotations_path=tmp_path / "annotations.json",
+        static_dir=tmp_path,
+        repo_root=tmp_path,
+        limit=2,
+    )
+
+    class DummyThread:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            pass
+
+        def start(self) -> None:
+            pass
+
+    import whodoirunlike.review_app as review_app
+
+    monkeypatch.setattr(review_app.threading, "Thread", DummyThread)
+    monkeypatch.setattr(
+        review_app,
+        "densepose_setup_status",
+        lambda _config: {"ready": True, "reasons": []},
+    )
+    monkeypatch.setattr(
+        review_app,
+        "_cv_stage_backend",
+        lambda stage, _options=None: f"test_{stage}",
+    )
+
+    payload = load_cv_run_payload(config, candidate_id)
+
+    for key, configured_path in configured_paths.items():
+        assert payload["artifacts"][key]["path"] == str(configured_path)
+        assert payload["artifacts"][key]["exists"] is True
+    assert payload["artifacts"]["target_prompt"]["path"] == str(
+        configured_paths["person_prompt"]
+    )
+    assert payload["artifacts"]["qc_metrics"]["path"] == str(run_dir / "qc_metrics.json")
+    assert payload["prompt"]["selection"]["type"] == "point"
+
+    save_cv_prompt(
+        config,
+        candidate_id,
+        {"selection": {"positive_points": [{"x": 0.25, "y": 0.75}]}},
+    )
+
+    saved_prompt = json.loads(configured_paths["person_prompt"].read_text(encoding="utf-8"))
+    poisoned_prompt = json.loads(default_prompt_path.read_text(encoding="utf-8"))
+    saved_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert saved_prompt["selection"]["positive_points"] == [{"x": 0.25, "y": 0.75}]
+    assert saved_prompt["custom_prompt_field"] == "keep"
+    assert poisoned_prompt["poisoned_default"] is True
+    assert poisoned_prompt["selection"]["type"] == "unset"
+    assert saved_manifest["custom_top_level"] == {"keep": True}
+    assert saved_manifest["stages"]["person_prompt"]["custom_stage_field"] == "keep"
+    assert saved_manifest["stages"]["person_prompt"]["status"] == "ready"
+    assert saved_manifest["stages"]["detector_tracker"]["status"] == "pending_run"
+    assert saved_manifest["stages"]["whole_runner_mask"]["status"] == "pending_tracker"
+    assert saved_manifest["stages"]["future_stage"] == {
+        "status": "vendor-specific",
+        "keep": 7,
+    }
+
+    assert start_identity_job(config, candidate_id)["status"] == "running"
+    assert start_densepose_job(config, candidate_id)["status"] == "running"
+    assert start_fusion_job(config, candidate_id)["status"] == "running"
+    assert start_features_job(config, candidate_id)["status"] == "running"
+    assert start_pipeline_job(config, candidate_id)["status"] == "running"
+
+    updated_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert updated_manifest["custom_top_level"] == {"keep": True}
+    assert updated_manifest["stages"]["future_stage"] == {
+        "status": "vendor-specific",
+        "keep": 7,
+    }
+
+
+def test_external_prompt_is_rejected_before_thread_start(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    candidate_id = "external-prompt"
+    run_dir = write_cv_run(tmp_path, candidate_id=candidate_id)
+    external_prompt = tmp_path / "external-prompt.json"
+    external_prompt.write_text(
+        json.dumps({"selection": {"type": "point", "positive_points": [{"x": 0.5, "y": 0.5}]}}),
+        encoding="utf-8",
+    )
+    manifest_path = run_dir / "cv_run_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["paths"]["person_prompt"] = str(external_prompt)
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    config = ReviewAppConfig(
+        source_path=tmp_path / "source.json",
+        annotations_path=tmp_path / "annotations.json",
+        static_dir=tmp_path,
+        repo_root=tmp_path,
+        limit=2,
+    )
+    thread_starts = 0
+
+    class DummyThread:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            pass
+
+        def start(self) -> None:
+            nonlocal thread_starts
+            thread_starts += 1
+
+    import whodoirunlike.review_app as review_app
+
+    monkeypatch.setattr(review_app.threading, "Thread", DummyThread)
+
+    error = "Prompt path must resolve inside the Running Clip Run directory"
+    with pytest.raises(ValueError, match=error):
+        load_cv_run_payload(config, candidate_id)
+    with pytest.raises(ValueError, match=error):
+        save_cv_prompt(config, candidate_id, {"selection": {"positive_points": [{"x": 0.2, "y": 0.3}]}})
+    with pytest.raises(ValueError, match=error):
+        start_identity_job(config, candidate_id)
+
+    assert thread_starts == 0
+    assert review_app.identity_job_status(candidate_id)["status"] == "idle"
+    assert "detector_tracker" not in json.loads(manifest_path.read_text(encoding="utf-8"))["stages"]
+
+
+def test_external_stage_artifact_is_rejected_before_thread_start(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    candidate_id = "external-stage-artifact"
+    run_dir = write_cv_run(tmp_path, candidate_id=candidate_id)
+    external_pose_sequence = tmp_path / "external-pose-sequence.jsonl"
+    external_pose_sequence.write_text('{"frame_index": 0}\n', encoding="utf-8")
+    (run_dir / "fused_form.jsonl").write_text('{"frame_index": 0}\n', encoding="utf-8")
+    manifest_path = run_dir / "cv_run_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["paths"]["pose_landmarks"] = str(external_pose_sequence)
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    config = ReviewAppConfig(
+        source_path=tmp_path / "source.json",
+        annotations_path=tmp_path / "annotations.json",
+        static_dir=tmp_path,
+        repo_root=tmp_path,
+        limit=2,
+    )
+    thread_starts = 0
+
+    class DummyThread:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            pass
+
+        def start(self) -> None:
+            nonlocal thread_starts
+            thread_starts += 1
+
+    import whodoirunlike.review_app as review_app
+
+    monkeypatch.setattr(review_app.threading, "Thread", DummyThread)
+
+    error = "Pose Sequence path must resolve inside the Running Clip Run directory"
+    with pytest.raises(ValueError, match=error):
+        load_cv_run_payload(config, candidate_id)
+    with pytest.raises(ValueError, match=error):
+        start_features_job(config, candidate_id)
+
+    assert thread_starts == 0
+    assert features_job_status(candidate_id)["status"] == "idle"
+    assert "form_features" not in json.loads(manifest_path.read_text(encoding="utf-8"))["stages"]
 
 
 def test_save_cv_prompt_preserves_many_clicks(tmp_path: Path) -> None:

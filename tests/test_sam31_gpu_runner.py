@@ -224,12 +224,18 @@ def test_update_manifest_after_sam31_gpu_records_fallback(tmp_path) -> None:
     manifest_path = tmp_path / "cv_run_manifest.json"
     metadata_path = tmp_path / "runner_mask_metadata.jsonl"
     masks_jsonl_path = tmp_path / "masks.jsonl"
+    configured_masks_path = tmp_path / "custom-layout" / "runner-masks.jsonl"
     manifest_path.write_text(
         json.dumps(
             {
+                "version": 1,
                 "candidate_id": "clip-1",
-                "paths": {},
-                "stages": {"whole_runner_mask": {"error": "old failure"}},
+                "custom_top_level": {"keep": True},
+                "paths": {"masks_jsonl": str(configured_masks_path)},
+                "stages": {
+                    "whole_runner_mask": {"error": "old failure", "custom_stage_value": 7},
+                    "future_stage": {"status": "vendor-specific"},
+                },
             }
         ),
         encoding="utf-8",
@@ -255,6 +261,10 @@ def test_update_manifest_after_sam31_gpu_records_fallback(tmp_path) -> None:
     assert stage["fallback"]["reason"] == "sam31_gpu_empty_mask"
     assert stage["mask_summary"]["nonempty_frames"] == 3
     assert "error" not in stage
+    assert stage["custom_stage_value"] == 7
+    assert manifest["paths"]["masks_jsonl"] == str(configured_masks_path)
+    assert manifest["custom_top_level"] == {"keep": True}
+    assert manifest["stages"]["future_stage"] == {"status": "vendor-specific"}
 
 
 def test_collect_sam31_masks_tracks_visual_box_object_id(monkeypatch, tmp_path: Path) -> None:

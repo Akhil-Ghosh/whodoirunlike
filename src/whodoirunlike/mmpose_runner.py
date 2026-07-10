@@ -19,7 +19,8 @@ from whodoirunlike.pose_runner import (
     draw_skeleton,
     hard_mask_frame,
 )
-from whodoirunlike.sam2_runner import inspect_video, read_json, write_json
+from whodoirunlike.running_clip_run import RunningClipRun
+from whodoirunlike.sam2_runner import inspect_video, write_json
 from whodoirunlike.video_io import make_browser_playable_mp4s
 
 
@@ -730,45 +731,51 @@ def update_manifest_after_mmpose_pose(
     features_path: Path,
     result: dict[str, Any],
 ) -> None:
-    manifest = read_json(manifest_path)
+    run = RunningClipRun(manifest_path.parent)
+    manifest = run.read_manifest()
+    manifest["updated_at"] = utc_now_iso()
     paths = manifest.setdefault("paths", {})
     paths["pose_landmarks"] = str(pose_landmarks_path)
     paths["mmpose_landmarks"] = str(raw_mmpose_landmarks_path)
     paths["skeleton_render"] = str(skeleton_render_path)
     paths["qa_overlay"] = str(qa_overlay_path)
     paths["features"] = str(features_path)
-    stages = manifest.setdefault("stages", {})
     quality = result.get("quality", {})
-    stages["pose"] = {
-        "status": "complete",
-        "backend": spec.id,
-        "recommended_tool": f"RTMLib {spec.label}",
-        "output": str(pose_landmarks_path),
-        "raw_output": str(raw_mmpose_landmarks_path),
-        "summary": {
-            "pose_hit_rate": quality.get("pose_hit_rate"),
-            "usable_rate": quality.get("usable_rate"),
-            "visibility_mean": quality.get("visibility_mean"),
+    manifest.setdefault("stages", {}).setdefault("pose", {}).pop("error", None)
+    run.update_stages(
+        {
+            "pose": {
+                "status": "complete",
+                "backend": spec.id,
+                "recommended_tool": f"RTMLib {spec.label}",
+                "output": str(pose_landmarks_path),
+                "raw_output": str(raw_mmpose_landmarks_path),
+                "summary": {
+                    "pose_hit_rate": quality.get("pose_hit_rate"),
+                    "usable_rate": quality.get("usable_rate"),
+                    "visibility_mean": quality.get("visibility_mean"),
+                },
+            },
+            "renders": {
+                "status": "partial_complete",
+                "skeleton_render": str(skeleton_render_path),
+                "qa_overlay": str(qa_overlay_path),
+            },
+            "features": {"status": "complete", "output": str(features_path)},
         },
-    }
-    stages.setdefault("renders", {})["status"] = "partial_complete"
-    stages["renders"]["skeleton_render"] = str(skeleton_render_path)
-    stages["renders"]["qa_overlay"] = str(qa_overlay_path)
-    stages.setdefault("features", {})["status"] = "complete"
-    stages["features"]["output"] = str(features_path)
-    manifest["updated_at"] = utc_now_iso()
-    write_json(manifest_path, manifest)
+        manifest,
+    )
 
 
 def update_manifest_after_mmpose_failure(manifest_path: Path, *, backend: str, error: str) -> None:
-    manifest = read_json(manifest_path)
-    stages = manifest.setdefault("stages", {})
-    stage = stages.setdefault("pose", {})
-    stage["status"] = "failed"
-    stage["backend"] = backend
-    stage["error"] = error
+    run = RunningClipRun(manifest_path.parent)
+    manifest = run.read_manifest()
     manifest["updated_at"] = utc_now_iso()
-    write_json(manifest_path, manifest)
+    run.update_stage(
+        "pose",
+        {"status": "failed", "backend": backend, "error": error},
+        manifest,
+    )
 
 
 def build_rtmlib_model(
@@ -822,6 +829,7 @@ def process_mmpose_video(
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     skeleton_render_path.parent.mkdir(parents=True, exist_ok=True)
     skeleton_writer = cv2.VideoWriter(str(skeleton_render_path), fourcc, fps, (width, height), True)
+    qa_overlay_path.parent.mkdir(parents=True, exist_ok=True)
     qa_writer = cv2.VideoWriter(str(qa_overlay_path), fourcc, fps, (width, height), True)
     if not skeleton_writer.isOpened() or not qa_writer.isOpened():
         source_capture.release()
@@ -937,18 +945,16 @@ def run_mmpose_pose(
     started_at = time.monotonic()
     spec = mmpose_model_spec(model_id)
     setup = mmpose_setup_status(spec.id)
-    manifest_path = run_dir / "cv_run_manifest.json"
-    manifest = read_json(manifest_path)
-    paths = manifest["paths"]
-    source_segment = Path(str(paths["source_segment"]))
-    runner_mask = Path(str(paths.get("runner_mask") or ""))
-    raw_mmpose_landmarks_path = Path(
-        str(paths.get("mmpose_landmarks") or run_dir / "mmpose_landmarks.jsonl")
-    )
-    pose_landmarks_path = Path(str(paths.get("pose_landmarks") or run_dir / "pose_landmarks.jsonl"))
-    skeleton_render_path = Path(str(paths.get("skeleton_render") or run_dir / "skeleton_render.mp4"))
-    qa_overlay_path = Path(str(paths.get("qa_overlay") or run_dir / "qa_overlay.mp4"))
-    features_path = Path(str(paths.get("features") or run_dir / "features.json"))
+    run = RunningClipRun(run_dir)
+    manifest_path = run.manifest_path
+    manifest = run.read_manifest()
+    source_segment = run.artifact_path("source_segment", manifest)
+    runner_mask = run.artifact_path("runner_mask", manifest)
+    raw_mmpose_landmarks_path = run.artifact_path("mmpose_landmarks", manifest)
+    pose_landmarks_path = run.artifact_path("pose_landmarks", manifest)
+    skeleton_render_path = run.artifact_path("skeleton_render", manifest)
+    qa_overlay_path = run.artifact_path("qa_overlay", manifest)
+    features_path = run.artifact_path("features", manifest)
 
     if not setup["ready"]:
         error = "; ".join(setup["reasons"])

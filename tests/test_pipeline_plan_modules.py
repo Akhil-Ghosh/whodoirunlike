@@ -5,7 +5,9 @@ from pathlib import Path
 
 import cv2
 import numpy as np
+import pytest
 
+from whodoirunlike import artifact_tables
 from whodoirunlike.active_learning import build_uncertainty_queue
 from whodoirunlike.artifact_tables import export_cv_tables
 from whodoirunlike.mask_artifacts import encode_uncompressed_rle, write_masks_jsonl_from_video
@@ -155,3 +157,57 @@ def test_qc_tables_active_learning_and_multiview(tmp_path: Path) -> None:
     assert queue["entry_count"] == 2
     assert queue["entries"][0]["reason_tags"]
     assert match["appearance_cost"] < 0.01
+
+
+def test_table_fallbacks_keep_canonical_basenames_with_custom_inputs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_dir = tmp_path / "runs" / "candidate-custom"
+    inputs_dir = tmp_path / "custom-layout" / "signals"
+    pose_path = inputs_dir / "pose-sequence.jsonl"
+    densepose_path = inputs_dir / "body-map.jsonl"
+    fused_path = inputs_dir / "form-signal.jsonl"
+    write_jsonl(pose_path, [{"frame_index": 0, "usable": True}])
+    write_jsonl(densepose_path, [{"frame_index": 0, "usable": False}])
+    write_jsonl(fused_path, [{"frame_index": 0, "frame_confidence": 0.5}])
+    write_json(
+        run_dir / "cv_run_manifest.json",
+        {
+            "version": 1,
+            "candidate_id": "candidate-custom",
+            "paths": {
+                "pose_landmarks": str(pose_path),
+                "densepose": str(densepose_path),
+                "fused_form": str(fused_path),
+            },
+            "stages": {
+                "artifact_tables": {"status": "pending", "custom_field": "keep"},
+                "future_stage": {"status": "future"},
+            },
+        },
+    )
+    written_paths: list[Path] = []
+
+    def fake_write_parquet(path: Path, rows: list[dict[str, object]]) -> int:
+        written_paths.append(path)
+        return len(rows)
+
+    monkeypatch.setattr(artifact_tables, "write_parquet", fake_write_parquet)
+
+    result = export_cv_tables(run_dir)
+
+    assert written_paths == [
+        run_dir / "poses.parquet",
+        run_dir / "densepose.parquet",
+        run_dir / "fused_form.parquet",
+    ]
+    assert result["exports"]["densepose_parquet"]["output"] == str(
+        run_dir / "densepose.parquet"
+    )
+    assert result["exports"]["fused_form_parquet"]["output"] == str(
+        run_dir / "fused_form.parquet"
+    )
+    manifest = json.loads((run_dir / "cv_run_manifest.json").read_text(encoding="utf-8"))
+    assert manifest["stages"]["artifact_tables"]["custom_field"] == "keep"
+    assert manifest["stages"]["future_stage"] == {"status": "future"}

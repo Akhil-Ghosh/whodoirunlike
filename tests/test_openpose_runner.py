@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 from typing import Any
 
+from whodoirunlike import openpose_runner as openpose_runner_module
 from whodoirunlike.openpose_runner import (
     BODY25_NAMES,
     body25_row_to_pose_row,
@@ -147,6 +148,58 @@ def test_compare_openpose_to_mediapipe_writes_summary(tmp_path: Path) -> None:
     assert summary["bbox_iou_mean"] > 0
     assert summary["keypoint_pairs"] > 0
     assert json.loads(output_path.read_text(encoding="utf-8")) == summary
+
+
+def test_openpose_writers_create_separate_configured_output_directories(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    class FakeCapture:
+        def release(self) -> None:
+            pass
+
+    class FakeWriter:
+        def isOpened(self) -> bool:
+            return True
+
+        def release(self) -> None:
+            pass
+
+    opened_paths: list[Path] = []
+
+    def open_writer(path: str, *_: Any) -> FakeWriter:
+        output_path = Path(path)
+        assert output_path.parent.is_dir()
+        opened_paths.append(output_path)
+        return FakeWriter()
+
+    monkeypatch.setattr(
+        openpose_runner_module,
+        "inspect_video",
+        lambda _: {"width": 64, "height": 48, "fps": 24.0, "frame_count": 0},
+    )
+    monkeypatch.setattr(openpose_runner_module.cv2, "VideoCapture", lambda _: FakeCapture())
+    monkeypatch.setattr(openpose_runner_module.cv2, "VideoWriter_fourcc", lambda *_: 0)
+    monkeypatch.setattr(openpose_runner_module.cv2, "VideoWriter", open_writer)
+    monkeypatch.setattr(openpose_runner_module, "make_browser_playable_mp4s", lambda _: None)
+    skeleton_path = tmp_path / "new-skeleton-dir" / "skeleton.mp4"
+    qa_path = tmp_path / "new-qa-dir" / "qa.mp4"
+    assert not skeleton_path.parent.exists()
+    assert not qa_path.parent.exists()
+
+    result = openpose_runner_module._rows_from_openpose_json(
+        output_dir=tmp_path / "openpose-json",
+        source_segment=tmp_path / "source.mp4",
+        runner_mask=None,
+        landmarks_path=tmp_path / "landmarks" / "openpose.jsonl",
+        skeleton_render_path=skeleton_path,
+        qa_overlay_path=qa_path,
+        progress_callback=None,
+        started_at=0.0,
+    )
+
+    assert opened_paths == [skeleton_path, qa_path]
+    assert result["frame_count"] == 0
 
 
 def test_run_openpose_comparison_marks_manifest_unavailable(

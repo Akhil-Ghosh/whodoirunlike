@@ -499,6 +499,15 @@ def run_fused_form(
     fused_form_path = run.artifact_path("fused_form", manifest)
     fused_overlay_path = run.artifact_path("fused_overlay", manifest)
 
+    if progress_callback:
+        progress_callback(
+            build_fusion_progress(
+                phase="reading_inputs",
+                processed_frames=0,
+                total_frames=0,
+                elapsed_seconds=0.0,
+            )
+        )
     pose_rows = read_jsonl(pose_path)
     densepose_rows = read_jsonl(densepose_path)
     densepose_by_frame = {int(row.get("frame_index") or 0): row for row in densepose_rows}
@@ -541,6 +550,15 @@ def run_fused_form(
         raise ValueError(f"Could not open fused overlay writer: {fused_overlay_path}")
 
     fused_rows: list[dict[str, Any]] = []
+    if progress_callback:
+        progress_callback(
+            build_fusion_progress(
+                phase="rendering",
+                processed_frames=0,
+                total_frames=total_frames,
+                elapsed_seconds=time.monotonic() - started_at,
+            )
+        )
     try:
         for index, pose_row in enumerate(pose_rows):
             ok, frame = base_capture.read()
@@ -563,7 +581,7 @@ def run_fused_form(
             if progress_callback and (index == 0 or (index + 1) % 10 == 0):
                 progress_callback(
                     build_fusion_progress(
-                        phase="fusing_form",
+                        phase="rendering",
                         processed_frames=index + 1,
                         total_frames=total_frames,
                         elapsed_seconds=time.monotonic() - started_at,
@@ -576,7 +594,25 @@ def run_fused_form(
             mask_capture.release()
         writer.release()
 
+    if progress_callback:
+        progress_callback(
+            build_fusion_progress(
+                phase="encoding",
+                processed_frames=len(fused_rows),
+                total_frames=total_frames,
+                elapsed_seconds=time.monotonic() - started_at,
+            )
+        )
     make_browser_playable_mp4(fused_overlay_path)
+    if progress_callback:
+        progress_callback(
+            build_fusion_progress(
+                phase="writing_outputs",
+                processed_frames=len(fused_rows),
+                total_frames=total_frames,
+                elapsed_seconds=time.monotonic() - started_at,
+            )
+        )
     write_jsonl(fused_form_path, fused_rows)
     summary = summarize_fusion(fused_rows)
     update_manifest_after_fusion(
@@ -585,6 +621,15 @@ def run_fused_form(
         fused_overlay_path=fused_overlay_path,
         summary=summary,
     )
+    if progress_callback:
+        progress_callback(
+            build_fusion_progress(
+                phase="completed",
+                processed_frames=len(fused_rows),
+                total_frames=total_frames,
+                elapsed_seconds=time.monotonic() - started_at,
+            )
+        )
     return {
         "candidate_id": manifest.get("candidate_id"),
         "status": "complete",

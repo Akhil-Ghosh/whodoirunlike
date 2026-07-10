@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 import cv2
 import numpy as np
+import pytest
 from fastapi.testclient import TestClient
 
 
@@ -382,6 +384,234 @@ def test_upload_artifacts_uses_configured_files_with_stable_public_names(
     ]
 
 
+def test_upload_artifacts_emits_result_ready_only_after_fused_overlay_put(
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    from whodoirunlike import hosted_processor
+    from whodoirunlike.processing_telemetry import ProcessingTelemetry
+
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    fused_overlay = run_dir / "fused_overlay.mp4"
+    fused_overlay.write_bytes(b"viewable fused overlay")
+    (run_dir / "cv_run_manifest.json").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "paths": {"fused_overlay": str(fused_overlay)},
+                "stages": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+    payload = hosted_processor.WorkerJobRequest(
+        run_id="12345678-1234-4234-9234-123456789abc",
+        attempt_id="11111111-1111-4111-8111-111111111111",
+        callback_base_url="https://api.whodoirunlike.com",
+        source={
+            "url": "https://api.whodoirunlike.com/v1/jobs/12345678-1234-4234-9234-123456789abc/source",
+            "key": "uploads/12345678-1234-4234-9234-123456789abc/source.mp4",
+            "content_type": "video/mp4",
+            "size_bytes": 123,
+        },
+    )
+    uploaded_by_put: list[str] = []
+    monkeypatch.setattr(
+        hosted_processor,
+        "_put_worker_artifact",
+        lambda **kwargs: uploaded_by_put.append(kwargs["name"]),
+    )
+    telemetry = ProcessingTelemetry(
+        run_id=payload.run_id,
+        attempt_id=payload.attempt_id,
+        local_path=tmp_path / "events.jsonl",
+        wall_clock=lambda: datetime(2026, 7, 9, tzinfo=timezone.utc),
+        resource_sampler=lambda: {},
+        asynchronous_delivery=False,
+        sequence_start=100,
+    )
+
+    uploaded = hosted_processor._upload_artifacts(payload, run_dir, telemetry=telemetry)
+
+    events = [json.loads(line) for line in telemetry.local_path.read_text().splitlines()]
+    result_ready_index = next(
+        index for index, event in enumerate(events) if event["event_type"] == "result_ready"
+    )
+    fused_publish_complete_index = max(
+        index
+        for index, event in enumerate(events)
+        if event["event_type"] == "span_completed"
+        and event["measurements"].get("artifact_type") == "fused_overlay"
+    )
+    assert uploaded == ["cv_run_manifest.json", "fused_overlay.mp4"]
+    assert uploaded_by_put == uploaded
+    assert result_ready_index > fused_publish_complete_index
+    assert events[result_ready_index]["measurements"]["bytes"] == len(
+        b"viewable fused overlay"
+    )
+    assert events[0]["sequence"] == 100
+
+
+def test_upload_artifacts_does_not_emit_result_ready_when_fused_put_fails(
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    from whodoirunlike import hosted_processor
+    from whodoirunlike.processing_telemetry import ProcessingTelemetry
+
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    fused_overlay = run_dir / "fused_overlay.mp4"
+    fused_overlay.write_bytes(b"fused")
+    (run_dir / "cv_run_manifest.json").write_text(
+        json.dumps({"version": 1, "paths": {"fused_overlay": str(fused_overlay)}, "stages": {}}),
+        encoding="utf-8",
+    )
+    payload = hosted_processor.WorkerJobRequest(
+        run_id="12345678-1234-4234-9234-123456789abc",
+        callback_base_url="https://api.whodoirunlike.com",
+        source={
+            "url": "https://api.whodoirunlike.com/v1/jobs/12345678-1234-4234-9234-123456789abc/source",
+            "key": "uploads/source.mp4",
+            "content_type": "video/mp4",
+            "size_bytes": 123,
+        },
+    )
+
+    def fail_fused_put(**kwargs: Any) -> None:
+        if kwargs["name"] == "fused_overlay.mp4":
+            raise OSError("R2 write failed")
+
+    monkeypatch.setattr(hosted_processor, "_put_worker_artifact", fail_fused_put)
+    telemetry = ProcessingTelemetry(
+        run_id=payload.run_id,
+        attempt_id="11111111-1111-4111-8111-111111111111",
+        local_path=tmp_path / "events.jsonl",
+        resource_sampler=lambda: {},
+        asynchronous_delivery=False,
+    )
+
+    with pytest.raises(OSError, match="R2 write failed"):
+        hosted_processor._upload_artifacts(payload, run_dir, telemetry=telemetry)
+
+    events = [json.loads(line) for line in telemetry.local_path.read_text().splitlines()]
+    assert not any(event["event_type"] == "result_ready" for event in events)
+    assert events[-1]["event_type"] == "span_failed"
+    assert events[-1]["span"] == "publish"
+
+
+def test_artifact_put_sends_processing_attempt_header(
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    from whodoirunlike import hosted_processor
+
+    artifact = tmp_path / "fused_overlay.mp4"
+    artifact.write_bytes(b"fused")
+    requests: list[Any] = []
+
+    class FakeResponse:
+        def __enter__(self) -> FakeResponse:
+            return self
+
+        def __exit__(self, *_: Any) -> None:
+            return None
+
+    def fake_urlopen(request: Any, *, timeout: float) -> FakeResponse:
+        requests.append(request)
+        assert timeout == 120
+        return FakeResponse()
+
+    monkeypatch.setenv("WHODOIRUNLIKE_PROCESSOR_SHARED_SECRET", "secret")
+    monkeypatch.setattr(hosted_processor.urllib.request, "urlopen", fake_urlopen)
+
+    hosted_processor._put_worker_artifact(
+        callback_base_url="https://api.whodoirunlike.com",
+        run_id="12345678-1234-4234-9234-123456789abc",
+        attempt_id="11111111-1111-4111-8111-111111111111",
+        name="fused_overlay.mp4",
+        path=artifact,
+    )
+
+    assert len(requests) == 1
+    assert requests[0].get_header("X-processing-attempt-id") == (
+        "11111111-1111-4111-8111-111111111111"
+    )
+
+
+def test_job_payload_requires_exact_allowlisted_https_callback_origin(
+    monkeypatch: Any,
+) -> None:
+    from whodoirunlike import hosted_processor
+
+    monkeypatch.delenv("WHODOIRUNLIKE_CALLBACK_ORIGINS", raising=False)
+    monkeypatch.delenv("WHODOIRUNLIKE_ENVIRONMENT", raising=False)
+
+    def payload(callback: str, source_url: str) -> Any:
+        return hosted_processor.WorkerJobRequest(
+            run_id="12345678-1234-4234-9234-123456789abc",
+            callback_base_url=callback,
+            source={
+                "url": source_url,
+                "key": "uploads/source.mp4",
+                "content_type": "video/mp4",
+                "size_bytes": 123,
+            },
+        )
+
+    valid = payload(
+        "https://api.whodoirunlike.com",
+        "https://api.whodoirunlike.com/v1/jobs/12345678-1234-4234-9234-123456789abc/source",
+    )
+    hosted_processor._validate_job_payload(valid)
+
+    malicious_origin = payload(
+        "https://api.whodoirunlike.com.evil.example",
+        "https://api.whodoirunlike.com.evil.example/v1/jobs/12345678-1234-4234-9234-123456789abc/source",
+    )
+    with pytest.raises(Exception, match="origin is not allowed"):
+        hosted_processor._validate_job_payload(malicious_origin)
+
+    wrong_source = payload(
+        "https://api.whodoirunlike.com",
+        "https://staging-api.whodoirunlike.com/v1/jobs/12345678-1234-4234-9234-123456789abc/source",
+    )
+    with pytest.raises(Exception, match="expected job source"):
+        hosted_processor._validate_job_payload(wrong_source)
+
+    callback_with_path = payload(
+        "https://api.whodoirunlike.com/proxy",
+        "https://api.whodoirunlike.com/v1/jobs/12345678-1234-4234-9234-123456789abc/source",
+    )
+    with pytest.raises(Exception, match="origin is not allowed"):
+        hosted_processor._validate_job_payload(callback_with_path)
+
+
+def test_http_localhost_callback_requires_explicit_development(
+    monkeypatch: Any,
+) -> None:
+    from whodoirunlike import hosted_processor
+
+    payload = hosted_processor.WorkerJobRequest(
+        run_id="12345678-1234-4234-9234-123456789abc",
+        callback_base_url="http://localhost:8787",
+        source={
+            "url": "http://localhost:8787/v1/jobs/12345678-1234-4234-9234-123456789abc/source",
+            "key": "uploads/source.mp4",
+            "content_type": "video/mp4",
+            "size_bytes": 123,
+        },
+    )
+    monkeypatch.setenv("WHODOIRUNLIKE_CALLBACK_ORIGINS", "http://localhost:8787")
+    monkeypatch.setenv("WHODOIRUNLIKE_ENVIRONMENT", "production")
+    with pytest.raises(Exception, match="origin is not allowed"):
+        hosted_processor._validate_job_payload(payload)
+
+    monkeypatch.setenv("WHODOIRUNLIKE_ENVIRONMENT", "development")
+    hosted_processor._validate_job_payload(payload)
+
+
 def test_processor_job_requires_shared_secret(monkeypatch: Any) -> None:
     from whodoirunlike import api as api_module
 
@@ -523,6 +753,193 @@ def test_densepose_setup_status_reports_missing_default_files(monkeypatch: Any, 
     assert any("DENSEPOSE_CONFIG" in reason for reason in status["reasons"])
     assert any("DENSEPOSE_WEIGHTS" in reason for reason in status["reasons"])
     assert any("DensePose dependencies" in reason for reason in status["reasons"])
+
+
+def test_process_hosted_job_emits_complete_lifecycle_with_worker_attempt_id(
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    from whodoirunlike import hosted_processor
+    from whodoirunlike.processing_telemetry import ProcessingTelemetry
+
+    run_root = tmp_path / "hosted"
+    reports: list[dict[str, Any]] = []
+    terminal_seen_before_final_report: list[bool] = []
+    created_telemetry: list[ProcessingTelemetry] = []
+    monkeypatch.setattr(hosted_processor, "DEFAULT_HOSTED_RUN_ROOT", run_root)
+    monkeypatch.setenv("WHODOIRUNLIKE_PROCESSOR_SHARED_SECRET", "secret")
+
+    def make_telemetry(**kwargs: Any) -> ProcessingTelemetry:
+        telemetry = ProcessingTelemetry(
+            run_id=kwargs["run_id"],
+            attempt_id=kwargs["attempt_id"],
+            local_path=kwargs["run_dir"] / "processing_events.jsonl",
+            input_metadata=kwargs["input_metadata"],
+            runtime_metadata=kwargs["runtime_metadata"],
+            resource_sampler=lambda: {},
+            asynchronous_delivery=False,
+            sequence_start=kwargs["sequence_start"],
+            attempt_elapsed_offset_seconds=kwargs["attempt_elapsed_offset_seconds"],
+        )
+        created_telemetry.append(telemetry)
+        return telemetry
+
+    def download(_: Any, target: Path) -> None:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(b"source video")
+
+    def write_manifest(**kwargs: Any) -> Path:
+        path = kwargs["run_dir"] / "cv_run_manifest.json"
+        path.write_text(json.dumps({"version": 1, "paths": {}, "stages": {}}), encoding="utf-8")
+        return path
+
+    def run_pipeline(**kwargs: Any) -> dict[str, Any]:
+        assert kwargs["telemetry"] is created_telemetry[0]
+        return {"steps": [{"stage": "identity", "result": {"status": "complete"}}]}
+
+    def upload(_: Any, __: Path, *, telemetry: ProcessingTelemetry) -> list[str]:
+        telemetry.result_ready({"artifact_type": "fused_overlay", "bytes": 42})
+        return ["fused_overlay.mp4", "features.json"]
+
+    def fail_report(**kwargs: Any) -> None:
+        report = kwargs["payload"]
+        reports.append(report)
+        if report["status"] == "complete":
+            events_path = run_root / kwargs["run_id"] / "processing_events.jsonl"
+            terminal_seen_before_final_report.append(
+                json.loads(events_path.read_text().splitlines()[-1])["event_type"]
+                == "attempt_completed"
+            )
+        raise TimeoutError("transient report failure")
+
+    monkeypatch.setattr(hosted_processor, "create_hosted_telemetry", make_telemetry)
+    monkeypatch.setattr(hosted_processor, "_post_worker_report", fail_report)
+    monkeypatch.setattr(hosted_processor, "_download_source", download)
+    monkeypatch.setattr(hosted_processor, "_demo_upload_profile", lambda _: None)
+    monkeypatch.setattr(
+        hosted_processor,
+        "inspect_video",
+        lambda _: {"width": 1280, "height": 720, "fps": 30.0, "frame_count": 180},
+    )
+    monkeypatch.setattr(hosted_processor, "_write_hosted_manifest", write_manifest)
+    monkeypatch.setattr(hosted_processor, "run_full_cv_pipeline", run_pipeline)
+    monkeypatch.setattr(hosted_processor, "_apply_demo_reference_artifacts", lambda **_: [])
+    monkeypatch.setattr(hosted_processor, "_upload_artifacts", upload)
+    payload = hosted_processor.WorkerJobRequest(
+        run_id="12345678-1234-4234-9234-123456789abc",
+        attempt_id="77777777-7777-4777-8777-777777777777",
+        attempt_number=7,
+        attempt_started_at="2026-07-09T11:59:30.000Z",
+        processor_enqueued_at="2026-07-09T12:00:00.000Z",
+        telemetry_sequence_start=120,
+        runpod_job_id="runpod-job-99",
+        callback_base_url="https://api.whodoirunlike.com",
+        source={
+            "url": "https://api.whodoirunlike.com/v1/jobs/12345678-1234-4234-9234-123456789abc/source",
+            "key": "uploads/source.mp4",
+            "content_type": "video/mp4",
+            "size_bytes": 12,
+        },
+    )
+
+    result = hosted_processor.process_hosted_job(payload)
+
+    assert result["status"] == "complete"
+    assert result["attempt_id"] == "77777777-7777-4777-8777-777777777777"
+    assert result["artifacts_uploaded"] == ["fused_overlay.mp4", "features.json"]
+    assert all(
+        report["attempt_id"] == "77777777-7777-4777-8777-777777777777"
+        for report in reports
+    )
+    assert terminal_seen_before_final_report == [True]
+    events_path = run_root / payload.run_id / "processing_events.jsonl"
+    events = [json.loads(line) for line in events_path.read_text().splitlines()]
+    event_types = [event["event_type"] for event in events]
+    assert events[0]["sequence"] == 120
+    assert events[0]["runtime"]["attempt_number"] == 7
+    assert events[0]["runtime"]["runpod_job_id"] == "runpod-job-99"
+    assert events[0]["runtime"]["environment"] == "production"
+    assert events[0]["runtime"]["processor_version"]
+    assert next(
+        event
+        for event in events
+        if event["event_type"] == "stage_completed" and event["stage"] == "run_preparation"
+    )["input"]["duration_bucket"] == "5_10s"
+    assert event_types[0] == "stage_started"
+    assert events[0]["stage"] == "source_download"
+    assert event_types.index("analysis_completed") < event_types.index("result_ready")
+    assert event_types.index("result_ready") < event_types.index("attempt_completed")
+    assert event_types[-1] == "attempt_completed"
+    assert {
+        "telemetry_delivery_pending": 0,
+        "telemetry_delivery_failures": 0,
+        "telemetry_delivery_dropped": 0,
+        "telemetry_local_write_failures": 0,
+    }.items() <= events[-1]["measurements"].items()
+    assert [
+        event["stage"] for event in events if event["event_type"] == "stage_started"
+    ] == ["source_download", "run_preparation", "analysis_complete", "artifact_publish"]
+
+
+def test_process_hosted_job_emits_failed_stage_and_attempt_on_processing_error(
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    from whodoirunlike import hosted_processor
+    from whodoirunlike.processing_telemetry import ProcessingTelemetry
+
+    run_root = tmp_path / "hosted"
+    monkeypatch.setattr(hosted_processor, "DEFAULT_HOSTED_RUN_ROOT", run_root)
+    monkeypatch.setenv("WHODOIRUNLIKE_PROCESSOR_SHARED_SECRET", "secret")
+
+    def make_telemetry(**kwargs: Any) -> ProcessingTelemetry:
+        return ProcessingTelemetry(
+            run_id=kwargs["run_id"],
+            attempt_id=kwargs["attempt_id"],
+            local_path=kwargs["run_dir"] / "processing_events.jsonl",
+            resource_sampler=lambda: {},
+            asynchronous_delivery=False,
+            sequence_start=kwargs["sequence_start"],
+            attempt_elapsed_offset_seconds=kwargs["attempt_elapsed_offset_seconds"],
+        )
+
+    def fail_download(_: Any, __: Path) -> None:
+        raise RuntimeError(
+            "download failed from https://private.example/source token=private-token"
+        )
+
+    monkeypatch.setattr(hosted_processor, "create_hosted_telemetry", make_telemetry)
+    monkeypatch.setattr(hosted_processor, "_post_worker_report", lambda **_: None)
+    monkeypatch.setattr(hosted_processor, "_download_source", fail_download)
+    payload = hosted_processor.WorkerJobRequest(
+        run_id="12345678-1234-4234-9234-123456789abc",
+        attempt_id="99999999-9999-4999-8999-999999999999",
+        callback_base_url="https://api.whodoirunlike.com",
+        source={
+            "url": "https://api.whodoirunlike.com/v1/jobs/12345678-1234-4234-9234-123456789abc/source",
+            "key": "uploads/source.mp4",
+            "content_type": "video/mp4",
+            "size_bytes": 12,
+        },
+    )
+
+    result = hosted_processor.process_hosted_job(payload)
+
+    assert result["status"] == "failed"
+    assert result["attempt_id"] == "99999999-9999-4999-8999-999999999999"
+    events_path = run_root / payload.run_id / "processing_events.jsonl"
+    events = [json.loads(line) for line in events_path.read_text().splitlines()]
+    assert [event["event_type"] for event in events] == [
+        "stage_started",
+        "span_started",
+        "span_failed",
+        "stage_failed",
+        "attempt_failed",
+    ]
+    assert events[0]["stage"] == "source_download"
+    assert events[-1]["error"]["exception_type"] == "RuntimeError"
+    assert "private.example" not in events[-1]["error"]["message"]
+    assert "private-token" not in events[-1]["error"]["message"]
 
 
 def test_processor_job_accepts_authorized_worker_job(monkeypatch: Any) -> None:

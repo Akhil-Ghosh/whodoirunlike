@@ -1,9 +1,14 @@
-type WorkerEnv = Env & {
-  PROCESSOR_SHARED_SECRET?: string;
-  RUNPOD_API_KEY?: string;
-  RUNPOD_ENDPOINT_ID?: string;
-  RUNPOD_RUNSYNC?: string;
-};
+import {
+  deliverAnalyticsOutboxItem,
+  parseTelemetryRequest,
+  persistTelemetryEvent,
+  readTelemetryTimeline,
+  reconcileAnalyticsOutbox,
+  retryAnalyticsOutbox,
+  TelemetryConflictError,
+  TelemetryPayloadTooLargeError,
+} from "./telemetry";
+import type { ProcessingTelemetryEvent } from "./telemetry";
 
 type JobStatus = "uploaded" | "queued" | "running" | "complete" | "failed";
 
@@ -40,9 +45,20 @@ type RunnerTargetPrompt = {
 
 type ArtifactRecord = {
   key: string;
+  attempt_id?: string;
   content_type: string;
   size_bytes: number;
   updated_at: string;
+};
+
+type ProcessingAttemptRecord = {
+  attempt_id: string;
+  attempt_number: number;
+  created_at: string;
+  processor_enqueued_at?: string;
+  processor_queue_started_at?: string;
+  processor_started_at?: string;
+  runpod_job_id?: string;
 };
 
 type JobRecord = {
@@ -51,6 +67,7 @@ type JobRecord = {
   status: JobStatus;
   created_at: string;
   updated_at: string;
+  upload_completed_at?: string;
   upload: {
     key: string;
     filename: string | null;
@@ -59,14 +76,27 @@ type JobRecord = {
     consent_scope: string | null;
   };
   target_prompt?: RunnerTargetPrompt | null;
+  attempt_id?: string;
+  attempt_number?: number;
+  processor_enqueued_at?: string;
+  processor_queue_started_at?: string;
+  processor_started_at?: string;
+  runpod_job_id?: string;
+  processing_attempts?: ProcessingAttemptRecord[];
   progress?: unknown;
   summary?: unknown;
   error?: string;
+  error_code?: string;
   artifacts: Record<string, ArtifactRecord>;
 };
 
 type ProcessorPayload = {
   run_id: string;
+  attempt_id: string;
+  attempt_number: number;
+  attempt_started_at: string;
+  processor_enqueued_at: string;
+  telemetry_sequence_start: number;
   source: {
     url: string;
     key: string;
@@ -77,6 +107,19 @@ type ProcessorPayload = {
   target_prompt?: RunnerTargetPrompt | null;
   callback_base_url: string;
 };
+
+type EnqueuedJobRecord = JobRecord & {
+  attempt_id: string;
+  attempt_number: number;
+  processor_enqueued_at: string;
+};
+
+class JobMutationConflictError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "JobMutationConflictError";
+  }
+}
 
 type RunPodStartResponse = {
   id?: string;
@@ -91,13 +134,17 @@ const JSON_HEADERS = {
 
 export default {
   async fetch(request, env, ctx): Promise<Response> {
-    return handleRequest(request, env as WorkerEnv, ctx);
+    return handleRequest(request, env, ctx);
+  },
+  async scheduled(controller, env): Promise<void> {
+    await reconcileAnalyticsOutbox(env, controller.scheduledTime);
+    await retryAnalyticsOutbox(env, controller.scheduledTime);
   },
 } satisfies ExportedHandler<Env>;
 
 async function handleRequest(
   request: Request,
-  env: WorkerEnv,
+  env: Env,
   ctx: ExecutionContext,
 ): Promise<Response> {
   if (request.method === "OPTIONS") {
@@ -135,7 +182,15 @@ async function handleRequest(
       }
 
       if (request.method === "POST" && segments.length === 4 && segments[3] === "start") {
-        return handleStartJob(request, env, runId);
+        return handleStartJob(request, env, ctx, runId);
+      }
+
+      if (request.method === "POST" && segments.length === 4 && segments[3] === "events") {
+        return handlePostTelemetryEvent(request, env, ctx, runId);
+      }
+
+      if (request.method === "GET" && segments.length === 4 && segments[3] === "events") {
+        return handleGetTelemetryEvents(request, env, runId);
       }
 
       if (request.method === "GET" && segments.length === 4 && segments[3] === "source") {
@@ -155,7 +210,7 @@ async function handleRequest(
       }
 
       if (request.method === "POST" && segments.length === 4 && segments[3] === "report") {
-        return handleReport(request, env, runId);
+        return handleReport(request, env, ctx, runId);
       }
     }
 
@@ -183,7 +238,7 @@ async function handleRequest(
 
 async function handleUpload(
   request: Request,
-  env: WorkerEnv,
+  env: Env,
   ctx: ExecutionContext,
 ): Promise<Response> {
   const maxBytes = maxUploadBytes(env);
@@ -208,6 +263,7 @@ async function handleUpload(
 
   const runId = crypto.randomUUID();
   const createdAt = new Date().toISOString();
+  const initialAttempt = createProcessingAttempt(1, createdAt);
   const uploadKey = `uploads/${runId}/source${extension}`;
   const uploaded = await env.CLIPS.put(uploadKey, request.body, {
     httpMetadata: { contentType },
@@ -223,12 +279,15 @@ async function handleUpload(
     return errorResponse(request, env, 413, `Clip is too large. Max upload size is ${Math.floor(maxBytes / 1024 / 1024)} MB.`);
   }
 
+  const uploadCompletedAt = new Date().toISOString();
+
   const job: JobRecord = {
     version: 1,
     run_id: runId,
     status: "uploaded",
     created_at: createdAt,
-    updated_at: createdAt,
+    updated_at: uploadCompletedAt,
+    upload_completed_at: uploadCompletedAt,
     upload: {
       key: uploadKey,
       filename: originalFilename,
@@ -237,33 +296,87 @@ async function handleUpload(
       consent_scope: request.headers.get("x-clip-consent"),
     },
     target_prompt: promptResult.prompt,
+    attempt_id: initialAttempt.attempt_id,
+    attempt_number: initialAttempt.attempt_number,
+    processing_attempts: [initialAttempt],
     artifacts: {},
   };
   await writeJob(env, job);
+  await recordWorkerLifecycleEvent(
+    env,
+    ctx,
+    workerLifecycleEvent(env, job, {
+      sequence: 1,
+      event_type: "attempt_started",
+      event_time: createdAt,
+      status: "running",
+      elapsed_seconds: 0,
+    }),
+  );
+  await recordWorkerLifecycleEvent(
+    env,
+    ctx,
+    workerLifecycleEvent(env, job, {
+      sequence: 2,
+      event_type: "stage_started",
+      event_time: createdAt,
+      stage: "source_ingest",
+      status: "running",
+      elapsed_seconds: 0,
+    }),
+  );
+  await recordWorkerLifecycleEvent(
+    env,
+    ctx,
+    workerLifecycleEvent(env, job, {
+      sequence: 3,
+      event_type: "stage_completed",
+      event_time: uploadCompletedAt,
+      stage: "source_ingest",
+      status: "complete",
+      elapsed_seconds: elapsedSeconds(createdAt, uploadCompletedAt),
+      input: {
+        size_bytes: uploaded.size,
+        content_type: contentType.slice(0, 100),
+      },
+    }),
+  );
 
-  const response = publicJob(job, publicBaseUrl(request, env));
+  let responseJob = job;
   if (new URL(request.url).searchParams.get("start") === "1" && processorConfigured(env)) {
-    ctx.waitUntil(notifyProcessor(request, env, job));
-    response.status = "queued";
-    response.message = "Uploaded. Processor notification started.";
+    const queued = enqueueJob(job);
+    await writeJob(env, queued);
+    ctx.waitUntil(notifyProcessorSafely(request, env, ctx, queued));
+    responseJob = queued;
   }
 
+  const response = publicJob(responseJob, publicBaseUrl(request, env));
+  if (responseJob.status === "queued") {
+    response.message = "Uploaded. Processor notification started.";
+  }
   return jsonResponse(request, env, response, 201);
 }
 
-async function handleGetJob(request: Request, env: WorkerEnv, runId: string): Promise<Response> {
-  const job = await readJob(env, runId);
-  if (!job) {
+async function handleGetJob(request: Request, env: Env, runId: string): Promise<Response> {
+  const snapshot = await readJobSnapshot(env, runId);
+  if (!snapshot) {
     return errorResponse(request, env, 404, "Job not found.");
   }
+  const job = snapshot.job;
   return jsonResponse(request, env, publicJob(job, publicBaseUrl(request, env)));
 }
 
-async function handleStartJob(request: Request, env: WorkerEnv, runId: string): Promise<Response> {
-  const job = await readJob(env, runId);
-  if (!job) {
+async function handleStartJob(
+  request: Request,
+  env: Env,
+  ctx: ExecutionContext,
+  runId: string,
+): Promise<Response> {
+  const snapshot = await readJobSnapshot(env, runId);
+  if (!snapshot) {
     return errorResponse(request, env, 404, "Job not found.");
   }
+  const job = snapshot.job;
 
   if (job.status === "complete" || job.status === "running" || job.status === "queued") {
     return jsonResponse(request, env, publicJob(job, publicBaseUrl(request, env)), 202);
@@ -286,13 +399,172 @@ async function handleStartJob(request: Request, env: WorkerEnv, runId: string): 
     return errorResponse(request, env, 503, "Processor secret is not configured.");
   }
 
-  const queued = updateJob(job, "queued");
-  await writeJob(env, queued);
-  await notifyProcessor(request, env, queued);
+  const queued = enqueueJob(job);
+  if (!(await writeJobIfUnchanged(env, queued, snapshot.etag))) {
+    return errorResponse(request, env, 409, "Job changed while the attempt was being enqueued.");
+  }
+  if (queued.attempt_id !== job.attempt_id) {
+    const attemptStartedAt = currentProcessingAttempt(queued)?.created_at ?? queued.processor_enqueued_at;
+    await recordWorkerLifecycleEvent(
+      env,
+      ctx,
+      workerLifecycleEvent(env, queued, {
+        sequence: 1,
+        event_type: "attempt_started",
+        event_time: attemptStartedAt,
+        status: "running",
+        elapsed_seconds: 0,
+      }),
+    );
+  }
+  await notifyProcessor(request, env, ctx, queued);
   return jsonResponse(request, env, publicJob(queued, publicBaseUrl(request, env)), 202);
 }
 
-async function handleGetSource(request: Request, env: WorkerEnv, runId: string): Promise<Response> {
+async function handlePostTelemetryEvent(
+  request: Request,
+  env: Env,
+  ctx: ExecutionContext,
+  runId: string,
+): Promise<Response> {
+  if (!(await hasProcessorAuth(request, env))) {
+    return errorResponse(request, env, 401, "Processor authorization required.");
+  }
+  const job = await readJob(env, runId);
+  if (!job) {
+    return errorResponse(request, env, 404, "Job not found.");
+  }
+
+  const parsed = await parseTelemetryRequest(request, runId);
+  if (!parsed.ok) {
+    return errorResponse(request, env, parsed.status, parsed.error);
+  }
+  if (!jobHasAttempt(job, parsed.value.attempt_id)) {
+    return errorResponse(request, env, 409, "Processing attempt does not belong to this job.");
+  }
+  const requestedTerminalStatus = parsed.value.event_type === "attempt_completed"
+    ? "complete"
+    : parsed.value.event_type === "attempt_failed"
+      ? "failed"
+      : null;
+  if (
+    job.attempt_id === parsed.value.attempt_id &&
+    requestedTerminalStatus &&
+    (job.status === "complete" || job.status === "failed") &&
+    job.status !== requestedTerminalStatus
+  ) {
+    return errorResponse(request, env, 409, "Attempt already has the opposite terminal state.");
+  }
+
+  try {
+    const persisted = await persistTelemetryEvent(env, parsed.value);
+    if (persisted.outbox_key && persisted.outbox_body) {
+      ctx.waitUntil(
+        deliverAnalyticsOutboxItem(env, persisted.outbox_key, persisted.outbox_body),
+      );
+    }
+    let currentJob = await readJob(env, runId);
+    if (currentJob?.attempt_id === parsed.value.attempt_id) {
+      if (!currentJob.runpod_job_id && !currentJob.processor_started_at) {
+        currentJob = await mutateCurrentJob(
+          env,
+          runId,
+          parsed.value.attempt_id,
+          (current) => markProcessorStarted(current, parsed.value.event_time),
+        );
+        ctx.waitUntil(
+          recordDirectQueueCompletion(env, ctx, currentJob, parsed.value.event_time),
+        );
+      }
+      if (
+        parsed.value.event_type === "attempt_completed" ||
+        parsed.value.event_type === "attempt_failed"
+      ) {
+        const terminalStatus =
+          parsed.value.event_type === "attempt_completed" ? "complete" : "failed";
+        currentJob = await transitionJobStatus(env, currentJob, terminalStatus);
+        currentJob = await mutateCurrentJob(
+          env,
+          runId,
+          parsed.value.attempt_id,
+          (current) => ({
+            ...updateJob(current, current.status),
+            error_code: terminalStatus === "failed"
+              ? "PROCESSING_ATTEMPT_FAILED"
+              : undefined,
+          }),
+        );
+        if (currentJob.runpod_job_id) {
+          ctx.waitUntil(recordProviderQueueCompletion(env, ctx, currentJob));
+        }
+      }
+    }
+    return jsonResponse(
+      request,
+      env,
+      {
+        schema_version: 1,
+        run_id: runId,
+        attempt_id: parsed.value.attempt_id,
+        event_id: parsed.value.event_id,
+        status: persisted.duplicate ? "already_stored" : "stored",
+        aws_export_queued: persisted.outbox_key !== null,
+      },
+      persisted.duplicate ? 200 : 202,
+    );
+  } catch (error) {
+    if (error instanceof TelemetryConflictError) {
+      return errorResponse(request, env, 409, error.message);
+    }
+    if (error instanceof TelemetryPayloadTooLargeError) {
+      return errorResponse(request, env, 413, error.message);
+    }
+    if (error instanceof JobMutationConflictError) {
+      return errorResponse(request, env, 409, error.message);
+    }
+    throw error;
+  }
+}
+
+async function handleGetTelemetryEvents(
+  request: Request,
+  env: Env,
+  runId: string,
+): Promise<Response> {
+  if (!(await hasProcessorAuth(request, env))) {
+    return errorResponse(request, env, 401, "Processor authorization required.");
+  }
+  const job = await readJob(env, runId);
+  if (!job) {
+    return errorResponse(request, env, 404, "Job not found.");
+  }
+
+  const url = new URL(request.url);
+  const unknownParameter = [...url.searchParams.keys()].find(
+    (key) => key !== "attempt_id" && key !== "limit" && key !== "cursor",
+  );
+  if (unknownParameter) {
+    return errorResponse(request, env, 400, `Unknown timeline parameter: ${unknownParameter}.`);
+  }
+  const attemptId = normalizeAttemptId(url.searchParams.get("attempt_id") ?? job.attempt_id ?? "");
+  if (!attemptId || !jobHasAttempt(job, attemptId)) {
+    return errorResponse(request, env, 400, "A valid attempt_id is required.");
+  }
+  const rawLimit = url.searchParams.get("limit");
+  const limit = rawLimit === null ? 200 : Number.parseInt(rawLimit, 10);
+  if (!Number.isInteger(limit) || limit < 1 || limit > 200) {
+    return errorResponse(request, env, 400, "Timeline limit must be between 1 and 200.");
+  }
+  const cursor = url.searchParams.get("cursor") ?? undefined;
+  if (cursor && cursor.length > 1024) {
+    return errorResponse(request, env, 400, "Timeline cursor is too large.");
+  }
+
+  const timeline = await readTelemetryTimeline(env, runId, attemptId, limit, cursor);
+  return jsonResponse(request, env, timeline);
+}
+
+async function handleGetSource(request: Request, env: Env, runId: string): Promise<Response> {
   if (!(await hasProcessorAuth(request, env))) {
     return errorResponse(request, env, 401, "Processor authorization required.");
   }
@@ -315,7 +587,7 @@ async function handleGetSource(request: Request, env: WorkerEnv, runId: string):
 
 async function handlePutArtifact(
   request: Request,
-  env: WorkerEnv,
+  env: Env,
   runId: string,
   artifactName: string,
 ): Promise<Response> {
@@ -326,36 +598,53 @@ async function handlePutArtifact(
     return errorResponse(request, env, 400, "Artifact body is required.");
   }
 
-  const job = await readJob(env, runId);
-  if (!job) {
+  const snapshot = await readJobSnapshot(env, runId);
+  if (!snapshot) {
     return errorResponse(request, env, 404, "Job not found.");
+  }
+  const job = snapshot.job;
+  const attemptId = normalizeAttemptId(request.headers.get("x-processing-attempt-id") ?? "");
+  if (!attemptId) {
+    return errorResponse(request, env, 400, "X-Processing-Attempt-Id is required.");
+  }
+  if (job.attempt_id !== attemptId) {
+    return errorResponse(request, env, 409, "Processing attempt is stale.");
   }
 
   const contentType = request.headers.get("content-type") ?? "application/octet-stream";
-  const artifactKey = `artifacts/${runId}/${artifactName}`;
+  const artifactKey = `artifacts/${runId}/${attemptId}/${artifactName}`;
   const stored = await env.CLIPS.put(artifactKey, request.body, {
     httpMetadata: { contentType },
-    customMetadata: { run_id: runId, artifact_name: artifactName },
+    customMetadata: { run_id: runId, attempt_id: attemptId, artifact_name: artifactName },
   });
 
   const updated = updateJob(job, job.status);
   updated.artifacts[artifactName] = {
     key: artifactKey,
+    attempt_id: attemptId,
     content_type: contentType,
     size_bytes: stored.size,
     updated_at: updated.updated_at,
   };
-  await writeJob(env, updated);
+  if (!(await writeJobIfUnchanged(env, updated, snapshot.etag))) {
+    return errorResponse(request, env, 409, "Job changed during artifact upload.");
+  }
 
   return jsonResponse(request, env, {
     run_id: runId,
+    attempt_id: attemptId,
     artifact: artifactName,
     status: "stored",
     size_bytes: stored.size,
   });
 }
 
-async function handleReport(request: Request, env: WorkerEnv, runId: string): Promise<Response> {
+async function handleReport(
+  request: Request,
+  env: Env,
+  ctx: ExecutionContext,
+  runId: string,
+): Promise<Response> {
   if (!(await hasProcessorAuth(request, env))) {
     return errorResponse(request, env, 401, "Processor authorization required.");
   }
@@ -370,6 +659,7 @@ async function handleReport(request: Request, env: WorkerEnv, runId: string): Pr
   }
 
   const payload = (await request.json().catch(() => null)) as {
+    attempt_id?: string;
     status?: JobStatus;
     progress?: unknown;
     summary?: unknown;
@@ -379,19 +669,63 @@ async function handleReport(request: Request, env: WorkerEnv, runId: string): Pr
     return errorResponse(request, env, 400, "Report must be valid JSON.");
   }
 
-  const status = normalizeStatus(payload.status) ?? job.status;
-  const updated = updateJob(job, status);
-  if ("progress" in payload) updated.progress = payload.progress;
-  if ("summary" in payload) updated.summary = payload.summary;
-  if (payload.error) updated.error = String(payload.error).slice(0, 2000);
-  await writeJob(env, updated);
+  const attemptId = normalizeAttemptId(payload.attempt_id ?? "");
+  if (!attemptId) {
+    return errorResponse(request, env, 400, "Report attempt_id is required.");
+  }
+  if (job.attempt_id !== attemptId) {
+    return errorResponse(request, env, 409, "Processing attempt is stale.");
+  }
+
+  const latestJob = await readJob(env, runId);
+  if (!latestJob || latestJob.attempt_id !== attemptId) {
+    return errorResponse(request, env, 409, "Processing attempt became stale.");
+  }
+  const status = normalizeReportStatus(payload.status);
+  if (payload.status !== undefined && !status) {
+    return errorResponse(request, env, 400, "Invalid report status.");
+  }
+  const startedAtCandidate = status === "running" && !latestJob.processor_started_at
+    ? new Date().toISOString()
+    : null;
+  let updated: JobRecord;
+  try {
+    if (status) await transitionJobStatus(env, latestJob, status);
+    updated = await mutateCurrentJob(env, runId, attemptId, (current) => {
+      const next = updateJob(current, current.status);
+      if (startedAtCandidate && !next.processor_started_at) {
+        next.processor_started_at = startedAtCandidate;
+        next.processing_attempts = (next.processing_attempts ?? []).map((attempt) =>
+          attempt.attempt_id === attemptId
+            ? { ...attempt, processor_started_at: startedAtCandidate }
+            : attempt,
+        );
+      }
+      if ("progress" in payload) next.progress = sanitizePublicProgress(payload.progress);
+      if (status === "failed") next.error_code = "PROCESSING_ATTEMPT_FAILED";
+      if (status === "complete") next.error_code = undefined;
+      return next;
+    });
+  } catch (error) {
+    if (error instanceof JobMutationConflictError) {
+      return errorResponse(request, env, 409, error.message);
+    }
+    throw error;
+  }
+
+  if (startedAtCandidate && updated.processor_started_at === startedAtCandidate && !updated.runpod_job_id) {
+    ctx.waitUntil(recordDirectQueueCompletion(env, ctx, updated, startedAtCandidate));
+  }
+  if (status === "complete" || status === "failed") {
+    ctx.waitUntil(recordProviderQueueCompletion(env, ctx, updated));
+  }
 
   return jsonResponse(request, env, publicJob(updated, publicBaseUrl(request, env)));
 }
 
 async function handleGetArtifact(
   request: Request,
-  env: WorkerEnv,
+  env: Env,
   runId: string,
   artifactName: string,
 ): Promise<Response> {
@@ -414,11 +748,42 @@ async function handleGetArtifact(
   });
 }
 
-async function notifyProcessor(request: Request, env: WorkerEnv, job: JobRecord): Promise<void> {
+async function notifyProcessorSafely(
+  request: Request,
+  env: Env,
+  ctx: ExecutionContext,
+  job: EnqueuedJobRecord,
+): Promise<void> {
+  try {
+    await notifyProcessor(request, env, ctx, job);
+  } catch (error) {
+    console.error(
+      JSON.stringify({
+        level: "error",
+        message: "processor_enqueue_failed",
+        run_id: job.run_id,
+        attempt_id: job.attempt_id,
+        error: error instanceof Error ? error.message : "Unknown processor enqueue error",
+      }),
+    );
+  }
+}
+
+async function notifyProcessor(
+  request: Request,
+  env: Env,
+  ctx: ExecutionContext,
+  job: EnqueuedJobRecord,
+): Promise<void> {
   if (!env.PROCESSOR_SHARED_SECRET) return;
   const base = publicBaseUrl(request, env);
   const payload: ProcessorPayload = {
     run_id: job.run_id,
+    attempt_id: job.attempt_id,
+    attempt_number: job.attempt_number,
+    attempt_started_at: currentProcessingAttempt(job)?.created_at ?? job.processor_enqueued_at,
+    processor_enqueued_at: job.processor_enqueued_at,
+    telemetry_sequence_start: 100,
     source: {
       url: `${base}/v1/jobs/${job.run_id}/source`,
       key: job.upload.key,
@@ -430,36 +795,133 @@ async function notifyProcessor(request: Request, env: WorkerEnv, job: JobRecord)
     callback_base_url: base,
   };
 
-  if (runPodEndpointId(env) && env.RUNPOD_API_KEY) {
-    await notifyRunPod(env, job, payload);
-    return;
-  }
+  const enqueueStartedAt = new Date().toISOString();
+  await recordWorkerLifecycleEvent(
+    env,
+    ctx,
+    workerLifecycleEvent(env, job, {
+      sequence: 4,
+      event_type: "stage_started",
+      event_time: enqueueStartedAt,
+      stage: "processor_enqueue",
+      status: "running",
+      elapsed_seconds: 0,
+    }),
+  );
 
-  if (!env.PROCESSOR_URL) return;
-  const response = await fetch(`${trimTrailingSlash(env.PROCESSOR_URL)}/v1/processor/jobs`, {
-    method: "POST",
-    headers: {
-      ...JSON_HEADERS,
-      Authorization: `Bearer ${env.PROCESSOR_SHARED_SECRET}`,
-    },
-    body: JSON.stringify(payload),
-  });
-  if (!response.ok) {
-    const failed = updateJob(job, "failed");
-    failed.error = `Processor rejected job with HTTP ${response.status}`;
-    await writeJob(env, failed);
-    throw new Error(failed.error);
+  try {
+    if (asyncRunPodConfigured(env)) {
+      await notifyRunPod(env, job, payload);
+    } else if (env.PROCESSOR_URL) {
+      const response = await fetch(`${trimTrailingSlash(env.PROCESSOR_URL)}/v1/processor/jobs`, {
+        method: "POST",
+        headers: {
+          ...JSON_HEADERS,
+          Authorization: `Bearer ${env.PROCESSOR_SHARED_SECRET}`,
+        },
+        body: JSON.stringify(payload),
+      });
+      if (response.body) await response.body.cancel();
+      if (!response.ok) {
+        const failed = updateJob(job, "failed");
+        failed.error = `Processor rejected job with HTTP ${response.status}`;
+        await writeJob(env, failed);
+        throw new Error(failed.error);
+      }
+      console.log(
+        JSON.stringify({
+          level: "info",
+          message: "processor_enqueue_accepted",
+          run_id: job.run_id,
+          attempt_id: job.attempt_id,
+          processor: "configured_url",
+        }),
+      );
+    }
+
+    const completedAt = new Date().toISOString();
+    const acceptedJob = await markProcessorQueueStarted(env, job, completedAt);
+    await recordWorkerLifecycleEvent(
+      env,
+      ctx,
+      workerLifecycleEvent(env, acceptedJob, {
+        sequence: 5,
+        event_type: "stage_completed",
+        event_time: completedAt,
+        stage: "processor_enqueue",
+        status: "complete",
+        elapsed_seconds: elapsedSeconds(enqueueStartedAt, completedAt),
+      }),
+    );
+    await recordWorkerLifecycleEvent(
+      env,
+      ctx,
+      workerLifecycleEvent(env, acceptedJob, {
+        sequence: 6,
+        event_type: "stage_started",
+        event_time: completedAt,
+        stage: "processor_queue",
+        status: "running",
+        elapsed_seconds: 0,
+      }),
+    );
+  } catch (error) {
+    const failedAt = new Date().toISOString();
+    const failedJob = updateJob(job, "failed");
+    failedJob.error = "Processor enqueue failed.";
+    await writeJob(env, failedJob);
+    await recordWorkerLifecycleEvent(
+      env,
+      ctx,
+      workerLifecycleEvent(env, job, {
+        sequence: 5,
+        event_type: "stage_failed",
+        event_time: failedAt,
+        stage: "processor_enqueue",
+        status: "failed",
+        elapsed_seconds: elapsedSeconds(enqueueStartedAt, failedAt),
+        error: {
+          class: "ProcessorEnqueueError",
+          code: "upstream_enqueue.rejected",
+          category: "upstream_enqueue",
+          message: "Processor enqueue failed.",
+          retryable: true,
+        },
+      }),
+    );
+    const attemptStartedAt = currentProcessingAttempt(job)?.created_at ?? job.processor_enqueued_at;
+    await recordWorkerLifecycleEvent(
+      env,
+      ctx,
+      workerLifecycleEvent(env, job, {
+        sequence: 6,
+        event_type: "attempt_failed",
+        event_time: failedAt,
+        status: "failed",
+        elapsed_seconds: elapsedSeconds(attemptStartedAt, failedAt),
+        error: {
+          class: "ProcessorEnqueueError",
+          code: "upstream_enqueue.rejected",
+          category: "upstream_enqueue",
+          message: "Processor enqueue failed.",
+          retryable: true,
+        },
+      }),
+    );
+    throw error;
   }
 }
 
 async function notifyRunPod(
-  env: WorkerEnv,
-  job: JobRecord,
+  env: Env,
+  job: EnqueuedJobRecord,
   payload: ProcessorPayload,
 ): Promise<void> {
   const endpointId = runPodEndpointId(env);
-  const runMode = env.RUNPOD_RUNSYNC === "1" ? "runsync" : "run";
-  const response = await fetch(`https://api.runpod.ai/v2/${endpointId}/${runMode}`, {
+  if (env.RUNPOD_RUNSYNC === "1") {
+    throw new Error("RUNPOD_RUNSYNC_UNSUPPORTED");
+  }
+  const response = await fetch(`https://api.runpod.ai/v2/${endpointId}/run`, {
     method: "POST",
     headers: {
       ...JSON_HEADERS,
@@ -475,25 +937,68 @@ async function notifyRunPod(
     throw new Error(failed.error);
   }
 
-  const queued = updateJob(job, "queued");
-  queued.progress = {
-    phase: "queued_on_runpod",
-    runpod_job_id: body?.id ?? null,
-    runpod_status: body?.status ?? null,
-  };
-  await writeJob(env, queued);
+  const runpodJobId = typeof body?.id === "string" ? body.id.slice(0, 200) : undefined;
+  await mutateCurrentJob(env, job.run_id, job.attempt_id, (current) => {
+    const updated = updateJob(current, current.status);
+    if (runpodJobId) {
+      updated.runpod_job_id = runpodJobId;
+      updated.processing_attempts = (updated.processing_attempts ?? []).map((attempt) =>
+        attempt.attempt_id === job.attempt_id
+          ? { ...attempt, runpod_job_id: runpodJobId }
+          : attempt,
+      );
+    }
+    updated.progress = {
+      phase: "queued_on_runpod",
+      runpod_job_id: runpodJobId ?? null,
+      runpod_status: body?.status ?? null,
+    };
+    return updated;
+  });
+  console.log(
+    JSON.stringify({
+      level: "info",
+      message: "processor_enqueue_accepted",
+      run_id: job.run_id,
+      attempt_id: job.attempt_id,
+      processor: "runpod",
+      runpod_job_id: runpodJobId ?? null,
+    }),
+  );
 }
 
-function processorConfigured(env: WorkerEnv): boolean {
+function processorConfigured(env: Env): boolean {
   const hasSharedSecret = Boolean(env.PROCESSOR_SHARED_SECRET);
-  const hasRunPod = Boolean(runPodEndpointId(env) && env.RUNPOD_API_KEY);
+  const hasRunPod = asyncRunPodConfigured(env);
   const hasUrlProcessor = Boolean(env.PROCESSOR_URL);
+  if (
+    env.RUNPOD_RUNSYNC === "1" &&
+    runPodEndpointId(env) &&
+    env.RUNPOD_API_KEY &&
+    !hasUrlProcessor
+  ) {
+    console.error(
+      JSON.stringify({
+        level: "error",
+        message: "runpod_runsync_unsupported",
+        required_mode: "run",
+      }),
+    );
+  }
   return hasSharedSecret && (hasRunPod || hasUrlProcessor);
 }
 
-function processorConfigurationMessage(env: WorkerEnv): string {
+function processorConfigurationMessage(env: Env): string {
   if (!env.PROCESSOR_SHARED_SECRET) {
     return "Upload stored. Configure PROCESSOR_SHARED_SECRET before jobs can run.";
+  }
+  if (
+    env.RUNPOD_RUNSYNC === "1" &&
+    runPodEndpointId(env) &&
+    env.RUNPOD_API_KEY &&
+    !env.PROCESSOR_URL
+  ) {
+    return "Upload stored. RUNPOD_RUNSYNC=1 is unsupported; configure asynchronous RunPod /run mode.";
   }
   if (!runPodEndpointId(env) || !env.RUNPOD_API_KEY) {
     return "Upload stored. Configure RUNPOD_ENDPOINT_ID and RUNPOD_API_KEY before jobs can run.";
@@ -501,7 +1006,13 @@ function processorConfigurationMessage(env: WorkerEnv): string {
   return "Upload stored. Processor is not configured.";
 }
 
-function runPodEndpointId(env: WorkerEnv): string {
+function asyncRunPodConfigured(env: Env): boolean {
+  return Boolean(
+    env.RUNPOD_RUNSYNC !== "1" && runPodEndpointId(env) && env.RUNPOD_API_KEY,
+  );
+}
+
+function runPodEndpointId(env: Env): string {
   return (env.RUNPOD_ENDPOINT_ID ?? "").trim();
 }
 
@@ -521,7 +1032,12 @@ function publicJob(job: JobRecord, baseUrl: string): Record<string, unknown> {
   return {
     run_id: job.run_id,
     status: job.status,
+    attempt_id: job.attempt_id ?? null,
+    attempt_number: job.attempt_number ?? null,
+    processor_enqueued_at: job.processor_enqueued_at ?? null,
+    processing_attempt_count: job.processing_attempts?.length ?? (job.attempt_id ? 1 : 0),
     created_at: job.created_at,
+    upload_completed_at: job.upload_completed_at ?? null,
     updated_at: job.updated_at,
     upload: {
       filename: job.upload.filename,
@@ -536,15 +1052,343 @@ function publicJob(job: JobRecord, baseUrl: string): Record<string, unknown> {
           frame: job.target_prompt.frame,
         }
       : null,
-    progress: job.progress ?? null,
-    summary: job.summary ?? null,
-    error: job.error ?? null,
+    progress: sanitizePublicProgress(job.progress),
+    summary: null,
+    error: job.error_code ?? (job.status === "failed" ? "PROCESSING_ATTEMPT_FAILED" : null),
     artifacts,
     links: {
       job: `${baseUrl}/v1/jobs/${job.run_id}`,
       start: `${baseUrl}/v1/jobs/${job.run_id}/start`,
+      timeline: job.attempt_id
+        ? `${baseUrl}/v1/jobs/${job.run_id}/events?attempt_id=${encodeURIComponent(job.attempt_id)}`
+        : null,
     },
   };
+}
+
+type WorkerLifecycleDetails = Pick<
+  ProcessingTelemetryEvent,
+  "sequence" | "event_type" | "event_time"
+> &
+  Partial<
+    Pick<
+      ProcessingTelemetryEvent,
+      "stage" | "span" | "status" | "elapsed_seconds" | "input" | "measurements" | "error"
+    >
+  >;
+
+function workerLifecycleEvent(
+  env: Env,
+  job: JobRecord,
+  details: WorkerLifecycleDetails,
+): ProcessingTelemetryEvent {
+  if (!job.attempt_id || !job.attempt_number) {
+    throw new Error("Worker lifecycle event requires a Processing Attempt.");
+  }
+  return {
+    schema_version: 1,
+    event_id: crypto.randomUUID(),
+    run_id: job.run_id,
+    attempt_id: job.attempt_id,
+    runtime: {
+      service: "whodoirunlike-worker",
+      environment: env.ENVIRONMENT.slice(0, 64),
+      attempt_number: job.attempt_number,
+      processor_enqueued_at: job.processor_enqueued_at ?? null,
+    },
+    ...details,
+  };
+}
+
+async function recordWorkerLifecycleEvent(
+  env: Env,
+  ctx: ExecutionContext,
+  event: ProcessingTelemetryEvent,
+): Promise<void> {
+  try {
+    const persisted = await persistTelemetryEvent(env, event, "worker");
+    if (persisted.outbox_key && persisted.outbox_body) {
+      ctx.waitUntil(
+        deliverAnalyticsOutboxItem(env, persisted.outbox_key, persisted.outbox_body),
+      );
+    }
+  } catch (error) {
+    console.error(
+      JSON.stringify({
+        level: "error",
+        message: "worker_lifecycle_event_failed",
+        run_id: event.run_id,
+        attempt_id: event.attempt_id,
+        event_type: event.event_type,
+        stage: event.stage ?? null,
+        error: error instanceof Error ? error.message : "Unknown lifecycle persistence error",
+      }),
+    );
+  }
+}
+
+function elapsedSeconds(start: string, end: string): number {
+  return Math.max(0, (Date.parse(end) - Date.parse(start)) / 1000);
+}
+
+function enqueueJob(job: JobRecord): EnqueuedJobRecord {
+  const processorEnqueuedAt = new Date().toISOString();
+  const priorAttempts = job.processing_attempts ?? [];
+  const reuseInitialAttempt =
+    job.status === "uploaded" &&
+    Boolean(job.attempt_id) &&
+    Number.isInteger(job.attempt_number);
+  const nextAttemptNumber = reuseInitialAttempt
+    ? job.attempt_number ?? 1
+    : Math.max(
+        job.attempt_number ?? 0,
+        ...priorAttempts.map((attempt) => attempt.attempt_number),
+      ) + 1;
+  const attempt: ProcessingAttemptRecord = reuseInitialAttempt
+    ? {
+        attempt_id: job.attempt_id ?? crypto.randomUUID(),
+        attempt_number: nextAttemptNumber,
+        created_at:
+          priorAttempts.find((candidate) => candidate.attempt_id === job.attempt_id)?.created_at ??
+          job.created_at,
+        processor_enqueued_at: processorEnqueuedAt,
+      }
+    : {
+        ...createProcessingAttempt(nextAttemptNumber, processorEnqueuedAt),
+        processor_enqueued_at: processorEnqueuedAt,
+      };
+  const attempts = reuseInitialAttempt
+    ? priorAttempts.some((candidate) => candidate.attempt_id === attempt.attempt_id)
+      ? priorAttempts.map((candidate) =>
+          candidate.attempt_id === attempt.attempt_id ? attempt : candidate,
+        )
+      : [...priorAttempts, attempt]
+    : [...priorAttempts, attempt];
+  const queued = updateJob(job, "queued");
+  const enqueued: EnqueuedJobRecord = {
+    ...queued,
+    attempt_id: attempt.attempt_id,
+    attempt_number: attempt.attempt_number,
+    processor_enqueued_at: processorEnqueuedAt,
+    processing_attempts: attempts,
+    artifacts: reuseInitialAttempt ? queued.artifacts : {},
+    error_code: undefined,
+  };
+  console.log(
+    JSON.stringify({
+      level: "info",
+      message: "processing_attempt_enqueued",
+      run_id: job.run_id,
+      attempt_id: attempt.attempt_id,
+      attempt_number: attempt.attempt_number,
+      processor_enqueued_at: attempt.processor_enqueued_at,
+    }),
+  );
+  return enqueued;
+}
+
+function createProcessingAttempt(
+  attemptNumber: number,
+  createdAt: string,
+): ProcessingAttemptRecord {
+  return {
+    attempt_id: crypto.randomUUID(),
+    attempt_number: attemptNumber,
+    created_at: createdAt,
+  };
+}
+
+function jobHasAttempt(job: JobRecord, attemptId: string): boolean {
+  if (job.attempt_id === attemptId) return true;
+  return (job.processing_attempts ?? []).some((attempt) => attempt.attempt_id === attemptId);
+}
+
+function currentProcessingAttempt(job: JobRecord): ProcessingAttemptRecord | undefined {
+  return (job.processing_attempts ?? []).find(
+    (attempt) => attempt.attempt_id === job.attempt_id,
+  );
+}
+
+function markProcessorStarted(job: JobRecord, startedAt: string): JobRecord {
+  const updated = updateJob(job, job.status === "queued" ? "running" : job.status);
+  updated.processor_started_at = startedAt;
+  updated.processing_attempts = (updated.processing_attempts ?? []).map((attempt) =>
+    attempt.attempt_id === updated.attempt_id
+      ? { ...attempt, processor_started_at: startedAt }
+      : attempt,
+  );
+  return updated;
+}
+
+async function transitionJobStatus(
+  env: Env,
+  job: JobRecord,
+  target: "running" | "complete" | "failed",
+): Promise<JobRecord> {
+  const expectedAttemptId = job.attempt_id;
+  for (let retry = 0; retry < 6; retry += 1) {
+    const snapshot = await readJobSnapshot(env, job.run_id);
+    if (!snapshot || snapshot.job.attempt_id !== expectedAttemptId) {
+      throw new JobMutationConflictError("Processing attempt became stale.");
+    }
+    const current = snapshot.job;
+    if (current.status === target) return current;
+    if (current.status === "complete" || current.status === "failed") {
+      throw new JobMutationConflictError("Job already has a different terminal state.");
+    }
+
+    const nextStatus: JobStatus = current.status === "uploaded"
+      ? "queued"
+      : current.status === "queued"
+        ? "running"
+        : target;
+    const updated = updateJob(current, nextStatus);
+    if (await writeJobIfUnchanged(env, updated, snapshot.etag)) {
+      if (nextStatus === target) return updated;
+    }
+  }
+  throw new JobMutationConflictError("Job changed too many times during transition.");
+}
+
+async function mutateCurrentJob(
+  env: Env,
+  runId: string,
+  attemptId: string,
+  mutate: (job: JobRecord) => JobRecord,
+): Promise<JobRecord> {
+  for (let retry = 0; retry < 6; retry += 1) {
+    const snapshot = await readJobSnapshot(env, runId);
+    if (!snapshot || snapshot.job.attempt_id !== attemptId) {
+      throw new JobMutationConflictError("Processing attempt became stale.");
+    }
+    const updated = mutate(snapshot.job);
+    if (await writeJobIfUnchanged(env, updated, snapshot.etag)) return updated;
+  }
+  throw new JobMutationConflictError("Job changed too many times during update.");
+}
+
+async function recordProviderQueueCompletion(
+  env: Env,
+  ctx: ExecutionContext,
+  job: JobRecord,
+): Promise<void> {
+  if (!job.runpod_job_id || !env.RUNPOD_API_KEY || !runPodEndpointId(env)) return;
+  try {
+    const response = await fetch(
+      `https://api.runpod.ai/v2/${runPodEndpointId(env)}/status/${encodeURIComponent(job.runpod_job_id)}`,
+      { headers: { Authorization: `Bearer ${env.RUNPOD_API_KEY}` } },
+    );
+    const payload = (await response.json().catch(() => null)) as {
+      delayTime?: unknown;
+      status?: unknown;
+    } | null;
+    if (!response.ok) {
+      console.error(
+        JSON.stringify({
+          level: "error",
+          message: "runpod_queue_timing_rejected",
+          run_id: job.run_id,
+          attempt_id: job.attempt_id ?? null,
+          http_status: response.status,
+        }),
+      );
+      return;
+    }
+    const delayTime = typeof payload?.delayTime === "number" ? payload.delayTime : Number.NaN;
+    if (!Number.isFinite(delayTime) || delayTime < 0 || delayTime > 31_536_000_000) {
+      console.error(
+        JSON.stringify({
+          level: "error",
+          message: "runpod_queue_timing_missing",
+          run_id: job.run_id,
+          attempt_id: job.attempt_id ?? null,
+        }),
+      );
+      return;
+    }
+    const queueStartedAt = job.processor_queue_started_at ?? job.processor_enqueued_at;
+    if (!queueStartedAt) return;
+    const completedAt = new Date(Date.parse(queueStartedAt) + delayTime).toISOString();
+    await recordQueueCompletionEvent(env, ctx, job, completedAt, delayTime / 1000, {
+      timing_basis: "runpod_delay_time",
+      delay_time_ms: delayTime,
+    });
+  } catch (error) {
+    console.error(
+      JSON.stringify({
+        level: "error",
+        message: "runpod_queue_timing_failed",
+        run_id: job.run_id,
+        attempt_id: job.attempt_id ?? null,
+        error: error instanceof Error ? error.message : "Unknown RunPod status error",
+      }),
+    );
+  }
+}
+
+async function recordDirectQueueCompletion(
+  env: Env,
+  ctx: ExecutionContext,
+  job: JobRecord,
+  firstProcessorEventTime: string,
+): Promise<void> {
+  const queueStartedAt = job.processor_queue_started_at ?? job.processor_enqueued_at;
+  if (!queueStartedAt || job.runpod_job_id) return;
+  const elapsed = elapsedSeconds(queueStartedAt, firstProcessorEventTime);
+  await recordQueueCompletionEvent(env, ctx, job, firstProcessorEventTime, elapsed, {
+    timing_basis: "worker_dispatch_to_start_estimate",
+  });
+}
+
+async function recordQueueCompletionEvent(
+  env: Env,
+  ctx: ExecutionContext,
+  job: JobRecord,
+  eventTime: string,
+  elapsed: number,
+  measurements: Record<string, string | number>,
+): Promise<void> {
+  if (!job.attempt_id) return;
+  const event = workerLifecycleEvent(env, job, {
+    sequence: 7,
+    event_type: "stage_completed",
+    event_time: eventTime,
+    stage: "processor_queue",
+    status: "complete",
+    elapsed_seconds: elapsed,
+    measurements,
+  });
+  event.event_id = await deterministicTelemetryEventId(job.attempt_id, "processor_queue_completed");
+  await recordWorkerLifecycleEvent(env, ctx, event);
+}
+
+async function deterministicTelemetryEventId(attemptId: string, name: string): Promise<string> {
+  const digest = new Uint8Array(
+    await crypto.subtle.digest("SHA-256", new TextEncoder().encode(`${attemptId}:${name}`)),
+  );
+  digest[6] = (digest[6] & 0x0f) | 0x50;
+  digest[8] = (digest[8] & 0x3f) | 0x80;
+  const hex = Array.from(digest.slice(0, 16), (byte) =>
+    byte.toString(16).padStart(2, "0")
+  ).join("");
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
+
+async function markProcessorQueueStarted(
+  env: Env,
+  fallbackJob: EnqueuedJobRecord,
+  startedAt: string,
+): Promise<JobRecord> {
+  return mutateCurrentJob(env, fallbackJob.run_id, fallbackJob.attempt_id, (current) => {
+    const updated = updateJob(current, current.status);
+    updated.processor_queue_started_at = startedAt;
+    updated.processing_attempts = (updated.processing_attempts ?? []).map((attempt) =>
+      attempt.attempt_id === fallbackJob.attempt_id
+        ? { ...attempt, processor_queue_started_at: startedAt }
+        : attempt,
+    );
+    return updated;
+  });
 }
 
 function updateJob(job: JobRecord, status: JobStatus): JobRecord {
@@ -553,19 +1397,41 @@ function updateJob(job: JobRecord, status: JobStatus): JobRecord {
     status,
     updated_at: new Date().toISOString(),
     artifacts: { ...job.artifacts },
+    processing_attempts: job.processing_attempts
+      ? job.processing_attempts.map((attempt) => ({ ...attempt }))
+      : undefined,
   };
 }
 
-async function readJob(env: WorkerEnv, runId: string): Promise<JobRecord | null> {
-  const object = await env.CLIPS.get(jobKey(runId));
-  if (!object) return null;
-  return (await object.json()) as JobRecord;
+async function readJob(env: Env, runId: string): Promise<JobRecord | null> {
+  return (await readJobSnapshot(env, runId))?.job ?? null;
 }
 
-async function writeJob(env: WorkerEnv, job: JobRecord): Promise<void> {
+async function readJobSnapshot(
+  env: Env,
+  runId: string,
+): Promise<{ job: JobRecord; etag: string } | null> {
+  const object = await env.CLIPS.get(jobKey(runId));
+  if (!object) return null;
+  return { job: (await object.json()) as JobRecord, etag: object.etag };
+}
+
+async function writeJob(env: Env, job: JobRecord): Promise<void> {
   await env.CLIPS.put(jobKey(job.run_id), JSON.stringify(job, null, 2), {
     httpMetadata: { contentType: "application/json; charset=utf-8" },
   });
+}
+
+async function writeJobIfUnchanged(
+  env: Env,
+  job: JobRecord,
+  etag: string,
+): Promise<boolean> {
+  const stored = await env.CLIPS.put(jobKey(job.run_id), JSON.stringify(job, null, 2), {
+    onlyIf: { etagMatches: etag },
+    httpMetadata: { contentType: "application/json; charset=utf-8" },
+  });
+  return stored !== null;
 }
 
 function jobKey(runId: string): string {
@@ -574,7 +1440,7 @@ function jobKey(runId: string): string {
 
 function jsonResponse(
   request: Request,
-  env: WorkerEnv,
+  env: Env,
   payload: unknown,
   status = 200,
 ): Response {
@@ -587,17 +1453,17 @@ function jsonResponse(
   });
 }
 
-function errorResponse(request: Request, env: WorkerEnv, status: number, message: string): Response {
+function errorResponse(request: Request, env: Env, status: number, message: string): Response {
   return jsonResponse(request, env, { error: message }, status);
 }
 
-function notFound(request: Request, env: WorkerEnv): Response {
+function notFound(request: Request, env: Env): Response {
   return errorResponse(request, env, 404, "Not found.");
 }
 
 function objectResponse(
   request: Request,
-  env: WorkerEnv,
+  env: Env,
   object: R2ObjectBody,
   headers: Record<string, string>,
 ): Response {
@@ -610,7 +1476,7 @@ function objectResponse(
   });
 }
 
-function corsHeaders(request: Request, env: WorkerEnv): Record<string, string> {
+function corsHeaders(request: Request, env: Env): Record<string, string> {
   const origin = request.headers.get("origin");
   const origins = allowedOrigins(env);
   const allowedOrigin = origin && (origins.includes("*") || origins.includes(origin)) ? origin : origins[0];
@@ -618,7 +1484,7 @@ function corsHeaders(request: Request, env: WorkerEnv): Record<string, string> {
   return {
     "Access-Control-Allow-Origin": allowedOrigin,
     "Access-Control-Allow-Methods": "GET, POST, PUT, OPTIONS",
-    "Access-Control-Allow-Headers": "Authorization, Content-Type, X-Clip-Consent, X-Original-Filename, X-Runner-Prompt",
+    "Access-Control-Allow-Headers": "Authorization, Content-Type, X-Clip-Consent, X-Original-Filename, X-Processing-Attempt-Id, X-Runner-Prompt",
     "Access-Control-Max-Age": "86400",
     Vary: "Origin",
   };
@@ -756,7 +1622,7 @@ function roundUnit(value: number): number {
   return Math.round(value * 1_000_000) / 1_000_000;
 }
 
-function allowedOrigins(env: WorkerEnv): string[] {
+function allowedOrigins(env: Env): string[] {
   const raw = env.PUBLIC_ORIGINS || "https://whodoirunlike.com";
   return raw
     .split(",")
@@ -777,7 +1643,7 @@ function extensionForUpload(contentType: string, filename: string | null): strin
   return null;
 }
 
-function maxUploadBytes(env: WorkerEnv): number {
+function maxUploadBytes(env: Env): number {
   const parsed = Number.parseInt(env.MAX_UPLOAD_BYTES || "", 10);
   return Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_MAX_UPLOAD_BYTES;
 }
@@ -794,25 +1660,43 @@ function normalizeRunId(value: string): string | null {
   return /^[a-f0-9-]{32,36}$/i.test(decoded) ? decoded : null;
 }
 
+function normalizeAttemptId(value: string): string | null {
+  return /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(value) ? value : null;
+}
+
 function normalizeArtifactName(value: string): string | null {
   const decoded = decodeURIComponent(value);
   return /^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,95}$/.test(decoded) ? decoded : null;
 }
 
-function normalizeStatus(value: unknown): JobStatus | null {
-  if (
-    value === "uploaded" ||
-    value === "queued" ||
-    value === "running" ||
-    value === "complete" ||
-    value === "failed"
-  ) {
-    return value;
-  }
-  return null;
+function normalizeReportStatus(value: unknown): "running" | "complete" | "failed" | null {
+  return value === "running" || value === "complete" || value === "failed" ? value : null;
 }
 
-function publicBaseUrl(request: Request, env: WorkerEnv): string {
+function sanitizePublicProgress(value: unknown): Record<string, string | number> | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const record = value as Record<string, unknown>;
+  const output: Record<string, string | number> = {};
+  if (typeof record.phase === "string" && /^[a-z][a-z0-9_.-]{0,63}$/.test(record.phase)) {
+    output.phase = record.phase;
+  }
+  const numericFields = [
+    "elapsed_seconds",
+    "processed_frames",
+    "total_frames",
+    "percent",
+    "eta_seconds",
+  ] as const;
+  for (const field of numericFields) {
+    const numeric = record[field];
+    if (typeof numeric === "number" && Number.isFinite(numeric) && numeric >= 0) {
+      output[field] = numeric;
+    }
+  }
+  return Object.keys(output).length ? output : null;
+}
+
+function publicBaseUrl(request: Request, env: Env): string {
   return trimTrailingSlash(env.PUBLIC_API_BASE_URL || new URL(request.url).origin);
 }
 
@@ -825,7 +1709,7 @@ function contentDisposition(filename: string): string {
   return `inline; filename="${fallback}"`;
 }
 
-async function hasProcessorAuth(request: Request, env: WorkerEnv): Promise<boolean> {
+async function hasProcessorAuth(request: Request, env: Env): Promise<boolean> {
   const expected = env.PROCESSOR_SHARED_SECRET;
   if (!expected) return false;
   const auth = request.headers.get("authorization") ?? "";
@@ -836,11 +1720,7 @@ async function hasProcessorAuth(request: Request, env: WorkerEnv): Promise<boole
 
 async function timingSafeEqual(left: string, right: string): Promise<boolean> {
   const [leftHash, rightHash] = await Promise.all([sha256(left), sha256(right)]);
-  let diff = 0;
-  for (let index = 0; index < leftHash.length; index += 1) {
-    diff |= leftHash[index] ^ rightHash[index];
-  }
-  return diff === 0;
+  return crypto.subtle.timingSafeEqual(leftHash, rightHash);
 }
 
 async function sha256(value: string): Promise<Uint8Array> {

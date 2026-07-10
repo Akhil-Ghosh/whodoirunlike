@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from contextlib import nullcontext
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import cv2
 import numpy as np
@@ -167,6 +167,7 @@ def write_mask_outputs(
     masked_runner_path: Path,
     qa_overlay_path: Path,
     metadata_path: Path,
+    phase_callback: Callable[[str], None] | None = None,
 ) -> None:
     first = cv2.imread(str(frame_paths[0]))
     if first is None:
@@ -234,7 +235,11 @@ def write_mask_outputs(
     mask_writer.release()
     masked_writer.release()
     qa_writer.release()
+    if phase_callback:
+        phase_callback("encoding")
     make_browser_playable_mp4s([runner_mask_path, masked_runner_path, qa_overlay_path])
+    if phase_callback:
+        phase_callback("writing_outputs")
     with metadata_path.open("w", encoding="utf-8") as f:
         for row in metadata_rows:
             f.write(json.dumps(row) + "\n")

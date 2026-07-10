@@ -83,6 +83,8 @@ WHODOIRUNLIKE_PROCESSOR_SHARED_SECRET=<same value as Cloudflare Worker>
 HF_TOKEN=<Hugging Face token with access to facebook/sam3.1>
 WHODOIRUNLIKE_MASK_BACKEND=sam31_gpu
 DENSEPOSE_DEVICE=cuda
+WHODOIRUNLIKE_ENVIRONMENT=production
+WHODOIRUNLIKE_CALLBACK_ORIGINS=https://api.whodoirunlike.com,https://staging-api.whodoirunlike.com
 ```
 
 Cloudflare Worker secrets:
@@ -122,6 +124,8 @@ runpodctl template create \
     "WHODOIRUNLIKE_PROCESSOR_SHARED_SECRET":"<shared-secret>",
     "HF_TOKEN":"<hf-token>",
     "WHODOIRUNLIKE_MASK_BACKEND":"sam31_gpu",
+    "WHODOIRUNLIKE_ENVIRONMENT":"production",
+    "WHODOIRUNLIKE_CALLBACK_ORIGINS":"https://api.whodoirunlike.com,https://staging-api.whodoirunlike.com",
     "WHODOIRUNLIKE_IDENTITY_BACKEND":"boxmot_bytetrack",
     "WHODOIRUNLIKE_POSE_BACKEND":"mmpose_rtmpose_l_384",
     "WHODOIRUNLIKE_SKIP_DENSEPOSE":"false",
@@ -149,6 +153,12 @@ Then set `RUNPOD_ENDPOINT_ID` in [worker/wrangler.jsonc](../worker/wrangler.json
 cd worker
 npm run deploy
 ```
+
+Hosted jobs must use RunPod's asynchronous `/run` operation. The Worker rejects `RUNPOD_RUNSYNC=1` because synchronous dispatch cannot preserve the ordered attempt lifecycle. RunPod's provider `delayTime` is collected separately as the authoritative queue/cold-start duration.
+
+The image workflow stamps `WHODOIRUNLIKE_PROCESSOR_VERSION` with the Git commit SHA at build time, so latency comparisons can be tied to an exact Processor revision.
+
+Processing telemetry is posted back with `WHODOIRUNLIKE_PROCESSOR_SHARED_SECRET`. Do not put `AWS_ANALYTICS_SHARED_SECRET` in the RunPod environment; only the Cloudflare Worker exports metadata to AWS.
 
 ## Health check
 

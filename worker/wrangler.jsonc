@@ -8,6 +8,9 @@
     "enabled": true,
     "head_sampling_rate": 1
   },
+  "triggers": {
+    "crons": ["*/5 * * * *"]
+  },
   "routes": [
     {
       "pattern": "api.whodoirunlike.com",
@@ -26,6 +29,8 @@
     "PUBLIC_ORIGINS": "https://whodoirunlike.com,http://127.0.0.1:4173,http://localhost:4173",
     "MAX_UPLOAD_BYTES": "78643200",
     "PROCESSOR_URL": "",
+    "RUNPOD_RUNSYNC": "0",
+    "AWS_ANALYTICS_INGEST_URL": "https://rn796ozrld.execute-api.us-east-1.amazonaws.com/v1/events",
     "RUNPOD_ENDPOINT_ID": "8dzd0456cig8ge"
   },
   "env": {
@@ -49,6 +54,8 @@
         "PUBLIC_ORIGINS": "https://whodoirunlike.com,http://127.0.0.1:4173,http://localhost:4173",
         "MAX_UPLOAD_BYTES": "78643200",
         "PROCESSOR_URL": "",
+        "RUNPOD_RUNSYNC": "0",
+        "AWS_ANALYTICS_INGEST_URL": "",
         "RUNPOD_ENDPOINT_ID": "8dzd0456cig8ge"
       }
     }

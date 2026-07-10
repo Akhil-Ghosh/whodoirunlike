@@ -6,13 +6,16 @@
   "scripts": {
     "dev": "wrangler dev --port 8787",
     "deploy": "wrangler deploy --env=\"\"",
+    "test": "vitest run",
     "types": "wrangler types worker-configuration.d.ts --env-file .dev.vars.example --strict-vars false",
     "typecheck": "npm run types && tsc --noEmit",
-    "check": "npm run typecheck && wrangler deploy --dry-run --env=\"\""
+    "check": "npm run typecheck && npm test && wrangler deploy --dry-run --env=\"\""
   },
   "devDependencies": {
+    "@cloudflare/vitest-pool-workers": "^0.18.4",
     "@types/node": "^25.9.3",
     "typescript": "6.0.3",
+    "vitest": "^4.1.10",
     "wrangler": "4.101.0"
   }
 }

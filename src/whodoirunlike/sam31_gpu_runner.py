@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 
@@ -22,6 +22,7 @@ DEFAULT_SAM31_GPU_MODEL = "facebook/sam3.1"
 DEFAULT_SAM31_GPU_OBJ_ID = 1
 DEFAULT_SAM31_GPU_TRACK_PROMPT_ANCHORS = 6
 DEFAULT_SAM31_GPU_DISABLE_DEMO_SUPPRESSION = True
+Sam31GpuProgressCallback = Callable[[dict[str, Any]], None]
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -316,6 +317,7 @@ def _collect_stream_masks(
     start_frame_index: int,
     masks_by_frame: dict[int, np.ndarray],
     direction: str,
+    progress_callback: Callable[[int, int, str], None] | None = None,
 ) -> dict[str, Any]:
     responses = 0
     masks = 0
@@ -337,6 +339,8 @@ def _collect_stream_masks(
             if mask is not None:
                 masks_by_frame[frame_index] = mask
                 masks += 1
+            if progress_callback:
+                progress_callback(frame_index, len(masks_by_frame), direction)
     except RuntimeError as exc:
         if "No prompts are received on any frames" not in str(exc):
             raise
@@ -358,6 +362,7 @@ def _propagate_from_seed_frame(
     masks_by_frame: dict[int, np.ndarray],
     label: str,
     directions: tuple[str, ...] = ("forward", "backward"),
+    progress_callback: Callable[[int, int, str], None] | None = None,
 ) -> list[dict[str, Any]]:
     diagnostics = []
     for direction in directions:
@@ -368,6 +373,7 @@ def _propagate_from_seed_frame(
             start_frame_index=seed_frame,
             masks_by_frame=masks_by_frame,
             direction=direction,
+            progress_callback=progress_callback,
         )
         result["pass"] = label
         diagnostics.append(result)
@@ -384,6 +390,7 @@ def _collect_sam31_masks(
     frame_count: int,
     obj_id: int,
     track_boxes: dict[int, np.ndarray] | None = None,
+    progress_callback: Callable[[int, int, str], None] | None = None,
 ) -> tuple[dict[int, np.ndarray], dict[str, Any]]:
     import torch
 
@@ -500,6 +507,7 @@ def _collect_sam31_masks(
                     masks_by_frame=masks_by_frame,
                     label="primary_prompt",
                     directions=("forward",) if seed_frame == 0 else ("forward", "backward"),
+                    progress_callback=progress_callback,
                 )
             )
 
@@ -555,6 +563,7 @@ def _collect_sam31_masks(
                             masks_by_frame=masks_by_frame,
                             label="anchor_refinement",
                             directions=("forward",) if seed_frame == 0 else ("forward", "backward"),
+                            progress_callback=progress_callback,
                         )
                     )
             else:
@@ -815,6 +824,7 @@ def run_sam31_gpu_mask(
     checkpoint_path: str | None = None,
     force_frames: bool = False,
     obj_id: int = DEFAULT_SAM31_GPU_OBJ_ID,
+    progress_callback: Sam31GpuProgressCallback | None = None,
 ) -> dict[str, Any]:
     try:
         from sam3.model_builder import build_sam3_multiplex_video_predictor
@@ -841,8 +851,36 @@ def run_sam31_gpu_mask(
     }
     frame_dir = run_dir / "sam31_gpu_frames"
 
+    def emit_progress(
+        phase: str,
+        processed_frames: int = 0,
+        *,
+        total_frames: int = 0,
+        frame_index: int | None = None,
+        direction: str | None = None,
+    ) -> None:
+        if progress_callback is None:
+            return
+        total_frames = max(0, int(total_frames))
+        processed_frames = max(0, int(processed_frames))
+        progress_callback(
+            {
+                "phase": phase,
+                "processed_frames": processed_frames,
+                "total_frames": total_frames,
+                "percent": (
+                    min(1.0, processed_frames / total_frames) if total_frames else 0.0
+                ),
+                "elapsed_seconds": max(0.0, time.perf_counter() - start),
+                "frame_index": frame_index,
+                "direction": direction,
+            }
+        )
+
+    emit_progress("decoding")
     video_meta = inspect_video(source_segment)
     frame_paths = extract_video_frames(source_segment, frame_dir, force=force_frames)
+    emit_progress("preprocessing", total_frames=len(frame_paths))
     prompt = load_prompt(prompt_path, video_meta["width"], video_meta["height"])
     prompt_frame = max(0, min(prompt["frame_index"], len(frame_paths) - 1))
     track_boxes = _load_identity_track_boxes(
@@ -864,6 +902,7 @@ def run_sam31_gpu_mask(
     resolved_checkpoint = checkpoint_path or os.getenv("WHODOIRUNLIKE_SAM31_GPU_CHECKPOINT")
     resolved_checkpoint = resolved_checkpoint.strip() if resolved_checkpoint else None
 
+    emit_progress("loading_model", total_frames=len(frame_paths))
     predictor = build_sam3_multiplex_video_predictor(
         checkpoint_path=resolved_checkpoint,
         use_fa3=_env_bool("WHODOIRUNLIKE_SAM31_GPU_USE_FA3", default=False),
@@ -873,6 +912,7 @@ def run_sam31_gpu_mask(
     )
     _patch_multiplex_init_state_kwargs(predictor)
     tracker_config = _configure_interactive_tracker_for_user_prompt(predictor)
+    emit_progress("running_sam31", total_frames=len(frame_paths))
     masks_by_frame, sam_prompt_diagnostics = _collect_sam31_masks(
         predictor=predictor,
         video_path=source_segment,
@@ -882,12 +922,21 @@ def run_sam31_gpu_mask(
         frame_count=len(frame_paths),
         obj_id=obj_id,
         track_boxes=track_boxes,
+        progress_callback=lambda frame_index, processed_frames, direction: emit_progress(
+            "running_sam31",
+            processed_frames,
+            total_frames=len(frame_paths),
+            frame_index=frame_index,
+            direction=direction,
+        ),
     )
     prompt_summary["sam31"] = sam_prompt_diagnostics
     prompt_summary["sam31_tracker_config"] = tracker_config
+    emit_progress("postprocessing", len(masks_by_frame), total_frames=len(frame_paths))
     masks_by_frame, identity_filter = _filter_masks_to_track_boxes(masks_by_frame, track_boxes)
     prompt_summary["identity_filter"] = identity_filter
 
+    emit_progress("rendering", len(masks_by_frame), total_frames=len(frame_paths))
     write_mask_outputs(
         frame_paths=frame_paths,
         masks_by_frame=masks_by_frame,
@@ -896,6 +945,11 @@ def run_sam31_gpu_mask(
         masked_runner_path=masked_runner_path,
         qa_overlay_path=qa_overlay_path,
         metadata_path=metadata_path,
+        phase_callback=lambda phase: emit_progress(
+            phase,
+            len(masks_by_frame),
+            total_frames=len(frame_paths),
+        ),
     )
     mask_summary = write_masks_jsonl_from_video(runner_mask_path, masks_jsonl_path)
     fallback: dict[str, Any] | None = None
@@ -922,6 +976,7 @@ def run_sam31_gpu_mask(
             combined_masks = dict(fallback_masks)
             combined_masks.update(masks_by_frame)
             masks_by_frame = combined_masks
+            emit_progress("rendering", len(masks_by_frame), total_frames=len(frame_paths))
             write_mask_outputs(
                 frame_paths=frame_paths,
                 masks_by_frame=masks_by_frame,
@@ -930,12 +985,18 @@ def run_sam31_gpu_mask(
                 masked_runner_path=masked_runner_path,
                 qa_overlay_path=qa_overlay_path,
                 metadata_path=metadata_path,
+                phase_callback=lambda phase: emit_progress(
+                    phase,
+                    len(masks_by_frame),
+                    total_frames=len(frame_paths),
+                ),
             )
             mask_summary = write_masks_jsonl_from_video(runner_mask_path, masks_jsonl_path)
             fallback["nonempty_frames_after_fallback"] = int(mask_summary.get("nonempty_frames") or 0)
         else:
             fallback["nonempty_frames_after_fallback"] = 0
     elapsed_seconds = time.perf_counter() - start
+    emit_progress("completed", len(frame_paths), total_frames=len(frame_paths))
     update_manifest_after_sam31_gpu(
         manifest_path,
         metadata_path,

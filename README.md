@@ -17,6 +17,8 @@ Live site: [whodoirunlike.com](https://whodoirunlike.com)
 - Cloudflare Worker API for uploads, job status, and artifact serving.
 - R2-backed storage for source clips, job records, and processed outputs.
 - RunPod Serverless GPU processor for identity tracking, SAM 3.1 runner masks, pose, DensePose, fusion, and QC.
+- Attempt, stage, span, resource, and five-second progress telemetry with an R2 operational timeline.
+- Private AWS analytics adapter using API Gateway, FIFO SQS, Lambda, S3, Glue, and Athena.
 - Local FastAPI path for quick short-clip pose artifact checks.
 - Offline scripts for candidate clip discovery, review, and curation.
 
@@ -26,7 +28,8 @@ Live site: [whodoirunlike.com](https://whodoirunlike.com)
 2. The Worker stores the source clip and job record in R2.
 3. RunPod Serverless runs the full CV processor.
 4. The processor writes artifacts back through the Worker.
-5. The site polls job status and links to the finished overlay.
+5. The Worker stores the attempt timeline in R2 and asynchronously exports metadata events to AWS when configured.
+6. The site polls job status and links to the finished overlay.
 
 The RunPod endpoint scales down when idle, so the first run after a quiet period can take a few minutes to start.
 
@@ -58,6 +61,7 @@ uv run --extra dev pytest
 uv run --extra dev ruff check src tests scripts
 cd site && npm run typecheck && npm run build:pages
 cd worker && npm run check
+cd infra/analytics && npm test && npm run synth
 ```
 
 ## Deploy notes
@@ -76,12 +80,14 @@ Worker and processor setup live in:
 - [worker/README.md](worker/README.md)
 - [site/README.md](site/README.md)
 - [docs/runpod-serverless.md](docs/runpod-serverless.md)
+- [infra/analytics/README.md](infra/analytics/README.md)
 
 ## Repo map
 
 ```text
 site/                         Next.js technical-preview site
 worker/                       Cloudflare Worker for uploads, jobs, and R2 artifacts
+infra/analytics/              private AWS processing-metadata analytics adapter
 src/whodoirunlike/api.py      local FastAPI upload endpoint
 src/whodoirunlike/full_pipeline.py
                               identity, SAM, pose, DensePose, fusion, features, QC

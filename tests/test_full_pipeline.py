@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 import pytest
 
 from whodoirunlike import full_pipeline
+from whodoirunlike.processing_telemetry import ProcessingTelemetry
 
 
 def test_densepose_runtime_kwargs_resolve_env_paths(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -128,3 +130,207 @@ def test_full_pipeline_skip_densepose_uses_configured_path_and_records_stage(
     }
     assert manifest["stages"]["future_stage"] == {"status": "future"}
     assert manifest["custom_manifest_field"] == {"keep": True}
+
+
+def test_full_pipeline_emits_canonical_stage_and_subspan_timeline(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    current = [10.0]
+
+    def clock() -> float:
+        return current[0]
+
+    telemetry = ProcessingTelemetry(
+        run_id="12345678-1234-4234-9234-123456789abc",
+        attempt_id="11111111-1111-4111-8111-111111111111",
+        local_path=tmp_path / "events.jsonl",
+        monotonic_clock=clock,
+        wall_clock=lambda: datetime(2026, 7, 9, tzinfo=timezone.utc),
+        resource_sampler=lambda: {},
+        asynchronous_delivery=False,
+    )
+
+    def runner(phase: str, *, frame_count: int = 12) -> Any:
+        def run(**kwargs: Any) -> dict[str, Any]:
+            callback = kwargs.get("progress_callback")
+            assert callback is not None
+            callback(
+                {
+                    "phase": phase,
+                    "processed_frames": 0,
+                    "total_frames": frame_count,
+                }
+            )
+            current[0] += 1.0
+            callback(
+                {
+                    "phase": "completed",
+                    "processed_frames": frame_count,
+                    "total_frames": frame_count,
+                }
+            )
+            return {
+                "status": "complete",
+                "frame_count": frame_count,
+                "elapsed_seconds": 1.0,
+            }
+
+        return run
+
+    def unreported_result(*_: Any, **__: Any) -> dict[str, Any]:
+        current[0] += 0.5
+        return {"status": "complete"}
+
+    monkeypatch.setattr(full_pipeline, "run_identity_tracking", runner("loading_model"))
+    monkeypatch.setattr(full_pipeline, "run_sam31_mlx_mask", runner("running_sam31"))
+    monkeypatch.setattr("whodoirunlike.pose_runner.run_pose_landmarks", runner("detecting_pose"))
+    monkeypatch.setattr("whodoirunlike.densepose_runner.run_densepose", runner("running_densepose"))
+    monkeypatch.setattr(full_pipeline, "run_fused_form", runner("rendering"))
+    monkeypatch.setattr(full_pipeline, "compile_form_features", runner("compiling_features"))
+    monkeypatch.setattr(full_pipeline, "export_cv_tables", unreported_result)
+    monkeypatch.setattr(full_pipeline, "run_qc_metrics", unreported_result)
+
+    result = full_pipeline.run_full_cv_pipeline(
+        run_dir=tmp_path,
+        pose_backend="mediapipe",
+        telemetry=telemetry,
+    )
+
+    assert [step["stage"] for step in result["steps"]] == [
+        "identity",
+        "mask",
+        "pose",
+        "densepose",
+        "fusion",
+        "features",
+        "artifact_tables",
+        "qc",
+    ]
+    events = [json.loads(line) for line in telemetry.local_path.read_text().splitlines()]
+    canonical_stages = [
+        "target_tracking",
+        "runner_mask",
+        "pose_sequence",
+        "densepose_body_map",
+        "fused_form_signal",
+        "form_feature_compilation",
+        "artifact_table_export",
+        "quality_control",
+    ]
+    assert [
+        event["stage"] for event in events if event["event_type"] == "stage_started"
+    ] == canonical_stages
+    assert [
+        event["stage"] for event in events if event["event_type"] == "stage_completed"
+    ] == canonical_stages
+    assert {
+        event["span"] for event in events if event["event_type"] == "span_started"
+    } >= {"model_load", "inference", "render", "postprocess", "write"}
+    target_span = next(
+        event
+        for event in events
+        if event["event_type"] == "span_started" and event["stage"] == "target_tracking"
+    )
+    target_progress = next(
+        event
+        for event in events
+        if event["event_type"] == "progress_sampled"
+        and event["stage"] == "target_tracking"
+    )
+    assert target_span["runtime"]["backend"] == full_pipeline.DEFAULT_IDENTITY_BACKEND
+    assert target_progress["runtime"]["backend"] == full_pipeline.DEFAULT_IDENTITY_BACKEND
+    target_complete = next(
+        event
+        for event in events
+        if event["event_type"] == "stage_completed" and event["stage"] == "target_tracking"
+    )
+    assert target_complete["elapsed_seconds"] == 1.0
+    assert target_complete["measurements"]["milliseconds_per_frame"] == pytest.approx(
+        1000.0 / 12
+    )
+
+
+def test_full_pipeline_emits_failed_stage_and_span_without_running_downstream(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    current = [10.0]
+    telemetry = ProcessingTelemetry(
+        run_id="12345678-1234-4234-9234-123456789abc",
+        attempt_id="11111111-1111-4111-8111-111111111111",
+        local_path=tmp_path / "events.jsonl",
+        monotonic_clock=lambda: current[0],
+        wall_clock=lambda: datetime(2026, 7, 9, tzinfo=timezone.utc),
+        resource_sampler=lambda: {},
+        asynchronous_delivery=False,
+    )
+
+    def fail_identity(**kwargs: Any) -> dict[str, Any]:
+        kwargs["progress_callback"](
+            {"phase": "detect_track", "processed_frames": 1, "total_frames": 20}
+        )
+        current[0] += 2.25
+        raise RuntimeError("identity exploded")
+
+    monkeypatch.setattr(full_pipeline, "run_identity_tracking", fail_identity)
+    monkeypatch.setattr(
+        full_pipeline,
+        "run_sam31_mlx_mask",
+        lambda **_: pytest.fail("mask must not run after identity failure"),
+    )
+
+    with pytest.raises(RuntimeError, match="identity exploded"):
+        full_pipeline.run_full_cv_pipeline(
+            run_dir=tmp_path,
+            pose_backend="mediapipe",
+            telemetry=telemetry,
+        )
+
+    events = [json.loads(line) for line in telemetry.local_path.read_text().splitlines()]
+    assert [event["event_type"] for event in events] == [
+        "stage_started",
+        "span_started",
+        "progress_sampled",
+        "span_failed",
+        "stage_failed",
+    ]
+    assert events[-2]["elapsed_seconds"] == 2.25
+    assert events[-1]["elapsed_seconds"] == 2.25
+    assert events[-1]["error"]["exception_type"] == "RuntimeError"
+
+
+def test_full_pipeline_raises_when_stage_returns_unavailable_and_stops_downstream(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    telemetry = ProcessingTelemetry(
+        run_id="12345678-1234-4234-9234-123456789abc",
+        attempt_id="11111111-1111-4111-8111-111111111111",
+        local_path=tmp_path / "events.jsonl",
+        wall_clock=lambda: datetime(2026, 7, 9, tzinfo=timezone.utc),
+        resource_sampler=lambda: {},
+        asynchronous_delivery=False,
+    )
+    monkeypatch.setattr(
+        full_pipeline,
+        "run_identity_tracking",
+        lambda **_: {"status": "unavailable", "error": "identity backend missing"},
+    )
+    monkeypatch.setattr(
+        full_pipeline,
+        "run_sam31_mlx_mask",
+        lambda **_: pytest.fail("mask must not run after unavailable identity stage"),
+    )
+
+    with pytest.raises(RuntimeError, match="identity backend missing"):
+        full_pipeline.run_full_cv_pipeline(
+            run_dir=tmp_path,
+            pose_backend="mediapipe",
+            telemetry=telemetry,
+        )
+
+    events = [json.loads(line) for line in telemetry.local_path.read_text().splitlines()]
+    assert [event["event_type"] for event in events] == ["stage_started", "stage_failed"]
+    assert events[-1]["stage"] == "target_tracking"
+    assert events[-1]["measurements"]["outcome"] == "unavailable"

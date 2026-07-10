@@ -14,8 +14,21 @@ out/
 *.tsbuildinfo
 .dev.vars
 worker/worker-configuration.d.ts
+
+# Local agent context and instructions
+CONTEXT.md
+AGENTS.md
+CLAUDE.md
 .agents/
+.codex/
+.claude/
+docs/agents/
 skills-lock.json
+
+# Local-only architecture and analytics working notes
+docs/adr/0002-keep-processing-on-runpod-and-export-analytics-to-aws.md
+docs/processing-analytics-dashboard.md
+docs/processing-observability-plan.md
 
 # Generated / local media artifacts
 artifacts/**

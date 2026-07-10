@@ -40,6 +40,9 @@ def test_runpod_handler_processes_worker_payload(monkeypatch: Any) -> None:
 
     def fake_process(payload: Any, *, raise_on_error: bool) -> dict[str, Any]:
         captured["run_id"] = payload.run_id
+        captured["attempt_id"] = payload.attempt_id
+        captured["runpod_job_id"] = payload.runpod_job_id
+        captured["runpod_delay_time_ms"] = payload.runpod_delay_time_ms
         captured["raise_on_error"] = raise_on_error
         return {"status": "complete", "run_id": payload.run_id}
 
@@ -47,8 +50,11 @@ def test_runpod_handler_processes_worker_payload(monkeypatch: Any) -> None:
 
     response = runpod_serverless.handler(
         {
+            "id": "runpod-invocation-99",
+            "delayTime": 1250,
             "input": {
                 "run_id": "12345678-1234-4234-9234-123456789abc",
+                "attempt_id": "11111111-1111-4111-8111-111111111111",
                 "callback_base_url": "https://api.whodoirunlike.com",
                 "source": {
                     "url": "https://api.whodoirunlike.com/v1/jobs/12345678-1234-4234-9234-123456789abc/source",
@@ -64,5 +70,8 @@ def test_runpod_handler_processes_worker_payload(monkeypatch: Any) -> None:
     assert response == {"status": "complete", "run_id": "12345678-1234-4234-9234-123456789abc"}
     assert captured == {
         "run_id": "12345678-1234-4234-9234-123456789abc",
+        "attempt_id": "11111111-1111-4111-8111-111111111111",
+        "runpod_job_id": "runpod-invocation-99",
+        "runpod_delay_time_ms": 1250.0,
         "raise_on_error": True,
     }

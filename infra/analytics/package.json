@@ -1,0 +1,22 @@
+{
+  "name": "whodoirunlike-analytics-infra",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "build": "tsc --noEmit",
+    "test:lambda": "python3 -m unittest discover -s lambda_src/tests -p 'test_*.py'",
+    "test:cdk": "node --test --import tsx test/*.test.ts",
+    "test": "npm run test:lambda && npm run build && npm run test:cdk",
+    "synth": "cdk synth"
+  },
+  "dependencies": {
+    "aws-cdk-lib": "2.261.0",
+    "constructs": "10.6.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "aws-cdk": "2.1129.0",
+    "tsx": "4.23.0",
+    "typescript": "5.9.3"
+  }
+}

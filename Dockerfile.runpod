@@ -1,5 +1,7 @@
 FROM runpod/pytorch:1.0.3-cu1281-torch291-ubuntu2404
 
+ARG WHODOIRUNLIKE_PROCESSOR_VERSION=unknown
+
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     HF_HOME=/runpod-volume/huggingface \
@@ -9,6 +11,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     WHODOIRUNLIKE_MASK_BACKEND=sam31_gpu \
     WHODOIRUNLIKE_SAM31_GPU_USE_FA3=false \
     WHODOIRUNLIKE_SKIP_DENSEPOSE=false \
+    WHODOIRUNLIKE_PROCESSOR_VERSION=${WHODOIRUNLIKE_PROCESSOR_VERSION} \
     DENSEPOSE_CONFIG=/opt/detectron2/projects/DensePose/configs/densepose_rcnn_R_50_FPN_s1x.yaml \
     DENSEPOSE_WEIGHTS=https://dl.fbaipublicfiles.com/densepose/densepose_rcnn_R_50_FPN_s1x/165712039/model_final_162be9.pkl \
     DENSEPOSE_DEVICE=cuda

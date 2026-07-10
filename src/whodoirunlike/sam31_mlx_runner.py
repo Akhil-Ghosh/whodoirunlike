@@ -677,6 +677,7 @@ def run_sam31_mlx_mask(
         masked_runner_path=masked_runner_path,
         qa_overlay_path=qa_overlay_path,
         metadata_path=metadata_path,
+        phase_callback=lambda phase: emit_progress(phase, total_frames),
     )
     mask_summary = write_masks_jsonl_from_video(runner_mask_path, masks_jsonl_path)
     elapsed_seconds = time.perf_counter() - start

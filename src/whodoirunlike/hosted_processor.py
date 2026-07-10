@@ -9,10 +9,13 @@ import platform
 import re
 import secrets
 import shutil
+import threading
 import time
 import traceback
-import urllib.error
+import urllib.parse
 import urllib.request
+from contextlib import nullcontext
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -23,6 +26,12 @@ from pydantic import BaseModel
 from whodoirunlike.cv_flow import utc_now_iso, write_json
 from whodoirunlike.full_pipeline import run_full_cv_pipeline
 from whodoirunlike.identity_runner import DEFAULT_IDENTITY_BACKEND, identity_setup_status
+from whodoirunlike.processing_telemetry import (
+    ProcessingTelemetry,
+    create_hosted_telemetry,
+    ensure_attempt_id,
+    input_metadata_from_video,
+)
 from whodoirunlike.running_clip_run import RunningClipRun
 from whodoirunlike.sam2_runner import inspect_video
 from whodoirunlike.sam31_gpu_runner import DEFAULT_SAM31_GPU_MODEL
@@ -44,6 +53,17 @@ DENSEPOSE_DEFAULT_WEIGHTS = (
 RUN_ID_PATTERN = re.compile(r"^[a-f0-9-]{32,36}$", re.IGNORECASE)
 PROCESSOR_USER_AGENT = "Mozilla/5.0 (compatible; whodoirunlike-processor/1.0)"
 DEFAULT_HOSTED_MASK_BACKEND = "sam31_gpu"
+DEFAULT_REPORT_TIMEOUT_SECONDS = 1.0
+DEFAULT_TELEMETRY_DRAIN_TIMEOUT_SECONDS = 4.0
+DEFAULT_TELEMETRY_SNAPSHOT_TIMEOUT_SECONDS = 0.25
+DEFAULT_CALLBACK_ORIGINS = (
+    "https://api.whodoirunlike.com",
+    "https://staging-api.whodoirunlike.com",
+)
+DEVELOPMENT_CALLBACK_ORIGINS = (
+    "http://127.0.0.1:8787",
+    "http://localhost:8787",
+)
 COLE_DEMO_SOURCE_SHA256 = "a8146591119c5439cc01168df63fa6144a7a55ff6817726946e1e8f5bc381617"
 COLE_DEMO_PROMPT_BOX = {
     "x": 0.624283,
@@ -77,6 +97,9 @@ _HOSTED_PUBLISHABLE_ARTIFACTS = (
     ("qc_metrics", "qc_metrics.json"),
     ("hosted_pipeline_result", "hosted_pipeline_result.json"),
 )
+_PROCESSOR_STARTED_AT = time.monotonic()
+_PROCESSOR_INVOCATION_LOCK = threading.Lock()
+_PROCESSOR_INVOCATION_COUNT = 0
 
 router = APIRouter()
 
@@ -91,6 +114,13 @@ class WorkerJobSource(BaseModel):
 
 class WorkerJobRequest(BaseModel):
     run_id: str
+    attempt_id: str | None = None
+    attempt_number: int | None = None
+    attempt_started_at: str | None = None
+    processor_enqueued_at: str | None = None
+    telemetry_sequence_start: int | None = None
+    runpod_job_id: str | None = None
+    runpod_delay_time_ms: float | None = None
     source: WorkerJobSource
     callback_base_url: str
     target_prompt: dict[str, Any] | None = None
@@ -127,9 +157,73 @@ def _require_processor_auth(request: Request) -> None:
 def _validate_job_payload(payload: WorkerJobRequest) -> None:
     if not RUN_ID_PATTERN.fullmatch(payload.run_id):
         raise HTTPException(status_code=400, detail="Invalid run_id.")
-    callback = payload.callback_base_url.rstrip("/")
-    if not payload.source.url.startswith(f"{callback}/"):
-        raise HTTPException(status_code=400, detail="Source URL must belong to callback_base_url.")
+    callback_origin = _canonical_callback_origin(payload.callback_base_url)
+    if callback_origin is None or callback_origin not in _allowed_callback_origins():
+        raise HTTPException(status_code=400, detail="callback_base_url origin is not allowed.")
+    source_origin = _canonical_callback_origin(payload.source.url, require_origin_only=False)
+    source_url = urllib.parse.urlsplit(payload.source.url)
+    expected_path = f"/v1/jobs/{payload.run_id}/source"
+    if (
+        source_origin != callback_origin
+        or source_url.path != expected_path
+        or bool(source_url.query)
+        or bool(source_url.fragment)
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="Source URL must be the expected job source on callback_base_url.",
+        )
+
+
+def _is_explicit_development() -> bool:
+    return os.getenv("WHODOIRUNLIKE_ENVIRONMENT", "").strip().lower() in {
+        "dev",
+        "development",
+        "local",
+        "test",
+    }
+
+
+def _canonical_callback_origin(
+    value: str,
+    *,
+    require_origin_only: bool = True,
+) -> str | None:
+    try:
+        parsed = urllib.parse.urlsplit(value)
+        port = parsed.port
+    except (TypeError, ValueError):
+        return None
+    scheme = parsed.scheme.lower()
+    hostname = (parsed.hostname or "").lower()
+    if not hostname or parsed.username is not None or parsed.password is not None:
+        return None
+    if scheme != "https":
+        is_localhost = hostname in {"localhost", "127.0.0.1", "::1"}
+        if scheme != "http" or not is_localhost or not _is_explicit_development():
+            return None
+    if require_origin_only and (parsed.path not in {"", "/"} or parsed.query or parsed.fragment):
+        return None
+    default_port = 443 if scheme == "https" else 80
+    formatted_host = f"[{hostname}]" if ":" in hostname else hostname
+    return f"{scheme}://{formatted_host}{f':{port}' if port and port != default_port else ''}"
+
+
+def _allowed_callback_origins() -> frozenset[str]:
+    configured = os.getenv("WHODOIRUNLIKE_CALLBACK_ORIGINS", "").strip()
+    candidates = (
+        [part.strip() for part in configured.split(",") if part.strip()]
+        if configured
+        else [
+            *DEFAULT_CALLBACK_ORIGINS,
+            *(DEVELOPMENT_CALLBACK_ORIGINS if _is_explicit_development() else ()),
+        ]
+    )
+    return frozenset(
+        origin
+        for candidate in candidates
+        if (origin := _canonical_callback_origin(candidate)) is not None
+    )
 
 
 def _request_headers() -> dict[str, str]:
@@ -199,19 +293,45 @@ def _post_worker_report(
         method="POST",
         headers={
             **_request_headers(),
+            **(
+                {"X-Processing-Attempt-Id": str(payload["attempt_id"])}
+                if payload.get("attempt_id")
+                else {}
+            ),
             "Accept": "application/json",
             "Content-Type": "application/json; charset=utf-8",
             "Content-Length": str(len(body)),
         },
     )
-    with urllib.request.urlopen(request, timeout=30):
+    with urllib.request.urlopen(
+        request,
+        timeout=_env_float("WHODOIRUNLIKE_REPORT_TIMEOUT_SECONDS", DEFAULT_REPORT_TIMEOUT_SECONDS),
+    ):
         return
+
+
+def _post_worker_report_best_effort(
+    *,
+    callback_base_url: str,
+    run_id: str,
+    payload: dict[str, Any],
+) -> bool:
+    try:
+        _post_worker_report(
+            callback_base_url=callback_base_url,
+            run_id=run_id,
+            payload=payload,
+        )
+        return True
+    except Exception:
+        return False
 
 
 def _put_worker_artifact(
     *,
     callback_base_url: str,
     run_id: str,
+    attempt_id: str,
     name: str,
     path: Path,
 ) -> None:
@@ -223,6 +343,7 @@ def _put_worker_artifact(
             method="PUT",
             headers={
                 **_request_headers(),
+                "X-Processing-Attempt-Id": attempt_id,
                 "Content-Type": content_type,
                 "Content-Length": str(path.stat().st_size),
             },
@@ -569,19 +690,47 @@ def _public_artifact_name(
     return path.name
 
 
-def _upload_artifacts(payload: WorkerJobRequest, run_dir: Path) -> list[str]:
+def _upload_artifacts(
+    payload: WorkerJobRequest,
+    run_dir: Path,
+    *,
+    telemetry: ProcessingTelemetry | None = None,
+) -> list[str]:
     run = RunningClipRun(run_dir)
     manifest = run.read_manifest() if run.manifest_path.is_file() else None
+    artifact_attempt_id = ensure_attempt_id(payload.attempt_id)
     uploaded: list[str] = []
     for path in _artifact_files(run_dir):
         public_name = _public_artifact_name(run, path, manifest)
-        _put_worker_artifact(
-            callback_base_url=payload.callback_base_url,
-            run_id=payload.run_id,
-            name=public_name,
-            path=path,
+        artifact_type = public_name.rsplit(".", 1)[0]
+        span_context = (
+            telemetry.span(
+                "artifact_publish",
+                "publish",
+                measurements={
+                    "artifact_type": artifact_type,
+                    "bytes": path.stat().st_size,
+                },
+            )
+            if telemetry is not None
+            else nullcontext()
         )
+        with span_context:
+            _put_worker_artifact(
+                callback_base_url=payload.callback_base_url,
+                run_id=payload.run_id,
+                attempt_id=artifact_attempt_id,
+                name=public_name,
+                path=path,
+            )
         uploaded.append(public_name)
+        if telemetry is not None and public_name == "fused_overlay.mp4":
+            telemetry.result_ready(
+                {
+                    "artifact_type": artifact_type,
+                    "bytes": path.stat().st_size,
+                }
+            )
     return uploaded
 
 
@@ -590,6 +739,47 @@ def _env_bool(name: str, default: bool = False) -> bool:
     if raw is None:
         return default
     return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return max(0.1, float(os.getenv(name, str(default))))
+    except (TypeError, ValueError):
+        return default
+
+
+def _invocation_runtime_metadata(payload: WorkerJobRequest) -> dict[str, Any]:
+    global _PROCESSOR_INVOCATION_COUNT
+    with _PROCESSOR_INVOCATION_LOCK:
+        _PROCESSOR_INVOCATION_COUNT += 1
+        invocation_index = _PROCESSOR_INVOCATION_COUNT
+    return {
+        "execution_environment": "runpod" if payload.runpod_job_id else "direct",
+        "environment": (
+            os.getenv("WHODOIRUNLIKE_ENVIRONMENT", "").strip()
+            or ("production" if payload.runpod_job_id else "development")
+        ),
+        "runpod_job_id": payload.runpod_job_id,
+        "runpod_delay_time_ms": payload.runpod_delay_time_ms,
+        "attempt_started_at": payload.attempt_started_at,
+        "processor_enqueued_at": payload.processor_enqueued_at,
+        "attempt_number": payload.attempt_number,
+        "process_invocation_index": invocation_index,
+        "cold_start": invocation_index == 1,
+        "process_uptime_seconds": max(0.0, time.monotonic() - _PROCESSOR_STARTED_AT),
+    }
+
+
+def _elapsed_from_timestamp(value: str | None, end: datetime) -> tuple[float, bool]:
+    if not value:
+        return 0.0, False
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return max(0.0, (end - parsed.astimezone(timezone.utc)).total_seconds()), True
+    except (TypeError, ValueError, OverflowError):
+        return 0.0, False
 
 
 def _resolve_repo_path(path: str | Path) -> Path:
@@ -839,63 +1029,155 @@ def processor_readiness() -> dict[str, Any]:
 
 
 def process_hosted_job(payload: WorkerJobRequest, *, raise_on_error: bool = False) -> dict[str, Any]:
+    _validate_job_payload(payload)
     started = time.monotonic()
+    invocation_started_at = datetime.now(timezone.utc)
     run_dir = _hosted_run_root() / payload.run_id
     source_path = run_dir / "source_segment.mp4"
+    attempt_id = ensure_attempt_id(payload.attempt_id)
+    if payload.attempt_id != attempt_id:
+        payload = payload.model_copy(update={"attempt_id": attempt_id})
+    identity_backend = os.getenv("WHODOIRUNLIKE_IDENTITY_BACKEND", DEFAULT_IDENTITY_BACKEND)
+    pose_backend = os.getenv("WHODOIRUNLIKE_POSE_BACKEND", "mmpose_rtmpose_l_384")
+    mask_backend = _mask_backend()
+    skip_densepose = _env_bool("WHODOIRUNLIKE_SKIP_DENSEPOSE")
+    attempt_elapsed_offset, has_attempt_timing = _elapsed_from_timestamp(
+        payload.attempt_started_at or payload.processor_enqueued_at,
+        invocation_started_at,
+    )
+    telemetry = create_hosted_telemetry(
+        run_id=payload.run_id,
+        attempt_id=attempt_id,
+        run_dir=run_dir,
+        callback_base_url=payload.callback_base_url,
+        auth_token=_processor_secret(),
+        input_metadata={
+            "size_bytes": payload.source.size_bytes,
+            "content_type": payload.source.content_type,
+        },
+        runtime_metadata={
+            **_invocation_runtime_metadata(payload),
+            "identity_backend": identity_backend,
+            "pose_backend": pose_backend,
+            "mask_backend": mask_backend,
+            "skip_densepose": skip_densepose,
+            "attempt_timing_available": has_attempt_timing,
+        },
+        sequence_start=max(100, payload.telemetry_sequence_start or 100),
+        attempt_elapsed_offset_seconds=(
+            attempt_elapsed_offset + max(0.0, time.monotonic() - started)
+        ),
+    )
     try:
-        _post_worker_report(
+        _post_worker_report_best_effort(
             callback_base_url=payload.callback_base_url,
             run_id=payload.run_id,
-            payload={"status": "running", "progress": {"phase": "downloading_upload"}},
+            payload={
+                "status": "running",
+                "attempt_id": attempt_id,
+                "progress": {"phase": "downloading_upload"},
+            },
         )
-        _download_source(payload, source_path)
-        demo_profile = _demo_upload_profile(source_path)
-        active_demo_profile = _active_demo_profile(demo_profile, payload.target_prompt)
-        video_meta = inspect_video(source_path)
-        _write_hosted_manifest(
-            run_dir=run_dir,
-            payload=payload,
-            source_path=source_path,
-            video_meta=video_meta,
-            demo_profile=active_demo_profile,
-            uploaded_prompt=payload.target_prompt,
-        )
+        with telemetry.stage("source_download") as stage_boundary:
+            with telemetry.span("source_download", "write"):
+                _download_source(payload, source_path)
+            stage_boundary.add_measurements(
+                {
+                    "bytes": source_path.stat().st_size,
+                    "expected_bytes": payload.source.size_bytes,
+                }
+            )
 
-        _post_worker_report(
+        with telemetry.stage("run_preparation"):
+            with telemetry.span("run_preparation", "decode"):
+                demo_profile = _demo_upload_profile(source_path)
+                active_demo_profile = _active_demo_profile(demo_profile, payload.target_prompt)
+                video_meta = inspect_video(source_path)
+                telemetry.update_input(
+                    input_metadata_from_video(
+                        video_meta,
+                        size_bytes=payload.source.size_bytes,
+                        content_type=payload.source.content_type,
+                    )
+                )
+            with telemetry.span("run_preparation", "write"):
+                _write_hosted_manifest(
+                    run_dir=run_dir,
+                    payload=payload,
+                    source_path=source_path,
+                    video_meta=video_meta,
+                    demo_profile=active_demo_profile,
+                    uploaded_prompt=payload.target_prompt,
+                )
+
+        _post_worker_report_best_effort(
             callback_base_url=payload.callback_base_url,
             run_id=payload.run_id,
-            payload={"status": "running", "progress": {"phase": "running_full_cv_pipeline"}},
+            payload={
+                "status": "running",
+                "attempt_id": attempt_id,
+                "progress": {"phase": "running_full_cv_pipeline"},
+            },
         )
         result = run_full_cv_pipeline(
             run_dir=run_dir,
-            identity_backend=os.getenv("WHODOIRUNLIKE_IDENTITY_BACKEND", DEFAULT_IDENTITY_BACKEND),
-            pose_backend=os.getenv("WHODOIRUNLIKE_POSE_BACKEND", "mmpose_rtmpose_l_384"),
-            mask_backend=_mask_backend(),
+            identity_backend=identity_backend,
+            pose_backend=pose_backend,
+            mask_backend=mask_backend,
             mask_quality_mode=os.getenv("WHODOIRUNLIKE_MASK_QUALITY_MODE", "native"),
-            skip_densepose=_env_bool("WHODOIRUNLIKE_SKIP_DENSEPOSE"),
+            skip_densepose=skip_densepose,
+            telemetry=telemetry,
         )
-        demo_artifacts = _apply_demo_reference_artifacts(
-            run_dir=run_dir,
-            demo_profile=active_demo_profile,
+        with telemetry.stage("analysis_complete"):
+            with telemetry.span("analysis_complete", "postprocess"):
+                demo_artifacts = _apply_demo_reference_artifacts(
+                    run_dir=run_dir,
+                    demo_profile=active_demo_profile,
+                )
+                result = _attach_demo_reference_summary(
+                    result,
+                    demo_profile=active_demo_profile,
+                    copied_artifacts=demo_artifacts,
+                )
+            with telemetry.span("analysis_complete", "write"):
+                write_json(run_dir / "hosted_pipeline_result.json", result)
+        telemetry.analysis_completed(
+            {
+                "pipeline_stage_count": len(result.get("steps", [])),
+            }
         )
-        result = _attach_demo_reference_summary(
-            result,
-            demo_profile=active_demo_profile,
-            copied_artifacts=demo_artifacts,
-        )
-        write_json(run_dir / "hosted_pipeline_result.json", result)
 
-        _post_worker_report(
+        _post_worker_report_best_effort(
             callback_base_url=payload.callback_base_url,
             run_id=payload.run_id,
-            payload={"status": "running", "progress": {"phase": "uploading_artifacts"}},
+            payload={
+                "status": "running",
+                "attempt_id": attempt_id,
+                "progress": {"phase": "uploading_artifacts"},
+            },
         )
-        uploaded = _upload_artifacts(payload, run_dir)
-        _post_worker_report(
+        with telemetry.stage("artifact_publish") as publish_boundary:
+            uploaded = _upload_artifacts(payload, run_dir, telemetry=telemetry)
+            publish_boundary.add_measurements({"artifact_count": len(uploaded)})
+        telemetry.flush_delivery(
+            timeout=_env_float(
+                "WHODOIRUNLIKE_TELEMETRY_SNAPSHOT_TIMEOUT_SECONDS",
+                DEFAULT_TELEMETRY_SNAPSHOT_TIMEOUT_SECONDS,
+            )
+        )
+        telemetry.attempt_completed(
+            {
+                "artifact_count": len(uploaded),
+                "pipeline_stage_count": len(result.get("steps", [])),
+                **telemetry.delivery_measurements(),
+            }
+        )
+        _post_worker_report_best_effort(
             callback_base_url=payload.callback_base_url,
             run_id=payload.run_id,
             payload={
                 "status": "complete",
+                "attempt_id": attempt_id,
                 "progress": {
                     "phase": "complete",
                     "elapsed_seconds": round(time.monotonic() - started, 3),
@@ -910,41 +1192,56 @@ def process_hosted_job(payload: WorkerJobRequest, *, raise_on_error: bool = Fals
         return {
             "status": "complete",
             "run_id": payload.run_id,
+            "attempt_id": attempt_id,
             "elapsed_seconds": round(time.monotonic() - started, 3),
             "artifacts_uploaded": uploaded,
         }
     except Exception as exc:
+        telemetry.flush_delivery(
+            timeout=_env_float(
+                "WHODOIRUNLIKE_TELEMETRY_SNAPSHOT_TIMEOUT_SECONDS",
+                DEFAULT_TELEMETRY_SNAPSHOT_TIMEOUT_SECONDS,
+            )
+        )
+        telemetry.attempt_failed(exc, telemetry.delivery_measurements())
         run_dir.mkdir(parents=True, exist_ok=True)
         error_traceback = traceback.format_exc(limit=8)
         write_json(
             run_dir / "hosted_job_error.json",
             {
                 "run_id": payload.run_id,
+                "attempt_id": attempt_id,
                 "error": str(exc),
                 "traceback": error_traceback,
                 "failed_at": utc_now_iso(),
             },
         )
-        try:
-            _post_worker_report(
-                callback_base_url=payload.callback_base_url,
-                run_id=payload.run_id,
-                payload={
-                    "status": "failed",
-                    "progress": {"phase": "failed"},
-                    "error": f"{exc}\n\n{error_traceback[-2000:]}",
-                },
-            )
-        except (OSError, urllib.error.URLError, urllib.error.HTTPError):
-            pass
+        _post_worker_report_best_effort(
+            callback_base_url=payload.callback_base_url,
+            run_id=payload.run_id,
+            payload={
+                "status": "failed",
+                "attempt_id": attempt_id,
+                "progress": {"phase": "failed"},
+                "error": f"{exc}\n\n{error_traceback[-2000:]}",
+            },
+        )
         if raise_on_error:
             raise
         return {
             "status": "failed",
             "run_id": payload.run_id,
+            "attempt_id": attempt_id,
             "error": str(exc),
             "elapsed_seconds": round(time.monotonic() - started, 3),
         }
+    finally:
+        telemetry.close(
+            timeout=_env_float(
+                "WHODOIRUNLIKE_TELEMETRY_DRAIN_TIMEOUT_SECONDS",
+                DEFAULT_TELEMETRY_DRAIN_TIMEOUT_SECONDS,
+            )
+        )
 
 
 @router.get("/v1/processor/health")

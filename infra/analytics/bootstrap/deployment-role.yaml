@@ -1,0 +1,78 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  One-time bootstrap role for deploying the Who Do I Run Like analytics CDK
+  stack without using the AWS account root principal for routine operations.
+
+Parameters:
+  DeploymentCallerName:
+    Type: String
+    Default: WhoDoIRunLikeDeploymentCaller
+    AllowedPattern: "[A-Za-z0-9+=,.@_-]{1,64}"
+    Description: Name of the IAM user that may assume the deployment role.
+  DeploymentRoleName:
+    Type: String
+    Default: WhoDoIRunLikeCdkDeploymentRole
+    AllowedPattern: "[A-Za-z0-9+=,.@_-]{1,64}"
+    Description: Name of the role used to bootstrap and deploy the CDK stack.
+
+Resources:
+  DeploymentCaller:
+    Type: AWS::IAM::User
+    DeletionPolicy: RetainExceptOnCreate
+    UpdateReplacePolicy: Retain
+    Properties:
+      UserName: !Ref DeploymentCallerName
+      Tags:
+        - Key: application
+          Value: whodoirunlike
+        - Key: purpose
+          Value: analytics-cdk-deployment-caller
+
+  DeploymentRole:
+    Type: AWS::IAM::Role
+    DependsOn: DeploymentCaller
+    DeletionPolicy: RetainExceptOnCreate
+    UpdateReplacePolicy: Retain
+    Properties:
+      RoleName: !Ref DeploymentRoleName
+      Description: >-
+        Assumable role for CDK bootstrap and deployment of the private
+        processing-analytics stack.
+      MaxSessionDuration: 14400
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowDeploymentCallerToAssume
+            Effect: Allow
+            Principal:
+              AWS: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:user/${DeploymentCallerName}"
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/AdministratorAccess"
+      Tags:
+        - Key: application
+          Value: whodoirunlike
+        - Key: purpose
+          Value: analytics-cdk-deployment
+
+  DeploymentCallerAssumeRolePolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: AssumeWhoDoIRunLikeCdkDeploymentRole
+      Users:
+        - !Ref DeploymentCaller
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AssumeAnalyticsDeploymentRole
+            Effect: Allow
+            Action: sts:AssumeRole
+            Resource: !GetAtt DeploymentRole.Arn
+
+Outputs:
+  DeploymentCallerName:
+    Description: IAM user name used only as the source for role assumption.
+    Value: !Ref DeploymentCaller
+  DeploymentRoleArn:
+    Description: Role ARN to configure as the analytics deployment profile.
+    Value: !GetAtt DeploymentRole.Arn

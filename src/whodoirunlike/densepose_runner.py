@@ -450,6 +450,15 @@ def run_densepose(
     if not runner_mask.exists():
         raise FileNotFoundError(f"Missing runner_mask: {runner_mask}")
 
+    if progress_callback:
+        progress_callback(
+            build_densepose_progress(
+                phase="decoding",
+                processed_frames=0,
+                total_frames=0,
+                elapsed_seconds=time.monotonic() - started_at,
+            )
+        )
     video_meta = inspect_video(source_segment)
     width = int(video_meta["width"])
     height = int(video_meta["height"])
@@ -473,6 +482,15 @@ def run_densepose(
             mask_capture.release()
             raise ValueError(f"Could not open qa overlay writer: {qa_overlay_path}")
 
+    if progress_callback:
+        progress_callback(
+            build_densepose_progress(
+                phase="running_densepose",
+                processed_frames=0,
+                total_frames=total_frames,
+                elapsed_seconds=time.monotonic() - started_at,
+            )
+        )
     rows: list[dict[str, Any]] = []
     frame_index = 0
     try:
@@ -530,9 +548,27 @@ def run_densepose(
             writer.release()
 
     if writer is not None:
+        if progress_callback:
+            progress_callback(
+                build_densepose_progress(
+                    phase="encoding",
+                    processed_frames=len(rows),
+                    total_frames=total_frames,
+                    elapsed_seconds=time.monotonic() - started_at,
+                )
+            )
         make_browser_playable_mp4(qa_overlay_path)
 
     usable_frames = sum(1 for row in rows if row.get("usable"))
+    if progress_callback:
+        progress_callback(
+            build_densepose_progress(
+                phase="writing_outputs",
+                processed_frames=len(rows),
+                total_frames=total_frames,
+                elapsed_seconds=time.monotonic() - started_at,
+            )
+        )
     jsonl_write(densepose_path, rows)
     update_manifest_densepose(
         manifest_path,
@@ -541,6 +577,15 @@ def run_densepose(
         frame_count=len(rows),
         usable_frames=usable_frames,
     )
+    if progress_callback:
+        progress_callback(
+            build_densepose_progress(
+                phase="completed",
+                processed_frames=len(rows),
+                total_frames=total_frames,
+                elapsed_seconds=time.monotonic() - started_at,
+            )
+        )
     return {
         "candidate_id": manifest.get("candidate_id"),
         "status": "complete",

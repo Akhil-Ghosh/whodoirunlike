@@ -1378,6 +1378,15 @@ def run_boxmot_identity_tracking(
     qc_metrics_path = clip_run.artifact_path("qc_metrics", manifest)
 
     try:
+        if progress_callback:
+            progress_callback(
+                build_identity_progress(
+                    phase="decoding",
+                    processed_frames=0,
+                    total_frames=0,
+                    elapsed_seconds=time.monotonic() - started_at,
+                )
+            )
         setup = identity_setup_status(backend)
         if not setup["ready"]:
             raise RuntimeError(
@@ -1400,6 +1409,15 @@ def run_boxmot_identity_tracking(
         reid_recover = _read_reid_threshold(seed, "cosine_recover", 0.58)
         selected_device = _select_identity_device(device)
 
+        if progress_callback:
+            progress_callback(
+                build_identity_progress(
+                    phase="loading_model",
+                    processed_frames=0,
+                    total_frames=frames.frame_count,
+                    elapsed_seconds=time.monotonic() - started_at,
+                )
+            )
         detector = _load_yolo_model(detector_model)
         tracker = _create_boxmot_tracker(
             backend,
@@ -1407,6 +1425,15 @@ def run_boxmot_identity_tracking(
             device=selected_device,
             half=half,
         )
+        if progress_callback:
+            progress_callback(
+                build_identity_progress(
+                    phase="detect_track",
+                    processed_frames=0,
+                    total_frames=frames.frame_count,
+                    elapsed_seconds=time.monotonic() - started_at,
+                )
+            )
 
         candidates_by_frame: dict[int, list[dict[str, Any]]] = {}
         for frame_index, frame in enumerate(frames.frames):
@@ -1435,6 +1462,15 @@ def run_boxmot_identity_tracking(
                     )
                 )
 
+        if progress_callback:
+            progress_callback(
+                build_identity_progress(
+                    phase="postprocessing",
+                    processed_frames=frames.frame_count,
+                    total_frames=frames.frame_count,
+                    elapsed_seconds=time.monotonic() - started_at,
+                )
+            )
         target_candidate = _select_target_candidate(
             candidates_by_frame,
             start_index=start_index,
@@ -1598,6 +1634,15 @@ def run_boxmot_identity_tracking(
             }
         )
 
+        if progress_callback:
+            progress_callback(
+                build_identity_progress(
+                    phase="writing_outputs",
+                    processed_frames=frames.frame_count,
+                    total_frames=frames.frame_count,
+                    elapsed_seconds=time.monotonic() - started_at,
+                )
+            )
         _write_parquet(tracklets_path, track_rows)
         _write_parquet(reid_path, reid_rows)
         _write_jsonl(tracklets_jsonl_path, track_rows)
@@ -1745,6 +1790,15 @@ def run_template_identity_tracking(
     qc_metrics_path = clip_run.artifact_path("qc_metrics", manifest)
 
     try:
+        if progress_callback:
+            progress_callback(
+                build_identity_progress(
+                    phase="decoding",
+                    processed_frames=0,
+                    total_frames=0,
+                    elapsed_seconds=time.monotonic() - started_at,
+                )
+            )
         frames = load_video_frames(source_segment)
         prompt = read_json(prompt_path)
         seed = read_json(track_seed_path) if track_seed_path.exists() else {}

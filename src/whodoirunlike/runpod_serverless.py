@@ -36,6 +36,26 @@ def _parse_worker_job_request(payload: dict[str, Any]) -> Any:
     return WorkerJobRequest.model_validate(payload)
 
 
+def _provider_delay_milliseconds(event: dict[str, Any]) -> float | None:
+    candidates = (
+        ("delayTime", 1.0),
+        ("delay_time_ms", 1.0),
+        ("delayTimeMs", 1.0),
+        ("delay_seconds", 1000.0),
+    )
+    for key, multiplier in candidates:
+        value = event.get(key)
+        if isinstance(value, bool):
+            continue
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if parsed >= 0 and parsed != float("inf"):
+            return parsed * multiplier
+    return None
+
+
 def handler(event: dict[str, Any]) -> dict[str, Any]:
     payload = event.get("input")
     if not isinstance(payload, dict):
@@ -52,7 +72,14 @@ def handler(event: dict[str, Any]) -> dict[str, Any]:
             "readiness": processor_readiness(),
         }
 
-    request = _parse_worker_job_request(payload)
+    request_payload = dict(payload)
+    runpod_job_id = event.get("id")
+    if runpod_job_id not in (None, "") and not request_payload.get("runpod_job_id"):
+        request_payload["runpod_job_id"] = str(runpod_job_id)
+    provider_delay_ms = _provider_delay_milliseconds(event)
+    if provider_delay_ms is not None and request_payload.get("runpod_delay_time_ms") is None:
+        request_payload["runpod_delay_time_ms"] = provider_delay_ms
+    request = _parse_worker_job_request(request_payload)
     return process_hosted_job(request, raise_on_error=True)
 
 

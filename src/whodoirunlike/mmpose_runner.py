@@ -813,6 +813,16 @@ def process_mmpose_video(
     runtime_backend: str = DEFAULT_RTMW_RUNTIME_BACKEND,
     progress_callback: MMPoseProgressCallback | None = None,
 ) -> dict[str, Any]:
+    started_at = time.monotonic()
+    if progress_callback:
+        progress_callback(
+            build_pose_progress(
+                phase="decoding",
+                processed_frames=0,
+                total_frames=0,
+                elapsed_seconds=0.0,
+            )
+        )
     meta = inspect_video(source_video)
     fps = float(meta.get("fps") or 30.0)
     frame_count = int(meta.get("frame_count") or 0)
@@ -837,7 +847,6 @@ def process_mmpose_video(
             mask_capture.release()
         raise ValueError("Could not open RTMW output video writers")
 
-    started_at = time.monotonic()
     if progress_callback:
         progress_callback(
             build_pose_progress(
@@ -849,6 +858,15 @@ def process_mmpose_video(
         )
 
     model = build_rtmlib_model(spec, device=device, runtime_backend=runtime_backend)
+    if progress_callback:
+        progress_callback(
+            build_pose_progress(
+                phase="running_rtmw",
+                processed_frames=0,
+                total_frames=frame_count,
+                elapsed_seconds=time.monotonic() - started_at,
+            )
+        )
 
     raw_rows: list[dict[str, Any]] = []
     pose_rows: list[dict[str, Any]] = []
@@ -918,15 +936,42 @@ def process_mmpose_video(
         skeleton_writer.release()
         qa_writer.release()
 
+    if progress_callback:
+        progress_callback(
+            build_pose_progress(
+                phase="writing_outputs",
+                processed_frames=len(pose_rows),
+                total_frames=frame_count,
+                elapsed_seconds=time.monotonic() - started_at,
+            )
+        )
     _write_jsonl(raw_mmpose_landmarks_path, raw_rows)
     _write_jsonl(pose_landmarks_path, pose_rows)
+    if progress_callback:
+        progress_callback(
+            build_pose_progress(
+                phase="encoding",
+                processed_frames=len(pose_rows),
+                total_frames=frame_count,
+                elapsed_seconds=time.monotonic() - started_at,
+            )
+        )
     make_browser_playable_mp4s([skeleton_render_path, qa_overlay_path])
+    if progress_callback:
+        progress_callback(
+            build_pose_progress(
+                phase="postprocessing",
+                processed_frames=len(pose_rows),
+                total_frames=frame_count,
+                elapsed_seconds=time.monotonic() - started_at,
+            )
+        )
     summary = summarize_mmpose_pose(pose_rows, input_video=source_video, spec=spec, fps=fps)
     write_json(features_path, summary)
     if progress_callback:
         progress_callback(
             build_pose_progress(
-                phase="writing_outputs",
+                phase="completed",
                 processed_frames=len(pose_rows),
                 total_frames=frame_count,
                 elapsed_seconds=time.monotonic() - started_at,

@@ -1,3 +1,5 @@
 PROCESSOR_SHARED_SECRET=replace-with-a-local-dev-secret
 RUNPOD_API_KEY=replace-with-runpod-api-key
 RUNPOD_ENDPOINT_ID=replace-with-runpod-endpoint-id
+AWS_ANALYTICS_INGEST_URL=
+AWS_ANALYTICS_SHARED_SECRET=replace-with-aws-analytics-shared-secret

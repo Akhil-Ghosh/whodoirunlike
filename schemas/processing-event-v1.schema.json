@@ -1,0 +1,209 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://whodoirunlike.com/schemas/processing-event-v1.schema.json",
+  "title": "Who Do I Run Like processing event v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "event_id",
+    "run_id",
+    "attempt_id",
+    "sequence",
+    "event_type",
+    "event_time"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "event_id": { "type": "string", "format": "uuid" },
+    "run_id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
+    },
+    "attempt_id": { "type": "string", "format": "uuid" },
+    "sequence": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 1000000000
+    },
+    "event_type": {
+      "enum": [
+        "attempt_started",
+        "stage_started",
+        "span_started",
+        "progress_sampled",
+        "span_completed",
+        "span_failed",
+        "stage_completed",
+        "stage_failed",
+        "result_ready",
+        "analysis_completed",
+        "attempt_completed",
+        "attempt_failed"
+      ]
+    },
+    "event_time": {
+      "type": "string",
+      "format": "date-time",
+      "maxLength": 40
+    },
+    "stage": {
+      "anyOf": [
+        { "$ref": "#/$defs/stage" },
+        { "type": "null" }
+      ]
+    },
+    "span": {
+      "anyOf": [
+        { "$ref": "#/$defs/span" },
+        { "type": "null" }
+      ]
+    },
+    "status": {
+      "enum": ["queued", "running", "complete", "failed"]
+    },
+    "elapsed_seconds": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 31536000
+    },
+    "progress": { "$ref": "#/$defs/metadata" },
+    "input": { "$ref": "#/$defs/metadata" },
+    "runtime": { "$ref": "#/$defs/metadata" },
+    "resources": { "$ref": "#/$defs/metadata" },
+    "measurements": { "$ref": "#/$defs/metadata" },
+    "error": { "$ref": "#/$defs/metadata" },
+    "attributes": { "$ref": "#/$defs/metadata" }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "event_type": {
+            "enum": [
+              "stage_started",
+              "stage_completed",
+              "stage_failed",
+              "span_started",
+              "span_completed",
+              "span_failed",
+              "progress_sampled"
+            ]
+          }
+        },
+        "required": ["event_type"]
+      },
+      "then": {
+        "required": ["stage"],
+        "properties": { "stage": { "$ref": "#/$defs/stage" } }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "event_type": {
+            "enum": ["span_started", "span_completed", "span_failed"]
+          }
+        },
+        "required": ["event_type"]
+      },
+      "then": {
+        "required": ["span"],
+        "properties": { "span": { "$ref": "#/$defs/span" } }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "event_type": {
+            "enum": ["span_failed", "stage_failed", "attempt_failed"]
+          }
+        },
+        "required": ["event_type"]
+      },
+      "then": { "required": ["error"] }
+    }
+  ],
+  "$defs": {
+    "stage": {
+      "enum": [
+        "source_ingest",
+        "processor_enqueue",
+        "processor_queue",
+        "source_download",
+        "run_preparation",
+        "target_tracking",
+        "runner_mask",
+        "pose_sequence",
+        "densepose_body_map",
+        "fused_form_signal",
+        "form_feature_compilation",
+        "artifact_table_export",
+        "quality_control",
+        "artifact_publish",
+        "result_ready",
+        "analysis_complete"
+      ]
+    },
+    "span": {
+      "enum": [
+        "model_load",
+        "decode",
+        "preprocess",
+        "inference",
+        "postprocess",
+        "render",
+        "encode",
+        "write",
+        "publish"
+      ]
+    },
+    "metadata": {
+      "type": "object",
+      "maxProperties": 32,
+      "propertyNames": {
+        "allOf": [
+          { "pattern": "^[A-Za-z][A-Za-z0-9_.-]{0,63}$" },
+          {
+            "not": {
+              "enum": [
+                "authorization",
+                "callback_base_url",
+                "filename",
+                "key",
+                "password",
+                "path",
+                "prompt",
+                "secret",
+                "source_path",
+                "source_url",
+                "token",
+                "traceback",
+                "url"
+              ]
+            }
+          }
+        ]
+      },
+      "additionalProperties": { "$ref": "#/$defs/metadata_value" }
+    },
+    "metadata_value": {
+      "anyOf": [
+        { "type": "null" },
+        { "type": "boolean" },
+        {
+          "type": "number",
+          "minimum": -1000000000000000,
+          "maximum": 1000000000000000
+        },
+        { "type": "string", "maxLength": 500 },
+        {
+          "type": "array",
+          "maxItems": 32,
+          "items": { "$ref": "#/$defs/metadata_value" }
+        },
+        { "$ref": "#/$defs/metadata" }
+      ]
+    }
+  }
+}

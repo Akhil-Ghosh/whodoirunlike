@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import time
 from collections import Counter
 from dataclasses import dataclass
@@ -21,6 +22,9 @@ _SEVERE_IDENTITY_REJECTION_REASONS = frozenset(
         "segmentation_mask_centroid_jump",
     }
 )
+_APPEARANCE_ONLY_IDENTITY_RISK_REASONS = frozenset(
+    {"low_prompt_anchor_similarity"}
+)
 
 
 @dataclass(frozen=True)
@@ -36,6 +40,15 @@ class InlineMaskConfig:
     sam_fallback_missing_target_gap_frames: int = 3
     fallback_to_track_box: bool = True
     blank_identity_risk: bool = True
+    rescue_appearance_only_identity_risk: bool = False
+    identity_rescue_maximum_span_seconds: float = 0.50
+    identity_rescue_minimum_confidence: float = 0.50
+    identity_rescue_minimum_track_box_iou: float = 0.45
+    identity_rescue_minimum_mask_inside_track_box: float = 0.80
+    identity_rescue_minimum_adjacent_box_iou: float = 0.55
+    identity_rescue_minimum_adjacent_mask_iou: float = 0.45
+    identity_rescue_maximum_area_change_ratio: float = 2.0
+    identity_rescue_maximum_centroid_jump_ratio: float = 0.08
 
 
 @dataclass(frozen=True)
@@ -263,6 +276,184 @@ def _plausibility_reason(
     return None, metrics
 
 
+def _xywh_iou(left: Sequence[float], right: Sequence[float]) -> float:
+    left_xyxy = (
+        float(left[0]),
+        float(left[1]),
+        float(left[0]) + float(left[2]),
+        float(left[1]) + float(left[3]),
+    )
+    right_xyxy = (
+        float(right[0]),
+        float(right[1]),
+        float(right[0]) + float(right[2]),
+        float(right[1]) + float(right[3]),
+    )
+    return _bbox_iou(left_xyxy, right_xyxy)
+
+
+def _appearance_only_identity_risk(
+    candidate: Mapping[str, Any] | None,
+) -> bool:
+    if candidate is None or str(candidate.get("_identity_state") or "") != "identity_risk":
+        return False
+    reasons = frozenset(str(reason) for reason in candidate.get("_identity_reasons") or [])
+    return reasons == _APPEARANCE_ONLY_IDENTITY_RISK_REASONS
+
+
+def _mask_inside_track_box_ratio(mask: np.ndarray, track_box_mask: np.ndarray) -> float:
+    area = int(mask.sum())
+    if not area:
+        return 0.0
+    return float(np.logical_and(mask > 0, track_box_mask > 0).sum() / area)
+
+
+def _area_change_ratio(left: np.ndarray, right: np.ndarray) -> float:
+    left_area = int(left.sum())
+    right_area = int(right.sum())
+    if not left_area or not right_area:
+        return float("inf")
+    return max(left_area / right_area, right_area / left_area)
+
+
+def _centroid_jump_ratio(
+    left: np.ndarray,
+    right: np.ndarray,
+    *,
+    width: int,
+    height: int,
+) -> float:
+    left_centroid = _centroid(left)
+    right_centroid = _centroid(right)
+    if left_centroid is None or right_centroid is None:
+        return float("inf")
+    distance = float(
+        np.hypot(
+            left_centroid[0] - right_centroid[0],
+            left_centroid[1] - right_centroid[1],
+        )
+    )
+    return distance / max(float(np.hypot(width, height)), 1.0)
+
+
+def _appearance_only_identity_rescue_frame_indexes(
+    *,
+    target_candidates: Mapping[int, Mapping[str, Any]],
+    height: int,
+    width: int,
+    fps: float,
+    config: InlineMaskConfig,
+) -> set[int]:
+    risk_indexes = sorted(
+        frame_index
+        for frame_index, candidate in target_candidates.items()
+        if _appearance_only_identity_risk(candidate)
+    )
+    if not risk_indexes:
+        return set()
+
+    spans: list[list[int]] = []
+    for frame_index in risk_indexes:
+        if not spans or frame_index != spans[-1][-1] + 1:
+            spans.append([frame_index])
+        else:
+            spans[-1].append(frame_index)
+
+    rescued: set[int] = set()
+    maximum_span_frames = max(
+        1,
+        int(
+            math.ceil(
+                max(0.0, float(fps))
+                * max(0.0, float(config.identity_rescue_maximum_span_seconds))
+            )
+        ),
+    )
+    for span in spans:
+        if len(span) > maximum_span_frames:
+            continue
+        previous_candidate = target_candidates.get(span[0] - 1)
+        next_candidate = target_candidates.get(span[-1] + 1)
+        if (
+            previous_candidate is None
+            or next_candidate is None
+            or str(previous_candidate.get("_identity_state") or "") != "usable"
+            or str(next_candidate.get("_identity_state") or "") != "usable"
+        ):
+            continue
+
+        sequence_indexes = [span[0] - 1, *span, span[-1] + 1]
+        sequence_candidates = [target_candidates[index] for index in sequence_indexes]
+        track_ids = {candidate.get("track_id") for candidate in sequence_candidates}
+        if None in track_ids or len(track_ids) != 1:
+            continue
+        risk_confidences = [
+            float(candidate.get("confidence") or 0.0)
+            for candidate in sequence_candidates[1:-1]
+        ]
+        if any(
+            not math.isfinite(confidence)
+            or confidence < float(config.identity_rescue_minimum_confidence)
+            for confidence in risk_confidences
+        ):
+            continue
+        association_ious = [
+            float(candidate.get("_inline_mask_track_box_iou") or 0.0)
+            for candidate in sequence_candidates
+        ]
+        if any(
+            not math.isfinite(association_iou)
+            or association_iou < float(config.identity_rescue_minimum_track_box_iou)
+            for association_iou in association_ious
+        ):
+            continue
+        if any(candidate.get("box") is None for candidate in sequence_candidates):
+            continue
+
+        sequence_masks = [
+            _decode_candidate_mask(candidate, height, width)
+            for candidate in sequence_candidates
+        ]
+        if any(mask is None or not mask.any() for mask in sequence_masks):
+            continue
+        decoded_masks = [mask for mask in sequence_masks if mask is not None]
+        if any(
+            _mask_inside_track_box_ratio(
+                mask,
+                _track_box_mask(candidate["box"], height=height, width=width),
+            )
+            < float(config.identity_rescue_minimum_mask_inside_track_box)
+            for candidate, mask in zip(sequence_candidates, decoded_masks)
+        ):
+            continue
+
+        adjacent_pairs = zip(
+            sequence_candidates,
+            sequence_candidates[1:],
+            decoded_masks,
+            decoded_masks[1:],
+        )
+        if any(
+            _xywh_iou(left_candidate["box"], right_candidate["box"])
+            < float(config.identity_rescue_minimum_adjacent_box_iou)
+            or mask_iou(left_mask, right_mask)
+            < float(config.identity_rescue_minimum_adjacent_mask_iou)
+            or _area_change_ratio(left_mask, right_mask)
+            > float(config.identity_rescue_maximum_area_change_ratio)
+            or _centroid_jump_ratio(
+                left_mask,
+                right_mask,
+                width=width,
+                height=height,
+            )
+            > float(config.identity_rescue_maximum_centroid_jump_ratio)
+            for left_candidate, right_candidate, left_mask, right_mask in adjacent_pairs
+        ):
+            continue
+        rescued.update(span)
+    return rescued
+
+
 def _overlay(frame: np.ndarray, mask: np.ndarray) -> np.ndarray:
     result = frame.copy()
     color = np.zeros_like(frame)
@@ -293,6 +484,17 @@ def write_selected_runner_mask_artifacts(
     if not frames:
         raise ValueError("Inline segmentation needs at least one source frame")
     height, width = frames[0].shape[:2]
+    identity_rescue_frame_indexes = (
+        _appearance_only_identity_rescue_frame_indexes(
+            target_candidates=target_candidates,
+            height=height,
+            width=width,
+            fps=fps,
+            config=config,
+        )
+        if config.blank_identity_risk and config.rescue_appearance_only_identity_risk
+        else set()
+    )
     for path in (
         runner_mask_path,
         masked_runner_path,
@@ -320,6 +522,7 @@ def write_selected_runner_mask_artifacts(
     fallback_frame_indexes: list[int] = []
     severe_rejection_frame_indexes: list[int] = []
     identity_risk_blank_frame_indexes: list[int] = []
+    accepted_identity_rescue_frame_indexes: list[int] = []
     temporal_rejection_frame_indexes: list[int] = []
     temporal_baseline_reset_frame_indexes: list[int] = []
     association_ious: list[float] = []
@@ -353,6 +556,7 @@ def write_selected_runner_mask_artifacts(
                 identity_state = (
                     str(candidate.get("_identity_state") or "missing") if candidate else "missing"
                 )
+                identity_rescue_requested = frame_index in identity_rescue_frame_indexes
                 track_mask = (
                     _track_box_mask(candidate["box"], height=height, width=width)
                     if candidate is not None and candidate.get("box") is not None
@@ -369,7 +573,11 @@ def write_selected_runner_mask_artifacts(
                     drop_reason = "target_track_missing"
                 else:
                     consecutive_missing_target_frames = 0
-                    if config.blank_identity_risk and identity_state != "usable":
+                    if (
+                        config.blank_identity_risk
+                        and identity_state != "usable"
+                        and not identity_rescue_requested
+                    ):
                         counts["identity_risk_blank_frames"] += 1
                         identity_risk_blank_frame_indexes.append(frame_index)
                         drop_reason = "identity_risk_blank"
@@ -396,13 +604,32 @@ def write_selected_runner_mask_artifacts(
                                 frame_gap=temporal_frame_gap or 1,
                             )
                         if fallback_reason is None:
-                            source = "yolo_segmentation"
+                            source = (
+                                "yolo_segmentation_identity_rescue"
+                                if identity_rescue_requested
+                                else "yolo_segmentation"
+                            )
                             counts["associated_frames"] += 1
+                            if identity_rescue_requested:
+                                counts["identity_rescue_frames"] += 1
+                                accepted_identity_rescue_frame_indexes.append(frame_index)
                             previous_plausible_mask = mask.copy()
                             previous_plausible_frame_index = frame_index
                             overlap = candidate.get("_inline_mask_track_box_iou")
                             if overlap is not None:
                                 association_ious.append(float(overlap))
+                        elif identity_rescue_requested:
+                            mask.fill(0)
+                            drop_reason = fallback_reason
+                            counts["rejected_segmentation_frames"] += 1
+                            counts["identity_risk_blank_frames"] += 1
+                            identity_risk_blank_frame_indexes.append(frame_index)
+                            fallback_reasons[fallback_reason] += 1
+                            if fallback_reason in _SEVERE_IDENTITY_REJECTION_REASONS:
+                                counts["severe_rejection_frames"] += 1
+                                severe_rejection_frame_indexes.append(frame_index)
+                            if fallback_reason == "segmentation_mask_centroid_jump":
+                                temporal_rejection_frame_indexes.append(frame_index)
                         elif fallback_reason in _SEVERE_IDENTITY_REJECTION_REASONS:
                             mask.fill(0)
                             drop_reason = fallback_reason
@@ -428,7 +655,11 @@ def write_selected_runner_mask_artifacts(
                             drop_reason = fallback_reason
                             counts["rejected_segmentation_frames"] += 1
 
-                if kernel is not None and mask.any() and source == "yolo_segmentation":
+                if (
+                    kernel is not None
+                    and mask.any()
+                    and source.startswith("yolo_segmentation")
+                ):
                     mask = cv2.dilate(mask, kernel)
                 if mask.any():
                     counts["nonempty_frames"] += 1
@@ -559,6 +790,16 @@ def write_selected_runner_mask_artifacts(
             maximum_consecutive_missing_target_frames
         ),
         "identity_risk_blank_frames": counts["identity_risk_blank_frames"],
+        "identity_risk_frames": (
+            counts["identity_risk_blank_frames"]
+            + counts["identity_rescue_frames"]
+        ),
+        "identity_rescue_eligible_frames": len(identity_rescue_frame_indexes),
+        "identity_rescue_frames": counts["identity_rescue_frames"],
+        "identity_rescue_rejected_frames": (
+            len(identity_rescue_frame_indexes)
+            - counts["identity_rescue_frames"]
+        ),
         "rejected_segmentation_frames": counts["rejected_segmentation_frames"],
         "severe_rejection_frames": counts["severe_rejection_frames"],
         "track_box_fallback_frames": counts["track_box_fallback_frames"],
@@ -607,7 +848,36 @@ def write_selected_runner_mask_artifacts(
         },
         "safety": {
             "blank_identity_risk": config.blank_identity_risk,
+            "rescue_appearance_only_identity_risk": (
+                config.rescue_appearance_only_identity_risk
+            ),
             "identity_risk_blank_frame_indexes": identity_risk_blank_frame_indexes,
+            "identity_rescue_frame_indexes": accepted_identity_rescue_frame_indexes,
+            "identity_rescue_maximum_span_seconds": max(
+                0.0,
+                float(config.identity_rescue_maximum_span_seconds),
+            ),
+            "identity_rescue_minimum_confidence": float(
+                config.identity_rescue_minimum_confidence
+            ),
+            "identity_rescue_minimum_track_box_iou": float(
+                config.identity_rescue_minimum_track_box_iou
+            ),
+            "identity_rescue_minimum_mask_inside_track_box": float(
+                config.identity_rescue_minimum_mask_inside_track_box
+            ),
+            "identity_rescue_minimum_adjacent_box_iou": float(
+                config.identity_rescue_minimum_adjacent_box_iou
+            ),
+            "identity_rescue_minimum_adjacent_mask_iou": float(
+                config.identity_rescue_minimum_adjacent_mask_iou
+            ),
+            "identity_rescue_maximum_area_change_ratio": float(
+                config.identity_rescue_maximum_area_change_ratio
+            ),
+            "identity_rescue_maximum_centroid_jump_ratio": float(
+                config.identity_rescue_maximum_centroid_jump_ratio
+            ),
             "severe_rejection_frame_indexes": severe_rejection_frame_indexes,
             "temporal_rejection_frame_indexes": temporal_rejection_frame_indexes,
             "temporal_baseline_reset_frame_indexes": (

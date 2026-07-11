@@ -1012,6 +1012,305 @@ def test_inline_segmentation_blanks_severe_adjacent_centroid_jump(
     assert result["safety"]["temporal_rejection_frame_indexes"] == [1]
 
 
+def test_inline_segmentation_rescues_bounded_appearance_only_identity_risk(
+    tmp_path: Path,
+) -> None:
+    frames = [np.zeros((64, 96, 3), dtype=np.uint8) for _ in range(4)]
+
+    def candidate(
+        x: int,
+        *,
+        identity_state: str,
+        reasons: list[str],
+    ) -> dict[str, object]:
+        mask = np.zeros((64, 96), dtype=np.uint8)
+        mask[18:49, x : x + 15] = 1
+        ok, encoded = cv2.imencode(".png", mask * 255)
+        assert ok
+        return {
+            "box": (x, 18, 15, 31),
+            "track_id": 7,
+            "confidence": 0.92,
+            "_identity_state": identity_state,
+            "_identity_reasons": reasons,
+            "_identity_memory_updated": identity_state == "usable",
+            "_inline_mask_png": encoded.tobytes(),
+            "_inline_mask_track_box_iou": 0.95,
+        }
+
+    result = inline_segmentation.write_selected_runner_mask_artifacts(
+        frames=frames,
+        fps=30.0,
+        target_candidates={
+            0: candidate(10, identity_state="usable", reasons=[]),
+            1: candidate(
+                11,
+                identity_state="identity_risk",
+                reasons=["low_prompt_anchor_similarity"],
+            ),
+            2: candidate(
+                12,
+                identity_state="identity_risk",
+                reasons=["low_prompt_anchor_similarity"],
+            ),
+            3: candidate(13, identity_state="usable", reasons=[]),
+        },
+        runner_mask_path=tmp_path / "runner_mask.mp4",
+        masked_runner_path=tmp_path / "masked_runner.mp4",
+        qa_overlay_path=tmp_path / "qa_overlay.mp4",
+        metadata_path=tmp_path / "runner_mask_metadata.jsonl",
+        masks_jsonl_path=tmp_path / "masks.jsonl",
+        model="yolo26n-seg.pt",
+        config=inline_segmentation.InlineMaskConfig(
+            dilation_pixels=0,
+            rescue_appearance_only_identity_risk=True,
+        ),
+        browser_playable=False,
+    )
+
+    metadata_rows = [
+        json.loads(line)
+        for line in Path(result["metadata"]).read_text(encoding="utf-8").splitlines()
+    ]
+    assert [metadata_rows[index]["source"] for index in (1, 2)] == [
+        "yolo_segmentation_identity_rescue",
+        "yolo_segmentation_identity_rescue",
+    ]
+    assert [metadata_rows[index]["identity_state"] for index in (1, 2)] == [
+        "identity_risk",
+        "identity_risk",
+    ]
+    assert result["summary"]["identity_rescue_frames"] == 2
+    assert result["summary"]["identity_risk_blank_frames"] == 0
+    assert result["safety"]["identity_rescue_frame_indexes"] == [1, 2]
+
+
+@pytest.mark.parametrize(
+    ("risk_reasons", "risk_track_id", "risk_x"),
+    [
+        (["low_prompt_anchor_similarity", "weak_motion_continuity"], 7, 11),
+        (["low_prompt_anchor_similarity"], 8, 11),
+        (["low_prompt_anchor_similarity"], 7, 68),
+    ],
+)
+def test_inline_segmentation_does_not_rescue_unsafe_identity_risk(
+    tmp_path: Path,
+    risk_reasons: list[str],
+    risk_track_id: int,
+    risk_x: int,
+) -> None:
+    frames = [np.zeros((64, 96, 3), dtype=np.uint8) for _ in range(3)]
+
+    def candidate(
+        x: int,
+        *,
+        identity_state: str,
+        reasons: list[str],
+        track_id: int,
+    ) -> dict[str, object]:
+        mask = np.zeros((64, 96), dtype=np.uint8)
+        mask[18:49, x : x + 15] = 1
+        ok, encoded = cv2.imencode(".png", mask * 255)
+        assert ok
+        return {
+            "box": (x, 18, 15, 31),
+            "track_id": track_id,
+            "confidence": 0.92,
+            "_identity_state": identity_state,
+            "_identity_reasons": reasons,
+            "_inline_mask_png": encoded.tobytes(),
+            "_inline_mask_track_box_iou": 0.95,
+        }
+
+    result = inline_segmentation.write_selected_runner_mask_artifacts(
+        frames=frames,
+        fps=30.0,
+        target_candidates={
+            0: candidate(
+                10,
+                identity_state="usable",
+                reasons=[],
+                track_id=7,
+            ),
+            1: candidate(
+                risk_x,
+                identity_state="identity_risk",
+                reasons=risk_reasons,
+                track_id=risk_track_id,
+            ),
+            2: candidate(
+                12,
+                identity_state="usable",
+                reasons=[],
+                track_id=7,
+            ),
+        },
+        runner_mask_path=tmp_path / "runner_mask.mp4",
+        masked_runner_path=tmp_path / "masked_runner.mp4",
+        qa_overlay_path=tmp_path / "qa_overlay.mp4",
+        metadata_path=tmp_path / "runner_mask_metadata.jsonl",
+        masks_jsonl_path=tmp_path / "masks.jsonl",
+        model="yolo26n-seg.pt",
+        config=inline_segmentation.InlineMaskConfig(
+            dilation_pixels=0,
+            rescue_appearance_only_identity_risk=True,
+        ),
+        browser_playable=False,
+    )
+
+    metadata_rows = [
+        json.loads(line)
+        for line in Path(result["metadata"]).read_text(encoding="utf-8").splitlines()
+    ]
+    assert metadata_rows[1]["source"] == "blank"
+    assert metadata_rows[1]["drop_reason"] == "identity_risk_blank"
+    assert result["summary"]["identity_rescue_frames"] == 0
+    assert result["summary"]["identity_risk_blank_frames"] == 1
+    assert result["safety"]["identity_rescue_frame_indexes"] == []
+
+
+@pytest.mark.parametrize(
+    ("previous_association_iou", "risk_confidence"),
+    [
+        (0.05, 0.92),
+        (float("nan"), 0.92),
+        (0.95, float("nan")),
+    ],
+)
+def test_inline_segmentation_identity_rescue_fails_closed_on_invalid_evidence(
+    tmp_path: Path,
+    previous_association_iou: float,
+    risk_confidence: float,
+) -> None:
+    frames = [np.zeros((64, 96, 3), dtype=np.uint8) for _ in range(3)]
+
+    def candidate(
+        x: int,
+        *,
+        identity_state: str,
+        reasons: list[str],
+        confidence: float,
+        association_iou: float,
+    ) -> dict[str, object]:
+        mask = np.zeros((64, 96), dtype=np.uint8)
+        mask[18:49, x : x + 15] = 1
+        ok, encoded = cv2.imencode(".png", mask * 255)
+        assert ok
+        return {
+            "box": (x, 18, 15, 31),
+            "track_id": 7,
+            "confidence": confidence,
+            "_identity_state": identity_state,
+            "_identity_reasons": reasons,
+            "_inline_mask_png": encoded.tobytes(),
+            "_inline_mask_track_box_iou": association_iou,
+        }
+
+    result = inline_segmentation.write_selected_runner_mask_artifacts(
+        frames=frames,
+        fps=30.0,
+        target_candidates={
+            0: candidate(
+                10,
+                identity_state="usable",
+                reasons=[],
+                confidence=0.92,
+                association_iou=previous_association_iou,
+            ),
+            1: candidate(
+                11,
+                identity_state="identity_risk",
+                reasons=["low_prompt_anchor_similarity"],
+                confidence=risk_confidence,
+                association_iou=0.95,
+            ),
+            2: candidate(
+                12,
+                identity_state="usable",
+                reasons=[],
+                confidence=0.92,
+                association_iou=0.95,
+            ),
+        },
+        runner_mask_path=tmp_path / "runner_mask.mp4",
+        masked_runner_path=tmp_path / "masked_runner.mp4",
+        qa_overlay_path=tmp_path / "qa_overlay.mp4",
+        metadata_path=tmp_path / "runner_mask_metadata.jsonl",
+        masks_jsonl_path=tmp_path / "masks.jsonl",
+        model="yolo26n-seg.pt",
+        config=inline_segmentation.InlineMaskConfig(
+            dilation_pixels=0,
+            rescue_appearance_only_identity_risk=True,
+        ),
+        browser_playable=False,
+    )
+
+    assert result["summary"]["identity_rescue_eligible_frames"] == 0
+    assert result["summary"]["identity_rescue_frames"] == 0
+    assert result["summary"]["identity_risk_blank_frames"] == 1
+
+
+def test_inline_segmentation_failed_identity_rescue_still_recommends_sam(
+    tmp_path: Path,
+) -> None:
+    frames = [np.zeros((64, 96, 3), dtype=np.uint8) for _ in range(3)]
+
+    def candidate(
+        x: int,
+        mask_width: int,
+        *,
+        identity_state: str,
+        reasons: list[str],
+    ) -> dict[str, object]:
+        mask = np.zeros((64, 96), dtype=np.uint8)
+        mask[18:49, x : x + mask_width] = 1
+        ok, encoded = cv2.imencode(".png", mask * 255)
+        assert ok
+        return {
+            "box": (x, 18, mask_width, 31),
+            "track_id": 7,
+            "confidence": 0.92,
+            "_identity_state": identity_state,
+            "_identity_reasons": reasons,
+            "_inline_mask_png": encoded.tobytes(),
+            "_inline_mask_track_box_iou": 0.95,
+        }
+
+    result = inline_segmentation.write_selected_runner_mask_artifacts(
+        frames=frames,
+        fps=30.0,
+        target_candidates={
+            0: candidate(10, 15, identity_state="usable", reasons=[]),
+            1: candidate(
+                10,
+                20,
+                identity_state="identity_risk",
+                reasons=["low_prompt_anchor_similarity"],
+            ),
+            2: candidate(10, 15, identity_state="usable", reasons=[]),
+        },
+        runner_mask_path=tmp_path / "runner_mask.mp4",
+        masked_runner_path=tmp_path / "masked_runner.mp4",
+        qa_overlay_path=tmp_path / "qa_overlay.mp4",
+        metadata_path=tmp_path / "runner_mask_metadata.jsonl",
+        masks_jsonl_path=tmp_path / "masks.jsonl",
+        model="yolo26n-seg.pt",
+        config=inline_segmentation.InlineMaskConfig(
+            dilation_pixels=0,
+            maximum_area_change_ratio=1.1,
+            rescue_appearance_only_identity_risk=True,
+        ),
+        browser_playable=False,
+    )
+
+    assert result["summary"]["identity_rescue_eligible_frames"] == 1
+    assert result["summary"]["identity_rescue_frames"] == 0
+    assert result["summary"]["identity_rescue_rejected_frames"] == 1
+    assert result["summary"]["identity_risk_blank_frames"] == 1
+    assert result["summary"]["sam_fallback_recommended"] is True
+    assert result["safety"]["identity_risk_blank_frame_indexes"] == [1]
+
+
 class SwitchFakeBoxes:
     def __init__(self, frame_index: int) -> None:
         target_x = 22 + frame_index

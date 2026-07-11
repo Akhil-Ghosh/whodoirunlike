@@ -343,12 +343,14 @@ def test_full_pipeline_reuses_yolo26_inline_mask_without_running_sam(
         mask_backend="yolo26n_seg_inline",
         inline_mask_defer_browser_encoding=True,
         inline_mask_temporal_reset_gap_frames=7,
+        inline_mask_rescue_appearance_only_identity_risk=True,
         telemetry=telemetry,
     )
 
     assert identity_kwargs["inline_segmentation"] is True
     assert identity_kwargs["inline_mask_defer_browser_encoding"] is True
     assert identity_kwargs["inline_mask_temporal_reset_gap_frames"] == 7
+    assert identity_kwargs["inline_mask_rescue_appearance_only_identity_risk"] is True
     assert identity_kwargs["detector_model"] == "yolo26n-seg.pt"
     mask_result = next(step["result"] for step in result["steps"] if step["stage"] == "mask")
     assert mask_result["runner_mask"] == inline_mask["runner_mask"]

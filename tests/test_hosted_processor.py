@@ -927,6 +927,10 @@ def test_processor_health_reports_full_pipeline_readiness(monkeypatch: Any, tmp_
     monkeypatch.setenv("WHODOIRUNLIKE_IDENTITY_DETECTOR_MODEL", str(detector_model))
     monkeypatch.setenv("WHODOIRUNLIKE_INLINE_MASK_DILATION_PIXELS", "7")
     monkeypatch.setenv("WHODOIRUNLIKE_INLINE_MASK_TEMPORAL_RESET_GAP_FRAMES", "9")
+    monkeypatch.setenv(
+        "WHODOIRUNLIKE_INLINE_MASK_RESCUE_APPEARANCE_ONLY_IDENTITY_RISK",
+        "true",
+    )
     monkeypatch.setenv("WHODOIRUNLIKE_INLINE_MASK_FALLBACK_TO_TRACK_BOX", "false")
     monkeypatch.setenv("WHODOIRUNLIKE_INLINE_MASK_DEFER_BROWSER_ENCODING", "true")
     monkeypatch.setenv("WHODOIRUNLIKE_INLINE_MASK_SAM_FALLBACK", "false")
@@ -967,6 +971,7 @@ def test_processor_health_reports_full_pipeline_readiness(monkeypatch: Any, tmp_
         "identity_detector_model": str(detector_model),
         "inline_mask_dilation_pixels": 7,
         "inline_mask_temporal_reset_gap_frames": 9,
+        "inline_mask_rescue_appearance_only_identity_risk": True,
         "inline_mask_fallback_to_track_box": False,
         "inline_mask_defer_browser_encoding": True,
         "inline_mask_sam_fallback": False,
@@ -1410,6 +1415,7 @@ def test_inline_mask_settings_keep_safe_defaults(monkeypatch: Any) -> None:
         "WHODOIRUNLIKE_IDENTITY_DETECTOR_MODEL",
         "WHODOIRUNLIKE_INLINE_MASK_DILATION_PIXELS",
         "WHODOIRUNLIKE_INLINE_MASK_TEMPORAL_RESET_GAP_FRAMES",
+        "WHODOIRUNLIKE_INLINE_MASK_RESCUE_APPEARANCE_ONLY_IDENTITY_RISK",
         "WHODOIRUNLIKE_INLINE_MASK_FALLBACK_TO_TRACK_BOX",
         "WHODOIRUNLIKE_INLINE_MASK_DEFER_BROWSER_ENCODING",
         "WHODOIRUNLIKE_INLINE_MASK_SAM_FALLBACK",
@@ -1421,6 +1427,7 @@ def test_inline_mask_settings_keep_safe_defaults(monkeypatch: Any) -> None:
         "identity_detector_model": None,
         "inline_mask_dilation_pixels": 5,
         "inline_mask_temporal_reset_gap_frames": 3,
+        "inline_mask_rescue_appearance_only_identity_risk": False,
         "inline_mask_fallback_to_track_box": True,
         "inline_mask_defer_browser_encoding": True,
         "inline_mask_sam_fallback": True,
@@ -1607,6 +1614,10 @@ def test_process_hosted_job_emits_complete_lifecycle_with_worker_attempt_id(
     monkeypatch.setenv("WHODOIRUNLIKE_IDENTITY_DETECTOR_MODEL", "runner-seg.engine")
     monkeypatch.setenv("WHODOIRUNLIKE_INLINE_MASK_DILATION_PIXELS", "7")
     monkeypatch.setenv("WHODOIRUNLIKE_INLINE_MASK_TEMPORAL_RESET_GAP_FRAMES", "11")
+    monkeypatch.setenv(
+        "WHODOIRUNLIKE_INLINE_MASK_RESCUE_APPEARANCE_ONLY_IDENTITY_RISK",
+        "true",
+    )
     monkeypatch.setenv("WHODOIRUNLIKE_INLINE_MASK_FALLBACK_TO_TRACK_BOX", "false")
     monkeypatch.setenv("WHODOIRUNLIKE_INLINE_MASK_DEFER_BROWSER_ENCODING", "true")
     monkeypatch.setenv("WHODOIRUNLIKE_INLINE_MASK_SAM_FALLBACK", "false")
@@ -1650,6 +1661,7 @@ def test_process_hosted_job_emits_complete_lifecycle_with_worker_attempt_id(
         assert kwargs["identity_detector_model"] == "runner-seg.engine"
         assert kwargs["inline_mask_dilation_pixels"] == 7
         assert kwargs["inline_mask_temporal_reset_gap_frames"] == 11
+        assert kwargs["inline_mask_rescue_appearance_only_identity_risk"] is True
         assert kwargs["inline_mask_fallback_to_track_box"] is False
         assert kwargs["inline_mask_defer_browser_encoding"] is True
         assert kwargs["inline_mask_sam_fallback"] is False
@@ -1725,6 +1737,10 @@ def test_process_hosted_job_emits_complete_lifecycle_with_worker_attempt_id(
     assert events[0]["runtime"]["identity_detector_model"] == "runner-seg.engine"
     assert events[0]["runtime"]["inline_mask_dilation_pixels"] == 7
     assert events[0]["runtime"]["inline_mask_temporal_reset_gap_frames"] == 11
+    assert (
+        events[0]["runtime"]["inline_mask_rescue_appearance_only_identity_risk"]
+        is True
+    )
     assert events[0]["runtime"]["inline_mask_fallback_to_track_box"] is False
     assert events[0]["runtime"]["inline_mask_sam_fallback"] is False
     assert events[0]["runtime"]["inline_mask_fallback_backend"] == "sam31_mlx"

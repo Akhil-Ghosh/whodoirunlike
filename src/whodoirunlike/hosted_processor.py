@@ -988,6 +988,10 @@ def _inline_mask_settings() -> dict[str, Any]:
             3,
             minimum=0,
         ),
+        "inline_mask_rescue_appearance_only_identity_risk": _env_bool(
+            "WHODOIRUNLIKE_INLINE_MASK_RESCUE_APPEARANCE_ONLY_IDENTITY_RISK",
+            False,
+        ),
         "inline_mask_fallback_to_track_box": _env_bool(
             "WHODOIRUNLIKE_INLINE_MASK_FALLBACK_TO_TRACK_BOX",
             True,

@@ -1511,6 +1511,7 @@ def run_boxmot_identity_tracking(
     inline_mask_fallback_to_track_box: bool = True,
     inline_mask_defer_browser_encoding: bool = False,
     inline_mask_temporal_reset_gap_frames: int = 3,
+    inline_mask_rescue_appearance_only_identity_risk: bool = False,
     progress_callback: IdentityProgressCallback | None = None,
 ) -> dict[str, Any]:
     backend = canonical_identity_backend(backend)
@@ -1540,6 +1541,9 @@ def run_boxmot_identity_tracking(
         temporal_reset_gap_frames=max(
             0,
             int(inline_mask_temporal_reset_gap_frames),
+        ),
+        rescue_appearance_only_identity_risk=bool(
+            inline_mask_rescue_appearance_only_identity_risk
         ),
     )
 
@@ -1997,6 +2001,7 @@ def run_identity_tracking(
     inline_mask_fallback_to_track_box: bool = True,
     inline_mask_defer_browser_encoding: bool = False,
     inline_mask_temporal_reset_gap_frames: int = 3,
+    inline_mask_rescue_appearance_only_identity_risk: bool = False,
     progress_callback: IdentityProgressCallback | None = None,
 ) -> dict[str, Any]:
     backend = canonical_identity_backend(backend)
@@ -2025,6 +2030,9 @@ def run_identity_tracking(
         inline_mask_fallback_to_track_box=inline_mask_fallback_to_track_box,
         inline_mask_defer_browser_encoding=inline_mask_defer_browser_encoding,
         inline_mask_temporal_reset_gap_frames=inline_mask_temporal_reset_gap_frames,
+        inline_mask_rescue_appearance_only_identity_risk=(
+            inline_mask_rescue_appearance_only_identity_risk
+        ),
         progress_callback=progress_callback,
     )
 

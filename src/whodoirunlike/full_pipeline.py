@@ -454,6 +454,7 @@ def run_full_cv_pipeline(
     inline_mask_fallback_to_track_box: bool = True,
     inline_mask_defer_browser_encoding: bool = False,
     inline_mask_temporal_reset_gap_frames: int = 3,
+    inline_mask_rescue_appearance_only_identity_risk: bool = False,
     inline_mask_sam_fallback: bool = True,
     inline_mask_fallback_backend: str = "sam31_gpu",
     parallel_pose_densepose: bool = False,
@@ -492,6 +493,9 @@ def run_full_cv_pipeline(
                     "inline_mask_temporal_reset_gap_frames": (
                         inline_mask_temporal_reset_gap_frames
                     ),
+                    "inline_mask_rescue_appearance_only_identity_risk": (
+                        inline_mask_rescue_appearance_only_identity_risk
+                    ),
                 }
             )
         return run_identity_tracking(**kwargs)
@@ -505,6 +509,9 @@ def run_full_cv_pipeline(
     if inline_segmentation:
         identity_runtime["inline_mask_temporal_reset_gap_frames"] = (
             inline_mask_temporal_reset_gap_frames
+        )
+        identity_runtime["inline_mask_rescue_appearance_only_identity_risk"] = (
+            inline_mask_rescue_appearance_only_identity_risk
         )
     identity = _run_observed_stage(
         telemetry=telemetry,

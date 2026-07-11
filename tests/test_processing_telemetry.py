@@ -99,6 +99,33 @@ def test_boundary_events_have_stable_contract_exact_elapsed_and_append_only_file
         processing_telemetry.validate_event(event)
 
 
+def test_runner_mask_result_exports_predictor_cache_measurements(tmp_path: Path) -> None:
+    clock = FakeClock()
+    telemetry = _telemetry(tmp_path, clock)
+
+    with telemetry.stage("runner_mask") as stage:
+        stage.set_result(
+            {
+                "cache_hit": True,
+                "model_build_seconds": 0.0,
+                "predictor_lock_wait_seconds": 0.004,
+                "frame_count": 260,
+                "elapsed_seconds": 40.0,
+            }
+        )
+
+    events = [json.loads(line) for line in telemetry.local_path.read_text().splitlines()]
+    completed = next(event for event in events if event["event_type"] == "stage_completed")
+    assert completed["measurements"] == {
+        "cache_hit": True,
+        "elapsed_seconds": 40.0,
+        "frame_count": 260,
+        "milliseconds_per_frame": 153.84615384615384,
+        "model_build_seconds": 0.0,
+        "predictor_lock_wait_seconds": 0.004,
+    }
+
+
 def test_progress_reporter_throttles_to_five_seconds_and_tracks_phase_spans(
     tmp_path: Path,
 ) -> None:

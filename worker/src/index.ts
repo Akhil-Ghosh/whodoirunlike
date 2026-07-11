@@ -58,6 +58,7 @@ type ProcessingAttemptRecord = {
   processor_enqueued_at?: string;
   processor_queue_started_at?: string;
   processor_started_at?: string;
+  runpod_endpoint_id?: string;
   runpod_job_id?: string;
 };
 
@@ -81,6 +82,7 @@ type JobRecord = {
   processor_enqueued_at?: string;
   processor_queue_started_at?: string;
   processor_started_at?: string;
+  runpod_endpoint_id?: string;
   runpod_job_id?: string;
   processing_attempts?: ProcessingAttemptRecord[];
   progress?: unknown;
@@ -940,14 +942,19 @@ async function notifyRunPod(
   const runpodJobId = typeof body?.id === "string" ? body.id.slice(0, 200) : undefined;
   await mutateCurrentJob(env, job.run_id, job.attempt_id, (current) => {
     const updated = updateJob(current, current.status);
+    updated.runpod_endpoint_id = endpointId;
     if (runpodJobId) {
       updated.runpod_job_id = runpodJobId;
-      updated.processing_attempts = (updated.processing_attempts ?? []).map((attempt) =>
-        attempt.attempt_id === job.attempt_id
-          ? { ...attempt, runpod_job_id: runpodJobId }
-          : attempt,
-      );
     }
+    updated.processing_attempts = (updated.processing_attempts ?? []).map((attempt) =>
+      attempt.attempt_id === job.attempt_id
+        ? {
+            ...attempt,
+            runpod_endpoint_id: endpointId,
+            ...(runpodJobId ? { runpod_job_id: runpodJobId } : {}),
+          }
+        : attempt,
+    );
     updated.progress = {
       phase: "queued_on_runpod",
       runpod_job_id: runpodJobId ?? null,
@@ -1095,6 +1102,7 @@ function workerLifecycleEvent(
       environment: env.ENVIRONMENT.slice(0, 64),
       attempt_number: job.attempt_number,
       processor_enqueued_at: job.processor_enqueued_at ?? null,
+      runpod_endpoint_id: persistedRunPodEndpointId(job) ?? null,
     },
     ...details,
   };
@@ -1173,6 +1181,8 @@ function enqueueJob(job: JobRecord): EnqueuedJobRecord {
     processing_attempts: attempts,
     artifacts: reuseInitialAttempt ? queued.artifacts : {},
     error_code: undefined,
+    runpod_endpoint_id: undefined,
+    runpod_job_id: undefined,
   };
   console.log(
     JSON.stringify({
@@ -1272,10 +1282,11 @@ async function recordProviderQueueCompletion(
   ctx: ExecutionContext,
   job: JobRecord,
 ): Promise<void> {
-  if (!job.runpod_job_id || !env.RUNPOD_API_KEY || !runPodEndpointId(env)) return;
+  const endpointId = persistedRunPodEndpointId(job) ?? runPodEndpointId(env);
+  if (!job.runpod_job_id || !env.RUNPOD_API_KEY || !endpointId) return;
   try {
     const response = await fetch(
-      `https://api.runpod.ai/v2/${runPodEndpointId(env)}/status/${encodeURIComponent(job.runpod_job_id)}`,
+      `https://api.runpod.ai/v2/${endpointId}/status/${encodeURIComponent(job.runpod_job_id)}`,
       { headers: { Authorization: `Bearer ${env.RUNPOD_API_KEY}` } },
     );
     const payload = (await response.json().catch(() => null)) as {
@@ -1312,6 +1323,7 @@ async function recordProviderQueueCompletion(
     await recordQueueCompletionEvent(env, ctx, job, completedAt, delayTime / 1000, {
       timing_basis: "runpod_delay_time",
       delay_time_ms: delayTime,
+      runpod_endpoint_id: endpointId,
     });
   } catch (error) {
     console.error(
@@ -1324,6 +1336,13 @@ async function recordProviderQueueCompletion(
       }),
     );
   }
+}
+
+function persistedRunPodEndpointId(job: JobRecord): string | null {
+  const attemptEndpointId = currentProcessingAttempt(job)?.runpod_endpoint_id?.trim();
+  if (attemptEndpointId) return attemptEndpointId;
+  const jobEndpointId = job.runpod_endpoint_id?.trim();
+  return jobEndpointId || null;
 }
 
 async function recordDirectQueueCompletion(

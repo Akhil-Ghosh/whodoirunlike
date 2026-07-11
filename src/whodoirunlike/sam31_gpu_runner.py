@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 import os
+import threading
 import time
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 
 import numpy as np
 
@@ -24,12 +26,142 @@ DEFAULT_SAM31_GPU_TRACK_PROMPT_ANCHORS = 6
 DEFAULT_SAM31_GPU_DISABLE_DEMO_SUPPRESSION = True
 Sam31GpuProgressCallback = Callable[[dict[str, Any]], None]
 
+_SAM31_GPU_PREDICTOR_LOCK = threading.Lock()
+_SAM31_GPU_CACHED_PREDICTOR: Any | None = None
+_SAM31_GPU_CACHED_CONFIG: tuple[Any, ...] | None = None
+
 
 def _env_bool(name: str, default: bool = False) -> bool:
     raw = os.getenv(name)
     if raw is None:
         return default
     return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _predictor_config_key(build_kwargs: dict[str, Any]) -> tuple[Any, ...]:
+    return tuple((key, build_kwargs[key]) for key in sorted(build_kwargs))
+
+
+def _unwind_sam31_builder_autocast_contexts(predictor: Any) -> int:
+    """Replace SAM's thread-local lifetime autocast with per-session autocast.
+
+    The pinned SAM 3.1 builder enters two CUDA autocast contexts and never exits
+    them: one on the tracker wrapper, then one on the public predictor. A cached
+    predictor can be reused by a different worker thread, where those contexts do
+    not apply. Unwind them in reverse order once; callers then explicitly wrap
+    every serialized session in a fresh bfloat16 autocast context.
+    """
+    if getattr(predictor, "_whodoirunlike_autocast_unwound", False):
+        return 0
+
+    model = getattr(predictor, "model", None)
+    tracker = getattr(model, "tracker", None)
+    contexts = (
+        getattr(predictor, "bf16_context", None),
+        getattr(tracker, "bf16_context", None),
+    )
+    unwound = 0
+    for context in contexts:
+        exit_context = getattr(context, "__exit__", None)
+        if callable(exit_context):
+            exit_context(None, None, None)
+            unwound += 1
+    setattr(predictor, "_whodoirunlike_autocast_unwound", True)
+    return unwound
+
+
+def _dispose_sam31_gpu_predictor(predictor: Any) -> None:
+    sessions = getattr(predictor, "_all_inference_states", None)
+    if isinstance(sessions, dict):
+        sessions.clear()
+    if not getattr(predictor, "_whodoirunlike_autocast_unwound", False):
+        _unwind_sam31_builder_autocast_contexts(predictor)
+
+
+def _reclaim_sam31_gpu_memory() -> None:
+    import gc
+
+    gc.collect()
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except (AttributeError, RuntimeError):
+        return
+
+
+@contextmanager
+def _sam31_gpu_session_autocast() -> Iterator[None]:
+    import torch
+
+    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+        yield
+
+
+@contextmanager
+def _borrow_sam31_gpu_predictor(
+    *,
+    builder: Callable[..., Any],
+    build_kwargs: dict[str, Any],
+    cache_enabled: bool,
+) -> Iterator[tuple[Any, dict[str, Any]]]:
+    """Serialize predictor use and optionally retain one configured GPU model."""
+    global _SAM31_GPU_CACHED_CONFIG, _SAM31_GPU_CACHED_PREDICTOR
+
+    wait_started_at = time.perf_counter()
+    with _SAM31_GPU_PREDICTOR_LOCK:
+        lock_wait_seconds = time.perf_counter() - wait_started_at
+        config_key = _predictor_config_key(build_kwargs)
+        cache_hit = bool(
+            cache_enabled
+            and _SAM31_GPU_CACHED_PREDICTOR is not None
+            and _SAM31_GPU_CACHED_CONFIG == config_key
+        )
+        predictor = _SAM31_GPU_CACHED_PREDICTOR if cache_hit else None
+        build_seconds = 0.0
+
+        if predictor is None:
+            if _SAM31_GPU_CACHED_PREDICTOR is not None:
+                stale_predictor = _SAM31_GPU_CACHED_PREDICTOR
+                _SAM31_GPU_CACHED_PREDICTOR = None
+                _SAM31_GPU_CACHED_CONFIG = None
+                _dispose_sam31_gpu_predictor(stale_predictor)
+                del stale_predictor
+                _reclaim_sam31_gpu_memory()
+
+            build_started_at = time.perf_counter()
+            predictor = builder(**build_kwargs)
+            build_seconds = time.perf_counter() - build_started_at
+            unwound_contexts = _unwind_sam31_builder_autocast_contexts(predictor)
+            _patch_multiplex_init_state_kwargs(predictor)
+            if cache_enabled:
+                _SAM31_GPU_CACHED_PREDICTOR = predictor
+                _SAM31_GPU_CACHED_CONFIG = config_key
+        else:
+            unwound_contexts = 0
+
+        metadata = {
+            "enabled": cache_enabled,
+            "hit": cache_hit,
+            "model_build_seconds": round(build_seconds, 6),
+            "lock_wait_seconds": round(lock_wait_seconds, 6),
+            "autocast_contexts_unwound": unwound_contexts,
+            "invalidated_after_error": False,
+        }
+        try:
+            yield predictor, metadata
+        except BaseException:
+            if cache_enabled and _SAM31_GPU_CACHED_PREDICTOR is predictor:
+                _SAM31_GPU_CACHED_PREDICTOR = None
+                _SAM31_GPU_CACHED_CONFIG = None
+                metadata["invalidated_after_error"] = True
+                _dispose_sam31_gpu_predictor(predictor)
+                _reclaim_sam31_gpu_memory()
+            raise
+        finally:
+            if not cache_enabled:
+                _dispose_sam31_gpu_predictor(predictor)
 
 
 def _relative_prompt_tensors(
@@ -333,7 +465,7 @@ def _collect_stream_masks(
             responses += 1
             frame_index = int(stream_response["frame_index"])
             mask = _mask_from_outputs(
-                stream_response.get("outputs", {}),
+                stream_response.get("outputs") or {},
                 obj_id=active_obj_id,
             )
             if mask is not None:
@@ -391,6 +523,7 @@ def _collect_sam31_masks(
     obj_id: int,
     track_boxes: dict[int, np.ndarray] | None = None,
     progress_callback: Callable[[int, int, str], None] | None = None,
+    preseed_track_anchors: bool = True,
 ) -> tuple[dict[int, np.ndarray], dict[str, Any]]:
     import torch
 
@@ -407,6 +540,7 @@ def _collect_sam31_masks(
         "active_obj_id": obj_id,
         "visual_box_prompt": False,
         "propagation": [],
+        "preseed_track_anchors": preseed_track_anchors,
     }
     try:
         prompt_frame = max(0, min(int(prompt["frame_index"]), max(frame_count - 1, 0)))
@@ -460,7 +594,7 @@ def _collect_sam31_masks(
                         ),
                     }
                 )
-                box_outputs = box_response.get("outputs", {})
+                box_outputs = box_response.get("outputs") or {}
                 box_obj_id = _first_nonempty_output_object_id(box_outputs)
                 if box_obj_id is not None:
                     active_obj_id = box_obj_id
@@ -488,7 +622,7 @@ def _collect_sam31_masks(
                     **prompt_inputs,
                 }
             )
-            prompt_outputs = prompt_response.get("outputs", {})
+            prompt_outputs = prompt_response.get("outputs") or {}
             prompt_obj_id = _first_nonempty_output_object_id(prompt_outputs)
             if prompt_obj_id is not None:
                 active_obj_id = prompt_obj_id
@@ -497,6 +631,47 @@ def _collect_sam31_masks(
             prompt_mask = _mask_from_outputs(prompt_outputs, obj_id=active_obj_id)
             if prompt_mask is not None:
                 masks_by_frame[seed_frame] = prompt_mask
+
+            track_frame_target = len(track_boxes or {}) or frame_count
+            anchor_refine_threshold = min(
+                track_frame_target,
+                max(12, int(track_frame_target * 0.65)),
+            )
+            preseed_anchor_frames = (
+                _track_prompt_anchors(
+                    prompt_frame=seed_frame,
+                    frame_count=frame_count,
+                    track_boxes=track_boxes or {},
+                )
+                if track_boxes and preseed_track_anchors
+                else []
+            )
+            diagnostics["preseed_anchor_frames"] = preseed_anchor_frames
+            for anchor_frame in preseed_anchor_frames:
+                if anchor_frame == seed_frame:
+                    continue
+                points = _support_points_from_box(track_boxes[anchor_frame])
+                labels = np.ones(len(points), dtype=np.int32)
+                anchor_response = predictor.handle_request(
+                    request={
+                        "type": "add_prompt",
+                        "session_id": session_id,
+                        "frame_index": anchor_frame,
+                        "obj_id": active_obj_id,
+                        **_point_prompt_tensors(
+                            points=points,
+                            labels=labels,
+                            width=width,
+                            height=height,
+                        ),
+                    }
+                )
+                anchor_mask = _mask_from_outputs(
+                    anchor_response.get("outputs") or {},
+                    obj_id=active_obj_id,
+                )
+                if anchor_mask is not None:
+                    masks_by_frame[anchor_frame] = anchor_mask
 
             diagnostics["propagation"].extend(
                 _propagate_from_seed_frame(
@@ -511,49 +686,54 @@ def _collect_sam31_masks(
                 )
             )
 
-            track_frame_target = len(track_boxes or {}) or frame_count
-            anchor_refine_threshold = max(12, int(track_frame_target * 0.65))
             needs_anchor_refinement = len(masks_by_frame) < anchor_refine_threshold
             diagnostics["anchor_refinement_threshold"] = anchor_refine_threshold
-            diagnostics["anchor_refinement_triggered"] = needs_anchor_refinement
+            diagnostics["anchor_refinement_triggered"] = bool(
+                track_boxes and needs_anchor_refinement
+            )
             if track_boxes:
                 anchor_frames = (
-                    _track_prompt_anchors(
-                        prompt_frame=seed_frame,
-                        frame_count=frame_count,
-                        track_boxes=track_boxes,
+                    (
+                        preseed_anchor_frames
+                        if preseed_track_anchors
+                        else _track_prompt_anchors(
+                            prompt_frame=seed_frame,
+                            frame_count=frame_count,
+                            track_boxes=track_boxes,
+                        )
                     )
                     if needs_anchor_refinement
                     else []
                 )
                 diagnostics["anchor_refinement_frames"] = anchor_frames
-                for anchor_frame in anchor_frames:
-                    if anchor_frame == seed_frame:
-                        continue
-                    points = _support_points_from_box(track_boxes[anchor_frame])
-                    labels = np.ones(len(points), dtype=np.int32)
-                    anchor_response = predictor.handle_request(
-                        request={
-                            "type": "add_prompt",
-                            "session_id": session_id,
-                            "frame_index": anchor_frame,
-                            "obj_id": active_obj_id,
-                            **_point_prompt_tensors(
-                                points=points,
-                                labels=labels,
-                                width=width,
-                                height=height,
-                            ),
-                        }
-                    )
-                    anchor_mask = _mask_from_outputs(
-                        anchor_response.get("outputs", {}),
-                        obj_id=active_obj_id,
-                    )
-                    if anchor_mask is not None:
-                        masks_by_frame[anchor_frame] = anchor_mask
+                if needs_anchor_refinement and not preseed_track_anchors:
+                    for anchor_frame in anchor_frames:
+                        if anchor_frame == seed_frame:
+                            continue
+                        points = _support_points_from_box(track_boxes[anchor_frame])
+                        labels = np.ones(len(points), dtype=np.int32)
+                        anchor_response = predictor.handle_request(
+                            request={
+                                "type": "add_prompt",
+                                "session_id": session_id,
+                                "frame_index": anchor_frame,
+                                "obj_id": active_obj_id,
+                                **_point_prompt_tensors(
+                                    points=points,
+                                    labels=labels,
+                                    width=width,
+                                    height=height,
+                                ),
+                            }
+                        )
+                        anchor_mask = _mask_from_outputs(
+                            anchor_response.get("outputs") or {},
+                            obj_id=active_obj_id,
+                        )
+                        if anchor_mask is not None:
+                            masks_by_frame[anchor_frame] = anchor_mask
 
-                if anchor_frames:
+                if needs_anchor_refinement and anchor_frames:
                     diagnostics["propagation"].extend(
                         _propagate_from_seed_frame(
                             predictor=predictor,
@@ -561,7 +741,7 @@ def _collect_sam31_masks(
                             active_obj_id=active_obj_id,
                             seed_frame=seed_frame,
                             masks_by_frame=masks_by_frame,
-                            label="anchor_refinement",
+                            label="sparse_safety_retry",
                             directions=("forward",) if seed_frame == 0 else ("forward", "backward"),
                             progress_callback=progress_callback,
                         )
@@ -903,33 +1083,47 @@ def run_sam31_gpu_mask(
     resolved_checkpoint = resolved_checkpoint.strip() if resolved_checkpoint else None
 
     emit_progress("loading_model", total_frames=len(frame_paths))
-    predictor = build_sam3_multiplex_video_predictor(
-        checkpoint_path=resolved_checkpoint,
-        use_fa3=_env_bool("WHODOIRUNLIKE_SAM31_GPU_USE_FA3", default=False),
-        compile=_env_bool("WHODOIRUNLIKE_SAM31_GPU_COMPILE", default=False),
-        warm_up=_env_bool("WHODOIRUNLIKE_SAM31_GPU_WARM_UP", default=False),
-        default_output_prob_thresh=float(os.getenv("WHODOIRUNLIKE_SAM31_GPU_THRESHOLD", "0.5")),
-    )
-    _patch_multiplex_init_state_kwargs(predictor)
-    tracker_config = _configure_interactive_tracker_for_user_prompt(predictor)
-    emit_progress("running_sam31", total_frames=len(frame_paths))
-    masks_by_frame, sam_prompt_diagnostics = _collect_sam31_masks(
-        predictor=predictor,
-        video_path=source_segment,
-        prompt=prompt,
-        width=video_meta["width"],
-        height=video_meta["height"],
-        frame_count=len(frame_paths),
-        obj_id=obj_id,
-        track_boxes=track_boxes,
-        progress_callback=lambda frame_index, processed_frames, direction: emit_progress(
-            "running_sam31",
-            processed_frames,
-            total_frames=len(frame_paths),
-            frame_index=frame_index,
-            direction=direction,
+    predictor_build_kwargs = {
+        "checkpoint_path": resolved_checkpoint,
+        "use_fa3": _env_bool("WHODOIRUNLIKE_SAM31_GPU_USE_FA3", default=False),
+        "compile": _env_bool("WHODOIRUNLIKE_SAM31_GPU_COMPILE", default=False),
+        "warm_up": _env_bool("WHODOIRUNLIKE_SAM31_GPU_WARM_UP", default=False),
+        "default_output_prob_thresh": float(
+            os.getenv("WHODOIRUNLIKE_SAM31_GPU_THRESHOLD", "0.5")
         ),
+    }
+    cache_enabled = _env_bool("WHODOIRUNLIKE_SAM31_GPU_CACHE_PREDICTOR", default=True)
+    preseed_track_anchors = _env_bool(
+        "WHODOIRUNLIKE_SAM31_GPU_PRESEED_ANCHORS",
+        default=True,
     )
+    with _borrow_sam31_gpu_predictor(
+        builder=build_sam3_multiplex_video_predictor,
+        build_kwargs=predictor_build_kwargs,
+        cache_enabled=cache_enabled,
+    ) as (predictor, predictor_cache):
+        tracker_config = _configure_interactive_tracker_for_user_prompt(predictor)
+        emit_progress("running_sam31", total_frames=len(frame_paths))
+        with _sam31_gpu_session_autocast():
+            masks_by_frame, sam_prompt_diagnostics = _collect_sam31_masks(
+                predictor=predictor,
+                video_path=source_segment,
+                prompt=prompt,
+                width=video_meta["width"],
+                height=video_meta["height"],
+                frame_count=len(frame_paths),
+                obj_id=obj_id,
+                track_boxes=track_boxes,
+                progress_callback=lambda frame_index, processed_frames, direction: emit_progress(
+                    "running_sam31",
+                    processed_frames,
+                    total_frames=len(frame_paths),
+                    frame_index=frame_index,
+                    direction=direction,
+                ),
+                preseed_track_anchors=preseed_track_anchors,
+            )
+    prompt_summary["sam31_predictor_cache"] = predictor_cache
     prompt_summary["sam31"] = sam_prompt_diagnostics
     prompt_summary["sam31_tracker_config"] = tracker_config
     emit_progress("postprocessing", len(masks_by_frame), total_frames=len(frame_paths))
@@ -1016,6 +1210,9 @@ def run_sam31_gpu_mask(
         "prompt_frame": prompt_frame,
         "box_source": prompt["box_source"],
         "detected_frames": len(masks_by_frame),
+        "cache_hit": bool(predictor_cache["hit"]),
+        "model_build_seconds": float(predictor_cache["model_build_seconds"]),
+        "predictor_lock_wait_seconds": float(predictor_cache["lock_wait_seconds"]),
         "prompting": prompt_summary,
         "fallback": fallback,
         "elapsed_seconds": round(elapsed_seconds, 3),

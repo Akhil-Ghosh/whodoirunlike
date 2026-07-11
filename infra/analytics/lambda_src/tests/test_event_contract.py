@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import sys
 import unittest
 from pathlib import Path
@@ -38,6 +37,7 @@ def event_payload(**overrides: object) -> dict[str, object]:
             "service": "whodoirunlike-processor",
             "environment": "production",
             "execution_environment": "runpod",
+            "runpod_endpoint_id": "endpoint-old",
             "attempt_number": 2,
             "backend": "sam31_gpu",
             "gpu_type": "A40",
@@ -53,6 +53,9 @@ def event_payload(**overrides: object) -> dict[str, object]:
             "bytes": 4096,
             "milliseconds_per_frame": 50.8,
             "timing_basis": "runpod_delay_time",
+            "cache_hit": True,
+            "model_build_seconds": 0.0,
+            "predictor_lock_wait_seconds": 0.004,
         },
     }
     payload.update(overrides)
@@ -69,12 +72,16 @@ class EventContractTests(unittest.TestCase):
         self.assertEqual(flat["duration_bucket"], "5_10s")
         self.assertEqual(flat["resolution_bucket"], "hd")
         self.assertEqual(flat["attempt_number"], 2)
+        self.assertEqual(flat["runpod_endpoint_id"], "endpoint-old")
         self.assertEqual(flat["rss_mb"], 384.0)
         self.assertEqual(flat["peak_rss_mb"], 512.0)
         self.assertEqual(flat["artifact_type"], "fused_overlay")
         self.assertEqual(flat["artifact_size_bytes"], 4096)
         self.assertEqual(flat["milliseconds_per_frame"], 50.8)
         self.assertEqual(flat["timing_basis"], "runpod_delay_time")
+        self.assertIs(flat["cache_hit"], True)
+        self.assertEqual(flat["model_build_seconds"], 0.0)
+        self.assertEqual(flat["predictor_lock_wait_seconds"], 0.004)
         self.assertEqual(event_partition(event["event_time"]), ("2026-07-09", "21"))
 
     def test_rejects_unknown_field(self) -> None:

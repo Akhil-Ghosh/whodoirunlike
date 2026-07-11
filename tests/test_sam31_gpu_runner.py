@@ -7,7 +7,9 @@ import types
 
 import numpy as np
 
+import whodoirunlike.sam31_gpu_runner as sam31_gpu_runner
 from whodoirunlike.sam31_gpu_runner import (
+    _borrow_sam31_gpu_predictor,
     _build_track_box_fallback_masks,
     _collect_sam31_masks,
     _configure_interactive_tracker_for_user_prompt,
@@ -17,11 +19,147 @@ from whodoirunlike.sam31_gpu_runner import (
     _mask_from_outputs,
     _patch_multiplex_init_state_kwargs,
     _prompt_points_with_box_support,
+    _sam31_gpu_session_autocast,
     _seed_points_for_frame,
     _support_points_from_box,
     _track_prompt_anchors,
     update_manifest_after_sam31_gpu,
 )
+
+
+def _clear_predictor_cache() -> None:
+    sam31_gpu_runner._SAM31_GPU_CACHED_PREDICTOR = None
+    sam31_gpu_runner._SAM31_GPU_CACHED_CONFIG = None
+
+
+def test_predictor_cache_builds_once_for_same_config_and_rebuilds_for_change() -> None:
+    class ExitRecorder:
+        def __init__(self) -> None:
+            self.exits = 0
+
+        def __exit__(self, *_args: object) -> None:
+            self.exits += 1
+
+    class Predictor:
+        def __init__(self) -> None:
+            self.bf16_context = ExitRecorder()
+            self.model = types.SimpleNamespace(
+                tracker=types.SimpleNamespace(bf16_context=ExitRecorder())
+            )
+
+    built: list[Predictor] = []
+
+    def builder(**_kwargs: object) -> Predictor:
+        predictor = Predictor()
+        built.append(predictor)
+        return predictor
+
+    _clear_predictor_cache()
+    try:
+        with _borrow_sam31_gpu_predictor(
+            builder=builder,
+            build_kwargs={"checkpoint_path": None, "use_fa3": False},
+            cache_enabled=True,
+        ) as (first, first_metadata):
+            assert first_metadata["hit"] is False
+            assert first_metadata["autocast_contexts_unwound"] == 2
+
+        with _borrow_sam31_gpu_predictor(
+            builder=builder,
+            build_kwargs={"checkpoint_path": None, "use_fa3": False},
+            cache_enabled=True,
+        ) as (second, second_metadata):
+            assert second_metadata["hit"] is True
+
+        with _borrow_sam31_gpu_predictor(
+            builder=builder,
+            build_kwargs={"checkpoint_path": "alternate.pt", "use_fa3": False},
+            cache_enabled=True,
+        ) as (third, third_metadata):
+            assert third_metadata["hit"] is False
+
+        assert first is second
+        assert third is not first
+        assert len(built) == 2
+        assert built[0].bf16_context.exits == 1
+        assert built[0].model.tracker.bf16_context.exits == 1
+        assert built[1].bf16_context.exits == 1
+        assert built[1].model.tracker.bf16_context.exits == 1
+    finally:
+        _clear_predictor_cache()
+
+
+def test_sam31_session_autocast_is_entered_per_use(monkeypatch) -> None:
+    events: list[str] = []
+
+    class FakeAutocast:
+        def __enter__(self) -> None:
+            events.append("enter")
+
+        def __exit__(self, *_args: object) -> None:
+            events.append("exit")
+
+    fake_torch = types.SimpleNamespace(
+        bfloat16="bfloat16",
+        autocast=lambda **_kwargs: FakeAutocast(),
+    )
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+
+    with _sam31_gpu_session_autocast():
+        events.append("session-1")
+    with _sam31_gpu_session_autocast():
+        events.append("session-2")
+
+    assert events == ["enter", "session-1", "exit", "enter", "session-2", "exit"]
+
+
+def test_predictor_cache_is_invalidated_after_session_error(monkeypatch) -> None:
+    class Predictor:
+        _whodoirunlike_autocast_unwound = True
+        model = types.SimpleNamespace()
+
+        def __init__(self) -> None:
+            self._all_inference_states = {"partial-session": {"state": object()}}
+
+    built: list[Predictor] = []
+    reclaimed: list[bool] = []
+    monkeypatch.setattr(
+        sam31_gpu_runner,
+        "_reclaim_sam31_gpu_memory",
+        lambda: reclaimed.append(True),
+    )
+
+    def builder(**_kwargs: object) -> Predictor:
+        predictor = Predictor()
+        built.append(predictor)
+        return predictor
+
+    _clear_predictor_cache()
+    try:
+        try:
+            with _borrow_sam31_gpu_predictor(
+                builder=builder,
+                build_kwargs={"checkpoint_path": None},
+                cache_enabled=True,
+            ) as (_predictor, metadata):
+                raise RuntimeError("session failed")
+        except RuntimeError as exc:
+            assert str(exc) == "session failed"
+        else:
+            raise AssertionError("expected session failure")
+
+        assert metadata["invalidated_after_error"] is True
+        assert built[0]._all_inference_states == {}
+        assert reclaimed == [True]
+        with _borrow_sam31_gpu_predictor(
+            builder=builder,
+            build_kwargs={"checkpoint_path": None},
+            cache_enabled=True,
+        ) as (_predictor, retry_metadata):
+            assert retry_metadata["hit"] is False
+        assert len(built) == 2
+    finally:
+        _clear_predictor_cache()
 
 
 def test_mask_from_outputs_selects_requested_object() -> None:
@@ -427,3 +565,241 @@ def test_collect_sam31_masks_seeds_from_first_target_track_frame(
     assert np.asarray(point_prompt["points"]).tolist() == expected_points.tolist()
     assert predictor.stream_requests[0]["start_frame_index"] == 0
     assert predictor.stream_requests[0]["propagation_direction"] == "forward"
+
+
+def test_collect_sam31_masks_preseeds_anchors_before_one_full_pass(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    class FakeInferenceMode:
+        def __enter__(self) -> None:
+            return None
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+    fake_torch = types.SimpleNamespace(
+        float32="float32",
+        int32="int32",
+        tensor=lambda data, **_kwargs: np.asarray(data),
+        inference_mode=lambda: FakeInferenceMode(),
+    )
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+
+    class FakePredictor:
+        def __init__(self) -> None:
+            self.events: list[tuple[str, int | None]] = []
+
+        def handle_request(self, *, request: dict[str, object]) -> dict[str, object]:
+            request_type = str(request["type"])
+            if request_type == "start_session":
+                self.events.append((request_type, None))
+                return {"session_id": "session-1"}
+            if request_type == "close_session":
+                self.events.append((request_type, None))
+                return {}
+            if request_type == "add_prompt":
+                frame_index = int(request["frame_index"])
+                self.events.append((request_type, frame_index))
+                return {
+                    "outputs": {
+                        "out_obj_ids": np.array([1]),
+                        "out_binary_masks": np.array([[[1, 0], [0, 0]]], dtype=np.uint8),
+                    }
+                }
+            raise AssertionError(f"unexpected request: {request_type}")
+
+        def handle_stream_request(self, *, request: dict[str, object]) -> list[dict[str, object]]:
+            self.events.append(("propagate_in_video", int(request["start_frame_index"])))
+            return [
+                {
+                    "frame_index": frame_index,
+                    "outputs": {
+                        "out_obj_ids": np.array([1]),
+                        "out_binary_masks": np.array([[[1, 1], [0, 0]]], dtype=np.uint8),
+                    },
+                }
+                for frame_index in range(6)
+            ]
+
+    predictor = FakePredictor()
+    boxes = {
+        frame_index: np.array([0, 0, 2, 2], dtype=np.float32) for frame_index in range(6)
+    }
+    masks, diagnostics = _collect_sam31_masks(
+        predictor=predictor,
+        video_path=tmp_path / "clip.mp4",
+        prompt={
+            "frame_index": 0,
+            "box": np.array([0, 0, 2, 2], dtype=np.float32),
+            "points": np.array([[1, 1]], dtype=np.float32),
+            "labels": np.array([1], dtype=np.int32),
+        },
+        width=2,
+        height=2,
+        frame_count=6,
+        obj_id=1,
+        track_boxes=boxes,
+    )
+
+    propagation_positions = [
+        index for index, event in enumerate(predictor.events) if event[0] == "propagate_in_video"
+    ]
+    anchor_positions = [
+        index
+        for index, event in enumerate(predictor.events)
+        if event[0] == "add_prompt" and event[1] in {1, 2, 3, 4, 5}
+    ]
+    assert len(propagation_positions) == 1
+    assert anchor_positions
+    assert max(anchor_positions) < propagation_positions[0]
+    assert diagnostics["preseed_anchor_frames"] == [0, 1, 2, 3, 4, 5]
+    assert diagnostics["anchor_refinement_triggered"] is False
+    assert [item["pass"] for item in diagnostics["propagation"]] == ["primary_prompt"]
+    assert sorted(masks) == list(range(6))
+
+
+def test_collect_sam31_masks_retries_once_when_first_pass_is_sparse(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    class FakeInferenceMode:
+        def __enter__(self) -> None:
+            return None
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+    fake_torch = types.SimpleNamespace(
+        float32="float32",
+        int32="int32",
+        tensor=lambda data, **_kwargs: np.asarray(data),
+        inference_mode=lambda: FakeInferenceMode(),
+    )
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+
+    class FakePredictor:
+        def __init__(self) -> None:
+            self.stream_requests = 0
+
+        def handle_request(self, *, request: dict[str, object]) -> dict[str, object]:
+            if request["type"] == "start_session":
+                return {"session_id": "session-1"}
+            if request["type"] == "close_session":
+                return {}
+            if request["type"] == "add_prompt":
+                return {"outputs": {}}
+            raise AssertionError(f"unexpected request: {request['type']}")
+
+        def handle_stream_request(self, *, request: dict[str, object]) -> list[dict[str, object]]:
+            self.stream_requests += 1
+            if self.stream_requests == 2:
+                return [
+                    {
+                        "frame_index": frame_index,
+                        "outputs": {
+                            "out_obj_ids": np.array([1]),
+                            "out_binary_masks": np.array(
+                                [[[1, 0], [0, 0]]],
+                                dtype=np.uint8,
+                            ),
+                        },
+                    }
+                    for frame_index in range(20)
+                ]
+            return [
+                {
+                    "frame_index": 0,
+                    "outputs": {
+                        "out_obj_ids": np.array([1]),
+                        "out_binary_masks": np.array([[[1, 0], [0, 0]]], dtype=np.uint8),
+                    },
+                }
+            ]
+
+    predictor = FakePredictor()
+    masks, diagnostics = _collect_sam31_masks(
+        predictor=predictor,
+        video_path=tmp_path / "clip.mp4",
+        prompt={
+            "frame_index": 0,
+            "box": np.array([0, 0, 2, 2], dtype=np.float32),
+            "points": np.array([[1, 1]], dtype=np.float32),
+            "labels": np.array([1], dtype=np.int32),
+        },
+        width=2,
+        height=2,
+        frame_count=20,
+        obj_id=1,
+        track_boxes={
+            frame_index: np.array([0, 0, 2, 2], dtype=np.float32)
+            for frame_index in range(20)
+        },
+    )
+
+    assert predictor.stream_requests == 2
+    assert sorted(masks) == list(range(20))
+    assert diagnostics["anchor_refinement_triggered"] is True
+    assert [item["pass"] for item in diagnostics["propagation"]] == [
+        "primary_prompt",
+        "sparse_safety_retry",
+    ]
+
+
+def test_collect_sam31_masks_closes_session_when_propagation_fails(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    class FakeInferenceMode:
+        def __enter__(self) -> None:
+            return None
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+    fake_torch = types.SimpleNamespace(
+        float32="float32",
+        int32="int32",
+        tensor=lambda data, **_kwargs: np.asarray(data),
+        inference_mode=lambda: FakeInferenceMode(),
+    )
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+
+    class FakePredictor:
+        closed = False
+
+        def handle_request(self, *, request: dict[str, object]) -> dict[str, object]:
+            if request["type"] == "start_session":
+                return {"session_id": "session-1"}
+            if request["type"] == "close_session":
+                self.closed = True
+                return {}
+            if request["type"] == "add_prompt":
+                return {"outputs": {}}
+            raise AssertionError(f"unexpected request: {request['type']}")
+
+        def handle_stream_request(self, *, request: dict[str, object]) -> list[dict[str, object]]:
+            raise ValueError("inference failed")
+
+    predictor = FakePredictor()
+    try:
+        _collect_sam31_masks(
+            predictor=predictor,
+            video_path=tmp_path / "clip.mp4",
+            prompt={
+                "frame_index": 0,
+                "box": np.array([0, 0, 2, 2], dtype=np.float32),
+                "points": np.array([[1, 1]], dtype=np.float32),
+                "labels": np.array([1], dtype=np.int32),
+            },
+            width=2,
+            height=2,
+            frame_count=1,
+            obj_id=1,
+        )
+    except ValueError as exc:
+        assert str(exc) == "inference failed"
+    else:
+        raise AssertionError("expected propagation failure")
+
+    assert predictor.closed is True

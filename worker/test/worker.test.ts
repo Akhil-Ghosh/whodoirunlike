@@ -245,6 +245,251 @@ describe("telemetry ordering and recovery", () => {
     statusFetch.mockRestore();
   });
 
+  it("uses the endpoint that accepted the attempt after configuration changes and keeps it private", async () => {
+    const job = await uploadClip();
+    const originalEndpointId = "endpoint-old-123";
+    const replacementEndpointId = "endpoint-new-456";
+    const runpodJobId = "runpod-provenance-job";
+    const runpodFetch = vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      const url = input instanceof Request ? input.url : String(input);
+      if (url === `https://api.runpod.ai/v2/${originalEndpointId}/run`) {
+        return Response.json({ id: runpodJobId, status: "IN_QUEUE" });
+      }
+      if (url === `https://api.runpod.ai/v2/${originalEndpointId}/status/${runpodJobId}`) {
+        return Response.json({ delayTime: 1250, status: "COMPLETED" });
+      }
+      return new Response("Unexpected RunPod endpoint", { status: 500 });
+    });
+
+    const startCtx = createExecutionContext();
+    const started = await worker.fetch(
+      asIncomingRequest(new Request(`https://example.test/v1/jobs/${job.run_id}/start`, {
+        method: "POST",
+      })),
+      withRunPodEndpoint(originalEndpointId),
+      startCtx,
+    );
+    await waitOnExecutionContext(startCtx);
+    expect(started.status).toBe(202);
+
+    const stored = await env.CLIPS.get(`jobs/${job.run_id}.json`);
+    expect(stored).not.toBeNull();
+    const internalJob = await stored!.json<{
+      runpod_endpoint_id?: string;
+      processing_attempts?: Array<{ attempt_id: string; runpod_endpoint_id?: string }>;
+    }>();
+    expect(internalJob.runpod_endpoint_id).toBe(originalEndpointId);
+    expect(
+      internalJob.processing_attempts?.find((attempt) => attempt.attempt_id === job.attempt_id)
+        ?.runpod_endpoint_id,
+    ).toBe(originalEndpointId);
+
+    const terminal = telemetryEvent(job, 100, "attempt_completed");
+    const terminalCtx = createExecutionContext();
+    const terminalResponse = await worker.fetch(
+      asIncomingRequest(new Request(`https://example.test/v1/jobs/${job.run_id}/events`, {
+        method: "POST",
+        headers: processorHeaders({ "Content-Type": "application/json" }),
+        body: JSON.stringify(terminal),
+      })),
+      withRunPodEndpoint(replacementEndpointId),
+      terminalCtx,
+    );
+    await waitOnExecutionContext(terminalCtx);
+    expect(terminalResponse.status).toBe(202);
+    expect(runpodFetch).toHaveBeenCalledWith(
+      `https://api.runpod.ai/v2/${originalEndpointId}/status/${runpodJobId}`,
+      expect.any(Object),
+    );
+    expect(
+      runpodFetch.mock.calls.some(([input]) => String(input).includes(replacementEndpointId)),
+    ).toBe(false);
+
+    const completions = await waitForStoredSequence(job, 7);
+    expect(completions).toHaveLength(1);
+    expect(completions[0]).toMatchObject({
+      runtime: { runpod_endpoint_id: originalEndpointId },
+      measurements: { runpod_endpoint_id: originalEndpointId },
+    });
+
+    const publicCtx = createExecutionContext();
+    const publicResponse = await worker.fetch(
+      asIncomingRequest(new Request(`https://example.test/v1/jobs/${job.run_id}`)),
+      withRunPodEndpoint(replacementEndpointId),
+      publicCtx,
+    );
+    await waitOnExecutionContext(publicCtx);
+    const publicJob = await publicResponse.json<Record<string, unknown>>();
+    expect(JSON.stringify(publicJob)).not.toContain("runpod_endpoint_id");
+    expect(JSON.stringify(publicJob)).not.toContain(originalEndpointId);
+  });
+
+  it("keeps endpoint provenance isolated across a failed attempt and retry", async () => {
+    const firstJob = await uploadClip();
+    const firstEndpointId = "endpoint-first-123";
+    const secondEndpointId = "endpoint-second-456";
+    const firstRunPodJobId = "runpod-first-attempt";
+    const secondRunPodJobId = "runpod-second-attempt";
+    const requestedRunPodUrls: string[] = [];
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      const url = input instanceof Request ? input.url : String(input);
+      requestedRunPodUrls.push(url);
+      if (url === `https://api.runpod.ai/v2/${firstEndpointId}/run`) {
+        return Response.json({ id: firstRunPodJobId, status: "IN_QUEUE" });
+      }
+      if (
+        url ===
+          `https://api.runpod.ai/v2/${firstEndpointId}/status/${firstRunPodJobId}`
+      ) {
+        return Response.json({ delayTime: 1100, status: "FAILED" });
+      }
+      if (url === `https://api.runpod.ai/v2/${secondEndpointId}/run`) {
+        return Response.json({ id: secondRunPodJobId, status: "IN_QUEUE" });
+      }
+      if (
+        url ===
+          `https://api.runpod.ai/v2/${secondEndpointId}/status/${secondRunPodJobId}`
+      ) {
+        return Response.json({ delayTime: 2200, status: "COMPLETED" });
+      }
+      throw new Error(`Unexpected RunPod request: ${url}`);
+    });
+
+    const firstStartCtx = createExecutionContext();
+    const firstStart = await worker.fetch(
+      asIncomingRequest(new Request(`https://example.test/v1/jobs/${firstJob.run_id}/start`, {
+        method: "POST",
+      })),
+      withRunPodEndpoint(firstEndpointId),
+      firstStartCtx,
+    );
+    await waitOnExecutionContext(firstStartCtx);
+    expect(firstStart.status).toBe(202);
+
+    const firstFailure = telemetryEvent(firstJob, 100, "attempt_failed");
+    firstFailure.status = "failed";
+    firstFailure.error = {
+      class: "FirstAttemptFailure",
+      code: "test.first_attempt_failed",
+      category: "test",
+      message: "First attempt failed for retry coverage.",
+      retryable: true,
+    };
+    const firstTerminalCtx = createExecutionContext();
+    const firstTerminal = await worker.fetch(
+      asIncomingRequest(new Request(`https://example.test/v1/jobs/${firstJob.run_id}/events`, {
+        method: "POST",
+        headers: processorHeaders({ "Content-Type": "application/json" }),
+        body: JSON.stringify(firstFailure),
+      })),
+      withRunPodEndpoint(secondEndpointId),
+      firstTerminalCtx,
+    );
+    await waitOnExecutionContext(firstTerminalCtx);
+    expect(firstTerminal.status).toBe(202);
+    expect(await waitForStoredSequence(firstJob, 7)).toEqual([
+      expect.objectContaining({
+        runtime: expect.objectContaining({ runpod_endpoint_id: firstEndpointId }),
+        measurements: expect.objectContaining({ runpod_endpoint_id: firstEndpointId }),
+      }),
+    ]);
+
+    const retryCtx = createExecutionContext();
+    const retryResponse = await worker.fetch(
+      asIncomingRequest(new Request(`https://example.test/v1/jobs/${firstJob.run_id}/start`, {
+        method: "POST",
+      })),
+      withRunPodEndpoint(secondEndpointId),
+      retryCtx,
+    );
+    await waitOnExecutionContext(retryCtx);
+    expect(retryResponse.status).toBe(202);
+    const secondJob = await retryResponse.json<UploadedJob>();
+    expect(secondJob.attempt_id).not.toBe(firstJob.attempt_id);
+    expect(secondJob.attempt_number).toBe(2);
+
+    const staleReportCtx = createExecutionContext();
+    const staleReport = await worker.fetch(
+      asIncomingRequest(new Request(`https://example.test/v1/jobs/${firstJob.run_id}/report`, {
+        method: "POST",
+        headers: processorHeaders({ "Content-Type": "application/json" }),
+        body: JSON.stringify({ attempt_id: firstJob.attempt_id, status: "complete" }),
+      })),
+      withRunPodEndpoint(firstEndpointId),
+      staleReportCtx,
+    );
+    await waitOnExecutionContext(staleReportCtx);
+    expect(staleReport.status).toBe(409);
+
+    const staleTerminal = telemetryEvent(firstJob, 101, "attempt_completed");
+    const staleTerminalCtx = createExecutionContext();
+    const staleTerminalResponse = await worker.fetch(
+      asIncomingRequest(new Request(`https://example.test/v1/jobs/${firstJob.run_id}/events`, {
+        method: "POST",
+        headers: processorHeaders({ "Content-Type": "application/json" }),
+        body: JSON.stringify(staleTerminal),
+      })),
+      withRunPodEndpoint(firstEndpointId),
+      staleTerminalCtx,
+    );
+    await waitOnExecutionContext(staleTerminalCtx);
+    expect(staleTerminalResponse.status).toBe(202);
+
+    const afterStale = await readInternalJob(firstJob.run_id);
+    expect(afterStale).toMatchObject({
+      status: "queued",
+      attempt_id: secondJob.attempt_id,
+      runpod_endpoint_id: secondEndpointId,
+      runpod_job_id: secondRunPodJobId,
+    });
+
+    const secondCompletion = telemetryEvent(secondJob, 100, "attempt_completed");
+    const secondTerminalCtx = createExecutionContext();
+    const secondTerminal = await worker.fetch(
+      asIncomingRequest(new Request(`https://example.test/v1/jobs/${secondJob.run_id}/events`, {
+        method: "POST",
+        headers: processorHeaders({ "Content-Type": "application/json" }),
+        body: JSON.stringify(secondCompletion),
+      })),
+      withRunPodEndpoint(firstEndpointId),
+      secondTerminalCtx,
+    );
+    await waitOnExecutionContext(secondTerminalCtx);
+    expect(secondTerminal.status).toBe(202);
+    expect(await waitForStoredSequence(secondJob, 7)).toEqual([
+      expect.objectContaining({
+        runtime: expect.objectContaining({ runpod_endpoint_id: secondEndpointId }),
+        measurements: expect.objectContaining({ runpod_endpoint_id: secondEndpointId }),
+      }),
+    ]);
+
+    const finalJob = await readInternalJob(firstJob.run_id);
+    expect(finalJob).toMatchObject({
+      status: "complete",
+      attempt_id: secondJob.attempt_id,
+      runpod_endpoint_id: secondEndpointId,
+      runpod_job_id: secondRunPodJobId,
+    });
+    expect(finalJob.processing_attempts).toEqual([
+      expect.objectContaining({
+        attempt_id: firstJob.attempt_id,
+        runpod_endpoint_id: firstEndpointId,
+        runpod_job_id: firstRunPodJobId,
+      }),
+      expect.objectContaining({
+        attempt_id: secondJob.attempt_id,
+        runpod_endpoint_id: secondEndpointId,
+        runpod_job_id: secondRunPodJobId,
+      }),
+    ]);
+    expect(requestedRunPodUrls).toEqual([
+      `https://api.runpod.ai/v2/${firstEndpointId}/run`,
+      `https://api.runpod.ai/v2/${firstEndpointId}/status/${firstRunPodJobId}`,
+      `https://api.runpod.ai/v2/${secondEndpointId}/run`,
+      `https://api.runpod.ai/v2/${secondEndpointId}/status/${secondRunPodJobId}`,
+    ]);
+  });
+
   it("uses sequence-prefixed keys and paginates a globally ordered timeline", async () => {
     const job = await uploadClip();
     await postEvent(job.run_id, telemetryEvent(job, 100, "stage_started", "source_download"));
@@ -395,6 +640,29 @@ function processorHeaders(extra: Record<string, string> = {}): Headers {
     Authorization: `Bearer ${PROCESSOR_SECRET}`,
     ...extra,
   });
+}
+
+function withRunPodEndpoint(endpointId: string): Env {
+  return {
+    CLIPS: env.CLIPS,
+    ENVIRONMENT: env.ENVIRONMENT,
+    PUBLIC_API_BASE_URL: env.PUBLIC_API_BASE_URL,
+    PUBLIC_ORIGINS: env.PUBLIC_ORIGINS,
+    MAX_UPLOAD_BYTES: env.MAX_UPLOAD_BYTES,
+    PROCESSOR_URL: env.PROCESSOR_URL,
+    RUNPOD_RUNSYNC: env.RUNPOD_RUNSYNC,
+    PROCESSOR_SHARED_SECRET: env.PROCESSOR_SHARED_SECRET,
+    RUNPOD_API_KEY: env.RUNPOD_API_KEY,
+    RUNPOD_ENDPOINT_ID: endpointId,
+    AWS_ANALYTICS_INGEST_URL: env.AWS_ANALYTICS_INGEST_URL,
+    AWS_ANALYTICS_SHARED_SECRET: env.AWS_ANALYTICS_SHARED_SECRET,
+  };
+}
+
+async function readInternalJob(runId: string): Promise<Record<string, unknown>> {
+  const stored = await env.CLIPS.get(`jobs/${runId}.json`);
+  expect(stored).not.toBeNull();
+  return stored!.json<Record<string, unknown>>();
 }
 
 async function seedOperationalJob(

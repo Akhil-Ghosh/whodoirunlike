@@ -233,13 +233,27 @@ def flatten_event(event: dict[str, Any], *, ingested_at: str) -> dict[str, Any]:
         "environment": _value(runtime, "environment"),
         "service": _value(runtime, "service"),
         "execution_environment": _value(runtime, "execution_environment"),
+        "runpod_endpoint_id": (
+            _value(runtime, "runpod_endpoint_id")
+            if _value(runtime, "runpod_endpoint_id") is not None
+            else _value(measurements, "runpod_endpoint_id")
+        ),
         "attempt_number": _value(runtime, "attempt_number"),
         "processor_version": _value(runtime, "processor_version"),
         "backend": _value(runtime, "backend"),
         "model": _value(runtime, "model"),
         "gpu_type": _value(runtime, "gpu_type"),
         "cold_start": _value(runtime, "cold_start"),
-        "cache_hit": _value(runtime, "cache_hit"),
+        "cache_hit": (
+            _value(runtime, "cache_hit")
+            if _value(runtime, "cache_hit") is not None
+            else _value(measurements, "cache_hit")
+        ),
+        "model_build_seconds": _value(measurements, "model_build_seconds"),
+        "predictor_lock_wait_seconds": _value(
+            measurements,
+            "predictor_lock_wait_seconds",
+        ),
         "rss_mb": _value(resources, "rss_mb"),
         "peak_rss_mb": _megabytes(resources, "peak_rss_mb", "peak_rss_bytes"),
         "cuda_allocated_mb": _megabytes(

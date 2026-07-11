@@ -32,6 +32,40 @@ test("builds the complete private event-lake path", () => {
   output.resourceCountIs("AWS::Events::Rule", 2);
 });
 
+test("retains RunPod endpoint provenance in the validated event schema", () => {
+  const output = template();
+  const tables = Object.values(output.findResources("AWS::Glue::Table"));
+  const processingEvents = tables.find(
+    (resource) => resource.Properties?.TableInput?.Name === "processing_events",
+  );
+  assert.ok(processingEvents, "processing_events Glue table is missing");
+  assert.ok(
+    processingEvents.Properties?.TableInput?.StorageDescriptor?.Columns?.some(
+      (column: { Name?: string; Type?: string }) =>
+        column.Name === "runpod_endpoint_id" && column.Type === "string",
+    ),
+    "processing_events must expose runpod_endpoint_id as a string column",
+  );
+});
+
+test("exposes predictor cache timing as typed analytics columns", () => {
+  const output = template();
+  const tables = Object.values(output.findResources("AWS::Glue::Table"));
+  const processingEvents = tables.find(
+    (resource) => resource.Properties?.TableInput?.Name === "processing_events",
+  );
+  const columns = processingEvents?.Properties?.TableInput?.StorageDescriptor?.Columns ?? [];
+  for (const name of ["model_build_seconds", "predictor_lock_wait_seconds"]) {
+    assert.ok(
+      columns.some(
+        (column: { Name?: string; Type?: string }) =>
+          column.Name === name && column.Type === "double",
+      ),
+      `processing_events must expose ${name} as a double column`,
+    );
+  }
+});
+
 test("keeps processing metadata encrypted, private, and lifecycle bounded", () => {
   const output = template();
   output.hasResourceProperties("AWS::S3::Bucket", {

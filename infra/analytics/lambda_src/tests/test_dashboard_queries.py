@@ -101,6 +101,8 @@ class DashboardQueryContractTests(unittest.TestCase):
         self.assertIn("event_type <> 'progress_sampled'", query.sql)
         self.assertIn("start_offset_seconds", query.sql)
         self.assertNotIn("measurements_json", query.sql)
+        self.assertIn("e.model_build_seconds", query.sql)
+        self.assertIn("e.predictor_lock_wait_seconds", query.sql)
         self.assertNotIn("attributes_json", query.sql)
 
     def test_attempt_list_and_stalls_are_strictly_bounded(self) -> None:

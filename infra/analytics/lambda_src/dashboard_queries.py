@@ -374,6 +374,7 @@ SELECT e.run_id, e.attempt_id, e.sequence, e.event_type, e.stage, e.span, e.stat
        date_diff('millisecond', o.first_event_at, e.event_at) / 1000.0 AS end_offset_seconds,
        e.timing_basis, e.artifact_type, e.artifact_size_bytes, e.processed_frames, e.total_frames,
        e.backend, e.gpu_type, e.processor_version, e.cold_start,
+       e.runpod_endpoint_id, e.cache_hit, e.model_build_seconds, e.predictor_lock_wait_seconds,
        e.error_class, e.error_code
 FROM attempt_events e
 CROSS JOIN origin o

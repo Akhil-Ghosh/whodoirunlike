@@ -10,6 +10,8 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     WHODOIRUNLIKE_POSE_BACKEND=mmpose_rtmpose_l_384 \
     WHODOIRUNLIKE_MASK_BACKEND=sam31_gpu \
     WHODOIRUNLIKE_SAM31_GPU_USE_FA3=false \
+    WHODOIRUNLIKE_SAM31_GPU_CACHE_PREDICTOR=true \
+    WHODOIRUNLIKE_SAM31_GPU_PRESEED_ANCHORS=true \
     WHODOIRUNLIKE_SKIP_DENSEPOSE=false \
     WHODOIRUNLIKE_PROCESSOR_VERSION=${WHODOIRUNLIKE_PROCESSOR_VERSION} \
     DENSEPOSE_CONFIG=/opt/detectron2/projects/DensePose/configs/densepose_rcnn_R_50_FPN_s1x.yaml \
@@ -34,12 +36,20 @@ COPY pyproject.toml README.md ./
 COPY src ./src
 COPY site/public/assets/demos ./site/public/assets/demos
 COPY requirements-runpod-processor.txt ./
+COPY patches/sam3/0001-preserve-refined-mask-on-uncached-frame.patch /tmp/sam3.patch
+
+RUN git init /opt/sam3 \
+    && git -C /opt/sam3 remote add origin https://github.com/facebookresearch/sam3.git \
+    && git -C /opt/sam3 fetch --depth 1 origin 5dd401d1c5c1d5c3eedff06d41b77af824517619 \
+    && git -C /opt/sam3 checkout --detach FETCH_HEAD \
+    && git -C /opt/sam3 apply --check /tmp/sam3.patch \
+    && git -C /opt/sam3 apply /tmp/sam3.patch
 
 RUN python -m pip install --upgrade pip setuptools wheel \
     && python -m pip install --no-cache-dir -r requirements-runpod-processor.txt \
     && python -m pip install --no-cache-dir --no-deps -e . \
     && python -m pip install --no-cache-dir --no-deps \
-        git+https://github.com/facebookresearch/sam3.git \
+        /opt/sam3 \
         "torchvision==0.24.1" \
         "ultralytics>=8.3" \
         "ultralytics-thop>=2.0.18" \

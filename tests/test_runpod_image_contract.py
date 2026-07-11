@@ -67,7 +67,7 @@ def test_runpod_image_runs_rtmlib_with_cuda_onnxruntime() -> None:
 
     assert "MMPOSE_DEVICE=cuda" in dockerfile
     assert "RTMW_RUNTIME_BACKEND=onnxruntime" in dockerfile
-    assert "onnxruntime-gpu==1.27.0" in requirements
+    assert "onnxruntime-gpu==1.26.0" in requirements
     assert "\nonnxruntime>=1.20" not in requirements
     assert "CUDAExecutionProvider" in dockerfile
 

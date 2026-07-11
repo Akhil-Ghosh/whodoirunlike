@@ -35,6 +35,7 @@ jobs:
       - name: Import and call health handler
         run: |
           docker run --rm -i \
+            --network none \
             --entrypoint python \
             -e HF_TOKEN=smoke-test-token \
             -e WHODOIRUNLIKE_PROCESSOR_SHARED_SECRET=smoke-test-secret \
@@ -44,6 +45,7 @@ jobs:
           from importlib.metadata import version
 
           from whodoirunlike.identity_runner import identity_setup_status
+          from whodoirunlike.mmpose_runner import build_rtmlib_model, mmpose_model_spec
           from whodoirunlike.runpod_serverless import handler
 
           payload = handler({"input": {"type": "health"}})
@@ -59,4 +61,11 @@ jobs:
           identity = identity_setup_status(health["identity_backend"])
           print(json.dumps({"identity": identity}, indent=2, sort_keys=True))
           assert identity["ready"] is True, identity
+
+          pose_model = build_rtmlib_model(
+              mmpose_model_spec("mmpose_rtmpose_l_384"),
+              device="cpu",
+              runtime_backend="onnxruntime",
+          )
+          assert pose_model is not None
           PY

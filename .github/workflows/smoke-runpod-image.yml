@@ -41,7 +41,9 @@ jobs:
             "${{ inputs.image }}" \
             - <<'PY'
           import json
+          from importlib.metadata import version
 
+          from whodoirunlike.identity_runner import identity_setup_status
           from whodoirunlike.runpod_serverless import handler
 
           payload = handler({"input": {"type": "health"}})
@@ -52,4 +54,9 @@ jobs:
           assert health["has_processor_secret"] is True
           assert health["has_hf_token"] is True
           assert health["mask_backend"] == "sam31_gpu"
+          assert version("boxmot") == "21.0.0"
+
+          identity = identity_setup_status(health["identity_backend"])
+          print(json.dumps({"identity": identity}, indent=2, sort_keys=True))
+          assert identity["ready"] is True, identity
           PY

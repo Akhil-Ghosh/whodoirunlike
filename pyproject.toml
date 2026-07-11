@@ -40,7 +40,7 @@ identity = [
   "pyarrow>=16",
 ]
 mot = [
-  "boxmot>=17",
+  "boxmot==21.0.0",
   "ultralytics>=8.3",
 ]
 mmpose = [

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import sys
 import threading
+import time
 import urllib.error
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -392,8 +393,167 @@ def test_async_sender_keeps_delivery_off_caller_thread(tmp_path: Path) -> None:
     telemetry.attempt_started()
     assert delivered.wait(timeout=1.0)
     assert telemetry.close(timeout=1.0) is True
-    assert sender_threads == ["processing-telemetry-sender"]
+    assert len(sender_threads) == 1
+    assert sender_threads[0].startswith("processing-telemetry-sender-")
     assert sender_threads[0] != caller_thread
+    assert telemetry._async_sender is not None
+    assert all(not thread.is_alive() for thread in telemetry._async_sender._threads)
+
+
+def test_async_sender_delivers_two_hundred_slow_events_with_bounded_wall_time(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    delivered: list[dict[str, Any]] = []
+    delivery_lock = threading.Lock()
+    active_senders = 0
+    peak_active_senders = 0
+
+    def slow_sender(event: dict[str, Any]) -> None:
+        nonlocal active_senders, peak_active_senders
+        with delivery_lock:
+            active_senders += 1
+            peak_active_senders = max(peak_active_senders, active_senders)
+        time.sleep(0.015)
+        with delivery_lock:
+            delivered.append(event)
+            active_senders -= 1
+
+    monkeypatch.setenv("WHODOIRUNLIKE_TELEMETRY_DELIVERY_WORKERS", "6")
+    local_path = tmp_path / "events.jsonl"
+    telemetry = processing_telemetry.ProcessingTelemetry(
+        run_id="12345678-1234-4234-9234-123456789abc",
+        attempt_id=ATTEMPT_ID,
+        local_path=local_path,
+        event_sender=slow_sender,
+        asynchronous_delivery=True,
+        resource_sampler=lambda: {},
+    )
+
+    started = time.monotonic()
+    for _ in range(199):
+        telemetry.emit(
+            "stage_started",
+            stage="source_download",
+            elapsed_seconds=0.0,
+            status="running",
+        )
+    telemetry.attempt_completed()
+    assert telemetry.close(timeout=3.0) is True
+    elapsed = time.monotonic() - started
+
+    local_events = [json.loads(line) for line in local_path.read_text().splitlines()]
+    assert len(local_events) == 200
+    assert len(delivered) == 200
+    assert sorted(event["sequence"] for event in delivered) == list(range(1, 201))
+    terminal = next(event for event in delivered if event["event_type"] == "attempt_completed")
+    assert terminal["sequence"] == 200
+    assert peak_active_senders >= 4
+    assert elapsed < 1.5
+    assert telemetry.delivery_measurements() == {
+        "telemetry_delivery_pending": 0,
+        "telemetry_delivery_failures": 0,
+        "telemetry_delivery_dropped": 0,
+        "telemetry_local_write_failures": 0,
+    }
+    assert telemetry._async_sender is not None
+    assert len(telemetry._async_sender._threads) == 6
+    assert all(not thread.is_alive() for thread in telemetry._async_sender._threads)
+
+
+def test_async_sender_mixed_concurrent_outcomes_do_not_open_circuit_or_drop_queue(
+    tmp_path: Path,
+) -> None:
+    first_wave_started = threading.Event()
+    release_failures = threading.Event()
+    release_blocked_successes = threading.Event()
+    queued_events_delivered = threading.Event()
+    state_lock = threading.Lock()
+    started_count = 0
+    successful_sequences: set[int] = set()
+
+    def mixed_sender(event: dict[str, Any]) -> None:
+        nonlocal started_count
+        sequence = int(event["sequence"])
+        if sequence <= 6:
+            with state_lock:
+                started_count += 1
+                if started_count == 6:
+                    first_wave_started.set()
+        if sequence <= 3:
+            assert release_failures.wait(timeout=1.0)
+            raise TimeoutError("deterministic concurrent failure")
+        if sequence <= 6:
+            assert release_blocked_successes.wait(timeout=1.0)
+        with state_lock:
+            successful_sequences.add(sequence)
+            if set(range(7, 13)).issubset(successful_sequences):
+                queued_events_delivered.set()
+
+    telemetry = processing_telemetry.ProcessingTelemetry(
+        run_id="12345678-1234-4234-9234-123456789abc",
+        attempt_id=ATTEMPT_ID,
+        local_path=tmp_path / "events.jsonl",
+        event_sender=mixed_sender,
+        asynchronous_delivery=True,
+        delivery_failure_threshold=3,
+        delivery_workers=6,
+        resource_sampler=lambda: {},
+    )
+    for _ in range(6):
+        telemetry.emit(
+            "stage_started",
+            stage="source_download",
+            elapsed_seconds=0.0,
+            status="running",
+        )
+    assert first_wave_started.wait(timeout=1.0)
+    for _ in range(6):
+        telemetry.emit(
+            "stage_started",
+            stage="source_download",
+            elapsed_seconds=0.0,
+            status="running",
+        )
+
+    release_failures.set()
+    try:
+        assert queued_events_delivered.wait(timeout=1.0)
+    finally:
+        release_blocked_successes.set()
+
+    assert telemetry.close(timeout=1.0) is True
+    measurements = telemetry.delivery_measurements()
+    assert measurements["telemetry_delivery_pending"] == 0
+    assert measurements["telemetry_delivery_failures"] == 3
+    assert measurements["telemetry_delivery_dropped"] == 0
+    assert successful_sequences == set(range(4, 13))
+    assert telemetry._async_sender is not None
+    assert telemetry._async_sender._circuit_open is False
+
+
+def test_async_sender_fast_close_with_queue_smaller_than_worker_pool(tmp_path: Path) -> None:
+    delivered = threading.Event()
+    telemetry = processing_telemetry.ProcessingTelemetry(
+        run_id="12345678-1234-4234-9234-123456789abc",
+        attempt_id=ATTEMPT_ID,
+        local_path=tmp_path / "events.jsonl",
+        event_sender=lambda _: delivered.set(),
+        asynchronous_delivery=True,
+        delivery_queue_size=1,
+        delivery_workers=6,
+        resource_sampler=lambda: {},
+    )
+    telemetry.attempt_started()
+    assert delivered.wait(timeout=1.0)
+
+    started = time.monotonic()
+    assert telemetry.close(timeout=1.0) is True
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 0.35
+    assert telemetry._async_sender is not None
+    assert all(not thread.is_alive() for thread in telemetry._async_sender._threads)
 
 
 def test_async_sender_close_drains_slow_terminal_success(tmp_path: Path) -> None:
@@ -449,6 +609,7 @@ def test_async_sender_opens_circuit_and_counts_drops_after_repeated_failures(
         event_sender=broken_sender,
         asynchronous_delivery=True,
         delivery_failure_threshold=2,
+        delivery_workers=1,
         resource_sampler=lambda: {},
     )
     for _ in range(5):

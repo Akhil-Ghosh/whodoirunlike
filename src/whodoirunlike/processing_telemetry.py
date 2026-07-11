@@ -32,6 +32,8 @@ DEFAULT_DELIVERY_TIMEOUT_SECONDS = 10.0
 DEFAULT_DELIVERY_ATTEMPTS = 3
 DEFAULT_DELIVERY_BACKOFF_SECONDS = 0.1
 DEFAULT_DELIVERY_FAILURE_THRESHOLD = 3
+DEFAULT_DELIVERY_WORKERS = 6
+MAX_DELIVERY_WORKERS = 8
 
 EVENT_TYPES = frozenset(
     {
@@ -444,37 +446,50 @@ class _AsyncEventSender:
         *,
         max_queue_size: int = DEFAULT_DELIVERY_QUEUE_SIZE,
         failure_threshold: int = DEFAULT_DELIVERY_FAILURE_THRESHOLD,
+        worker_count: int = DEFAULT_DELIVERY_WORKERS,
     ) -> None:
         self._sender = sender
-        self._queue: queue.Queue[dict[str, Any] | None] = queue.Queue(
+        self._queue: queue.Queue[dict[str, Any]] = queue.Queue(
             maxsize=max(1, int(max_queue_size))
         )
         self._condition = threading.Condition()
         self._pending = 0
         self._closed = False
         self._circuit_open = False
-        self._failure_threshold = max(1, int(failure_threshold))
+        self._worker_count = max(1, min(int(worker_count), MAX_DELIVERY_WORKERS))
+        self._failure_threshold = max(1, int(failure_threshold)) * self._worker_count
         self._consecutive_failures = 0
         self.failures = 0
         self.dropped = 0
-        self._thread = threading.Thread(
-            target=self._run,
-            name="processing-telemetry-sender",
-            daemon=True,
-        )
-        self._thread.start()
+        self._threads = [
+            threading.Thread(
+                target=self._run,
+                name=f"processing-telemetry-sender-{index + 1}",
+                daemon=True,
+            )
+            for index in range(self._worker_count)
+        ]
+        try:
+            for thread in self._threads:
+                thread.start()
+        except RuntimeError:
+            with self._condition:
+                self._closed = True
+                self._condition.notify_all()
+            raise
 
     def submit(self, event: dict[str, Any]) -> None:
         with self._condition:
             if self._closed or self._circuit_open:
                 self.dropped += 1
                 return
+            self._pending += 1
             try:
                 self._queue.put_nowait(event)
             except queue.Full:
+                self._pending -= 1
                 self.dropped += 1
                 return
-            self._pending += 1
 
     def _run(self) -> None:
         while True:
@@ -485,38 +500,49 @@ class _AsyncEventSender:
                     if self._closed and self._pending == 0:
                         return
                 continue
-            if event is None:
+            opened_circuit = False
+            with self._condition:
+                circuit_open = self._circuit_open
+            if circuit_open:
+                with self._condition:
+                    self.dropped += 1
+                    self._pending -= 1
+                    self._condition.notify_all()
                 self._queue.task_done()
                 continue
             try:
                 self._sender(event)
                 with self._condition:
-                    self._consecutive_failures = 0
+                    if not self._circuit_open:
+                        self._consecutive_failures = 0
             except BaseException:
                 with self._condition:
                     self.failures += 1
                     self._consecutive_failures += 1
-                    if self._consecutive_failures >= self._failure_threshold:
+                    if (
+                        not self._circuit_open
+                        and self._consecutive_failures >= self._failure_threshold
+                    ):
                         self._circuit_open = True
+                        opened_circuit = True
             finally:
                 with self._condition:
                     self._pending -= 1
                     self._condition.notify_all()
                 self._queue.task_done()
-            if self._circuit_open:
+            if opened_circuit:
                 self._drop_queued_events()
 
     def _drop_queued_events(self) -> None:
         while True:
             try:
-                event = self._queue.get_nowait()
+                self._queue.get_nowait()
             except queue.Empty:
                 return
-            if event is not None:
-                with self._condition:
-                    self.dropped += 1
-                    self._pending -= 1
-                    self._condition.notify_all()
+            with self._condition:
+                self.dropped += 1
+                self._pending -= 1
+                self._condition.notify_all()
             self._queue.task_done()
 
     def flush(self, timeout: float) -> bool:
@@ -530,11 +556,14 @@ class _AsyncEventSender:
         return True
 
     def close(self, timeout: float) -> bool:
+        deadline = time.monotonic() + max(0.0, timeout)
         with self._condition:
             self._closed = True
             self._condition.notify_all()
-        flushed = self.flush(timeout)
-        return flushed
+        flushed = self.flush(max(0.0, deadline - time.monotonic()))
+        for thread in self._threads:
+            thread.join(timeout=max(0.0, deadline - time.monotonic()))
+        return flushed and all(not thread.is_alive() for thread in self._threads)
 
     def measurements(self) -> dict[str, int]:
         with self._condition:
@@ -565,6 +594,7 @@ class ProcessingTelemetry:
         asynchronous_delivery: bool = True,
         delivery_queue_size: int = DEFAULT_DELIVERY_QUEUE_SIZE,
         delivery_failure_threshold: int = DEFAULT_DELIVERY_FAILURE_THRESHOLD,
+        delivery_workers: int | None = None,
         start_heartbeat: bool = False,
         sequence_start: int = 1,
         attempt_elapsed_offset_seconds: float = 0.0,
@@ -613,6 +643,14 @@ class ProcessingTelemetry:
                 sender,
                 max_queue_size=delivery_queue_size,
                 failure_threshold=delivery_failure_threshold,
+                worker_count=(
+                    delivery_workers
+                    if delivery_workers is not None
+                    else _env_int(
+                        "WHODOIRUNLIKE_TELEMETRY_DELIVERY_WORKERS",
+                        DEFAULT_DELIVERY_WORKERS,
+                    )
+                ),
             )
             if sender is not None and asynchronous_delivery
             else None

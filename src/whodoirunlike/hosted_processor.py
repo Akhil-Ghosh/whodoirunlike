@@ -60,12 +60,11 @@ DEFAULT_HOSTED_MASK_BACKEND = "sam31_gpu"
 # report boundary; the larger deadline prevents partial status mutations under
 # normal remote-write latency.
 DEFAULT_REPORT_TIMEOUT_SECONDS = 10.0
-# The Worker currently persists each event through several serial durable
-# writes. A five-minute processing run can leave roughly 90 events queued even
-# when every callback succeeds. Keep the invocation alive long enough to drain
-# that measured backlog before RunPod's idle shutdown. This can add up to three
-# minutes of billed worker time; batching or parallel delivery should replace
-# the larger safety window once implemented.
+# Each callback still performs several durable Worker writes, but telemetry is
+# delivered by a bounded concurrent pool so normal processing no longer leaves
+# a large serial backlog. Retain the larger default as a correctness backstop;
+# production templates may use a shorter explicit deadline after canarying the
+# configured sender concurrency.
 DEFAULT_TELEMETRY_DRAIN_TIMEOUT_SECONDS = 180.0
 DEFAULT_TELEMETRY_SNAPSHOT_TIMEOUT_SECONDS = 0.25
 DEFAULT_CALLBACK_ORIGINS = (

@@ -350,7 +350,7 @@ def _collect_stream_masks(
     direction: str,
     progress_callback: Callable[[int, int, str], None] | None = None,
     strict_obj_id: bool = False,
-    max_frame_num_to_track: int | None = None,
+    max_responses: int | None = None,
 ) -> dict[str, Any]:
     import torch
 
@@ -366,24 +366,34 @@ def _collect_stream_masks(
             "propagation_direction": direction,
             "start_frame_index": start_frame_index,
         }
-        if max_frame_num_to_track is not None:
-            request["max_frame_num_to_track"] = max_frame_num_to_track
-        for stream_response in predictor.handle_stream_request(request=request):
-            responses += 1
-            frame_index = int(stream_response["frame_index"])
-            outputs = stream_response.get("outputs") or {}
-            mask_reader = _strict_mask_from_outputs if strict_obj_id else _mask_from_outputs
-            mask = mask_reader(
-                outputs,
-                obj_id=active_obj_id,
-            )
-            if strict_obj_id and mask is None and _first_nonempty_output_object_id(outputs) is not None:
-                object_id_mismatches += 1
-            if mask is not None:
-                masks_by_frame[frame_index] = mask
-                masks += 1
-            if progress_callback:
-                progress_callback(frame_index, len(masks_by_frame), direction)
+        stream = predictor.handle_stream_request(request=request)
+        try:
+            for stream_response in stream:
+                responses += 1
+                frame_index = int(stream_response["frame_index"])
+                outputs = stream_response.get("outputs") or {}
+                mask_reader = _strict_mask_from_outputs if strict_obj_id else _mask_from_outputs
+                mask = mask_reader(
+                    outputs,
+                    obj_id=active_obj_id,
+                )
+                if (
+                    strict_obj_id
+                    and mask is None
+                    and _first_nonempty_output_object_id(outputs) is not None
+                ):
+                    object_id_mismatches += 1
+                if mask is not None:
+                    masks_by_frame[frame_index] = mask
+                    masks += 1
+                if progress_callback:
+                    progress_callback(frame_index, len(masks_by_frame), direction)
+                if max_responses is not None and responses >= max_responses:
+                    break
+        finally:
+            close_stream = getattr(stream, "close", None)
+            if callable(close_stream):
+                close_stream()
     except RuntimeError as exc:
         if "No prompts are received on any frames" not in str(exc):
             raise
@@ -392,7 +402,7 @@ def _collect_stream_masks(
             "responses": responses,
             "masks": masks,
             "object_id_mismatches": object_id_mismatches,
-            "max_frame_num_to_track": max_frame_num_to_track,
+            "response_limit": max_responses,
             "elapsed_seconds": round(time.perf_counter() - started_at, 6),
             "warning": str(exc),
         }
@@ -403,7 +413,7 @@ def _collect_stream_masks(
         "responses": responses,
         "masks": masks,
         "object_id_mismatches": object_id_mismatches,
-        "max_frame_num_to_track": max_frame_num_to_track,
+        "response_limit": max_responses,
         "elapsed_seconds": round(time.perf_counter() - started_at, 6),
     }
 
@@ -419,7 +429,7 @@ def _propagate_from_seed_frame(
     directions: tuple[str, ...] = ("forward", "backward"),
     progress_callback: Callable[[int, int, str], None] | None = None,
     strict_obj_id: bool = False,
-    max_frame_num_to_track: int | None = None,
+    max_responses: int | None = None,
 ) -> list[dict[str, Any]]:
     diagnostics = []
     for direction in directions:
@@ -432,7 +442,7 @@ def _propagate_from_seed_frame(
             direction=direction,
             progress_callback=progress_callback,
             strict_obj_id=strict_obj_id,
-            max_frame_num_to_track=max_frame_num_to_track,
+            max_responses=max_responses,
         )
         result["pass"] = label
         diagnostics.append(result)
@@ -657,7 +667,7 @@ def _collect_sam31_masks(
                     directions=("forward",) if seed_frame == 0 else ("forward", "backward"),
                     progress_callback=progress_callback,
                     strict_obj_id=strict_obj_id,
-                    max_frame_num_to_track=(
+                    max_responses=(
                         probe_frame_count
                         if strategy == SAM31_GPU_STRATEGY_PROBE_THEN_ANCHOR
                         else None

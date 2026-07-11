@@ -556,6 +556,7 @@ def test_collect_sam31_masks_probes_before_anchor_refinement(
     class FakePredictor:
         def __init__(self) -> None:
             self.stream_requests: list[dict[str, object]] = []
+            self.streams: list[FakeStream] = []
 
         def handle_request(self, *, request: dict[str, object]) -> dict[str, object]:
             if request["type"] == "start_session":
@@ -571,10 +572,9 @@ def test_collect_sam31_masks_probes_before_anchor_refinement(
                 }
             raise AssertionError(f"unexpected request: {request['type']}")
 
-        def handle_stream_request(self, *, request: dict[str, object]) -> list[dict[str, object]]:
+        def handle_stream_request(self, *, request: dict[str, object]) -> FakeStream:
             self.stream_requests.append(request)
-            frame_indices = [0] if len(self.stream_requests) == 1 else list(range(6))
-            return [
+            stream = FakeStream([
                 {
                     "frame_index": frame_index,
                     "outputs": {
@@ -582,8 +582,24 @@ def test_collect_sam31_masks_probes_before_anchor_refinement(
                         "out_binary_masks": np.array([[[1, 1], [0, 0]]], dtype=np.uint8),
                     },
                 }
-                for frame_index in frame_indices
-            ]
+                for frame_index in range(6)
+            ])
+            self.streams.append(stream)
+            return stream
+
+    class FakeStream:
+        def __init__(self, responses: list[dict[str, object]]) -> None:
+            self.responses = iter(responses)
+            self.closed = False
+
+        def __iter__(self) -> FakeStream:
+            return self
+
+        def __next__(self) -> dict[str, object]:
+            return next(self.responses)
+
+        def close(self) -> None:
+            self.closed = True
 
     predictor = FakePredictor()
     masks, diagnostics = _collect_sam31_masks(
@@ -610,8 +626,11 @@ def test_collect_sam31_masks_probes_before_anchor_refinement(
     )
 
     assert len(predictor.stream_requests) == 2
-    assert predictor.stream_requests[0]["max_frame_num_to_track"] == 2
+    assert "max_frame_num_to_track" not in predictor.stream_requests[0]
     assert "max_frame_num_to_track" not in predictor.stream_requests[1]
+    assert [item["responses"] for item in diagnostics["propagation"]] == [2, 6]
+    assert [item["response_limit"] for item in diagnostics["propagation"]] == [2, None]
+    assert all(stream.closed for stream in predictor.streams)
     assert diagnostics["anchor_refinement_triggered"] is True
     assert diagnostics["anchor_refinement_frames"] == [0, 2, 4]
     assert [item["pass"] for item in diagnostics["propagation"]] == [

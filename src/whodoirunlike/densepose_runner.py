@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import json
+import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from importlib import import_module
 from pathlib import Path
 from typing import Any, Callable
@@ -36,12 +37,23 @@ DensePoseProgressCallback = Callable[[dict[str, Any]], None]
 @dataclass(frozen=True)
 class DensePoseBackend:
     predictor: Any
+    input_min_size_test: Any = None
+    input_max_size_test: Any = None
+    inference_lock: threading.RLock = field(
+        default_factory=threading.RLock,
+        compare=False,
+        repr=False,
+    )
 
 
 @dataclass(frozen=True)
 class DensePoseFrameOutput:
     row: dict[str, Any]
     labels: np.ndarray | None = None
+
+
+_DENSEPOSE_BACKEND_CACHE: dict[tuple[Any, ...], DensePoseBackend] = {}
+_DENSEPOSE_BACKEND_CACHE_LOCK = threading.RLock()
 
 
 def build_densepose_progress(
@@ -52,6 +64,7 @@ def build_densepose_progress(
     elapsed_seconds: float,
     frame_index: int | None = None,
     usable: bool | None = None,
+    inference_input: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     total_frames = max(0, int(total_frames))
     processed_frames = max(0, min(int(processed_frames), total_frames or int(processed_frames)))
@@ -77,6 +90,8 @@ def build_densepose_progress(
         payload["frame_index"] = int(frame_index)
     if usable is not None:
         payload["usable"] = bool(usable)
+    if inference_input is not None:
+        payload["inference_input"] = dict(inference_input)
     return payload
 
 
@@ -96,6 +111,7 @@ def update_manifest_densepose(
     usable_frames: int = 0,
     error: str | None = None,
     setup_instructions: str | None = None,
+    inference_settings: dict[str, Any] | None = None,
 ) -> None:
     run = RunningClipRun(manifest_path.parent)
     manifest = run.read_manifest()
@@ -115,6 +131,10 @@ def update_manifest_densepose(
         values["setup_instructions"] = setup_instructions
     else:
         densepose_stage.pop("setup_instructions", None)
+    if inference_settings is not None:
+        values["inference_settings"] = dict(inference_settings)
+    else:
+        densepose_stage.pop("inference_settings", None)
     run.update_stage("densepose", values, manifest)
 
 
@@ -124,27 +144,67 @@ def load_densepose_backend(
     weights_path: str | None = None,
     confidence_threshold: float = 0.5,
     device: str = "cpu",
+    input_min_size_test: int | None = None,
+    input_max_size_test: int | None = None,
+    cache_enabled: bool = True,
 ) -> DensePoseBackend:
     if config_path is None or weights_path in (None, ""):
         raise DensePoseSetupError(
             "DensePose config and weights are required. " + DENSEPOSE_SETUP_INSTRUCTIONS
         )
 
-    try:
-        from detectron2.config import get_cfg
-        from detectron2.engine import DefaultPredictor
-        from densepose import add_densepose_config
-    except ModuleNotFoundError as exc:
-        raise DensePoseSetupError(DENSEPOSE_SETUP_INSTRUCTIONS) from exc
+    min_size_override = int(input_min_size_test) if input_min_size_test is not None else None
+    max_size_override = int(input_max_size_test) if input_max_size_test is not None else None
+    if min_size_override is not None and min_size_override <= 0:
+        raise ValueError("DensePose INPUT.MIN_SIZE_TEST override must be positive")
+    if max_size_override is not None and max_size_override <= 0:
+        raise ValueError("DensePose INPUT.MAX_SIZE_TEST override must be positive")
 
-    cfg = get_cfg()
-    add_densepose_config(cfg)
-    cfg.merge_from_file(str(config_path))
-    cfg.MODEL.WEIGHTS = str(weights_path)
-    cfg.MODEL.DEVICE = device
-    cfg.MODEL.ROI_HEADS.SCORE_THRESH_TEST = float(confidence_threshold)
-    cfg.freeze()
-    return DensePoseBackend(predictor=DefaultPredictor(cfg))
+    key = (
+        str(config_path.resolve(strict=False)),
+        str(weights_path),
+        float(confidence_threshold),
+        str(device),
+        min_size_override,
+        max_size_override,
+    )
+    with _DENSEPOSE_BACKEND_CACHE_LOCK:
+        if cache_enabled and key in _DENSEPOSE_BACKEND_CACHE:
+            return _DENSEPOSE_BACKEND_CACHE[key]
+
+        try:
+            from detectron2.config import get_cfg
+            from detectron2.engine import DefaultPredictor
+            from densepose import add_densepose_config
+        except ModuleNotFoundError as exc:
+            raise DensePoseSetupError(DENSEPOSE_SETUP_INSTRUCTIONS) from exc
+
+        cfg = get_cfg()
+        add_densepose_config(cfg)
+        cfg.merge_from_file(str(config_path))
+        cfg.MODEL.WEIGHTS = str(weights_path)
+        cfg.MODEL.DEVICE = device
+        cfg.MODEL.ROI_HEADS.SCORE_THRESH_TEST = float(confidence_threshold)
+        if min_size_override is not None:
+            cfg.INPUT.MIN_SIZE_TEST = min_size_override
+        if max_size_override is not None:
+            cfg.INPUT.MAX_SIZE_TEST = max_size_override
+        effective_min_size = cfg.INPUT.MIN_SIZE_TEST
+        effective_max_size = cfg.INPUT.MAX_SIZE_TEST
+        cfg.freeze()
+        backend = DensePoseBackend(
+            predictor=DefaultPredictor(cfg),
+            input_min_size_test=effective_min_size,
+            input_max_size_test=effective_max_size,
+        )
+        if cache_enabled:
+            _DENSEPOSE_BACKEND_CACHE[key] = backend
+        return backend
+
+
+def clear_densepose_backend_cache() -> None:
+    with _DENSEPOSE_BACKEND_CACHE_LOCK:
+        _DENSEPOSE_BACKEND_CACHE.clear()
 
 
 def mask_bbox(mask: np.ndarray) -> list[int] | None:
@@ -156,6 +216,24 @@ def mask_bbox(mask: np.ndarray) -> list[int] | None:
     x2 = int(xs.max())
     y2 = int(ys.max())
     return [x1, y1, x2 - x1 + 1, y2 - y1 + 1]
+
+
+def _target_crop_bbox(
+    runner_mask: np.ndarray,
+    *,
+    runner_bbox: list[int],
+    padding_ratio: float,
+    padding_pixels: int,
+) -> list[int]:
+    x, y, width, height = runner_bbox
+    ratio_padding = int(round(max(width, height) * max(0.0, float(padding_ratio))))
+    padding = max(0, int(padding_pixels), ratio_padding)
+    frame_height, frame_width = runner_mask.shape[:2]
+    x1 = max(0, x - padding)
+    y1 = max(0, y - padding)
+    x2 = min(frame_width, x + width + padding)
+    y2 = min(frame_height, y + height + padding)
+    return [x1, y1, x2 - x1, y2 - y1]
 
 
 def _box_xyxy_to_xywh(box: Any) -> list[int]:
@@ -272,36 +350,94 @@ def apply_densepose_to_frame(
     *,
     frame_index: int,
     min_mask_overlap: float = 0.1,
+    target_crop_enabled: bool = False,
+    target_crop_padding_ratio: float = 0.2,
+    target_crop_padding_pixels: int = 16,
 ) -> DensePoseFrameOutput:
-    masked_frame = frame_bgr.copy()
-    masked_frame[runner_mask <= 0] = 0
-    outputs = backend.predictor(masked_frame)
+    frame_height, frame_width = frame_bgr.shape[:2]
+    runner_bbox = mask_bbox(runner_mask)
+    if runner_bbox is None:
+        return DensePoseFrameOutput(
+            {
+                "usable": False,
+                "drop_reason": "runner_mask_empty",
+                "inference_input": {
+                    "target_crop_enabled": bool(target_crop_enabled),
+                    "crop_bbox": None,
+                    "width": 0,
+                    "height": 0,
+                },
+            }
+        )
+    crop_bbox = [0, 0, frame_width, frame_height]
+    if target_crop_enabled:
+        crop_bbox = _target_crop_bbox(
+            runner_mask,
+            runner_bbox=runner_bbox,
+            padding_ratio=target_crop_padding_ratio,
+            padding_pixels=target_crop_padding_pixels,
+        )
+    crop_x, crop_y, crop_width, crop_height = crop_bbox
+    inference_frame = frame_bgr[crop_y : crop_y + crop_height, crop_x : crop_x + crop_width].copy()
+    inference_mask = runner_mask[
+        crop_y : crop_y + crop_height,
+        crop_x : crop_x + crop_width,
+    ]
+    inference_frame[inference_mask <= 0] = 0
+    inference_input = {
+        "target_crop_enabled": bool(target_crop_enabled),
+        "crop_bbox": crop_bbox,
+        "width": int(inference_frame.shape[1]),
+        "height": int(inference_frame.shape[0]),
+    }
+    with backend.inference_lock:
+        outputs = backend.predictor(inference_frame)
     instances = _instances_to_cpu(outputs.get("instances"))
     if instances is None or len(instances) == 0:
-        return DensePoseFrameOutput({"usable": False, "drop_reason": "densepose_missing"})
+        return DensePoseFrameOutput(
+            {
+                "usable": False,
+                "drop_reason": "densepose_missing",
+                "inference_input": inference_input,
+            }
+        )
 
-    boxes = instances.pred_boxes.tensor.numpy()
+    local_boxes = instances.pred_boxes.tensor.numpy()
     scores = instances.scores.numpy() if hasattr(instances, "scores") else np.ones(len(instances))
     densepose = getattr(instances, "pred_densepose", None)
 
     best_index: int | None = None
     best_overlap = 0.0
-    for index, raw_box in enumerate(boxes):
-        bbox = _box_xyxy_to_xywh(raw_box)
+    for index, raw_box in enumerate(local_boxes):
+        full_frame_box = np.asarray(raw_box, dtype=np.float32).copy()
+        full_frame_box[[0, 2]] += crop_x
+        full_frame_box[[1, 3]] += crop_y
+        bbox = _box_xyxy_to_xywh(full_frame_box)
         overlap = _box_mask_overlap(bbox, runner_mask)
         if overlap > best_overlap:
             best_overlap = overlap
             best_index = index
 
     if best_index is None or best_overlap < min_mask_overlap:
-        return DensePoseFrameOutput({"usable": False, "drop_reason": "no_detection_on_runner_mask"})
+        return DensePoseFrameOutput(
+            {
+                "usable": False,
+                "drop_reason": "no_detection_on_runner_mask",
+                "inference_input": inference_input,
+            }
+        )
+
+    selected_box = np.asarray(local_boxes[best_index], dtype=np.float32).copy()
+    selected_box[[0, 2]] += crop_x
+    selected_box[[1, 3]] += crop_y
 
     row = {
         "usable": True,
         "score": round(float(scores[best_index]), 4),
-        "bbox": _box_xyxy_to_xywh(boxes[best_index]),
+        "bbox": _box_xyxy_to_xywh(selected_box),
         "mask_overlap": round(best_overlap, 4),
         "drop_reason": None,
+        "inference_input": inference_input,
     }
     chart_result = _chart_result_for_instance(instances, best_index) if densepose is not None else None
     labels = None
@@ -399,6 +535,11 @@ def run_densepose(
     weights_path: str | None = None,
     confidence_threshold: float = 0.5,
     device: str = "cpu",
+    input_min_size_test: int | None = None,
+    input_max_size_test: int | None = None,
+    target_crop_enabled: bool = False,
+    target_crop_padding_ratio: float = 0.2,
+    target_crop_padding_pixels: int = 16,
     write_qa_overlay: bool = True,
     progress_callback: DensePoseProgressCallback | None = None,
 ) -> dict[str, Any]:
@@ -410,6 +551,8 @@ def run_densepose(
     runner_mask = run.artifact_path("runner_mask", manifest)
     densepose_path = run.artifact_path("densepose", manifest)
     qa_overlay_path = run.artifact_path("qa_overlay", manifest)
+    effective_padding_ratio = max(0.0, float(target_crop_padding_ratio))
+    effective_padding_pixels = max(0, int(target_crop_padding_pixels))
 
     if progress_callback:
         progress_callback(
@@ -427,6 +570,8 @@ def run_densepose(
             weights_path=weights_path,
             confidence_threshold=confidence_threshold,
             device=device,
+            input_min_size_test=input_min_size_test,
+            input_max_size_test=input_max_size_test,
         )
     except DensePoseSetupError as exc:
         update_manifest_densepose(
@@ -444,6 +589,14 @@ def run_densepose(
             "frame_count": 0,
             "elapsed_seconds": round(time.monotonic() - started_at, 3),
         }
+
+    inference_settings = {
+        "target_crop_enabled": bool(target_crop_enabled),
+        "target_crop_padding_ratio": effective_padding_ratio,
+        "target_crop_padding_pixels": effective_padding_pixels,
+        "input_min_size_test": backend.input_min_size_test,
+        "input_max_size_test": backend.input_max_size_test,
+    }
 
     if not source_segment.exists():
         raise FileNotFoundError(f"Missing source_segment: {source_segment}")
@@ -498,28 +651,63 @@ def run_densepose(
             ok, frame = source_capture.read()
             if not ok:
                 break
+            labels = None
             mask = _read_mask_frame(mask_capture, width, height)
             if mask is None:
-                row = {"usable": False, "drop_reason": "runner_mask_frame_missing"}
+                row = {
+                    "usable": False,
+                    "drop_reason": "runner_mask_frame_missing",
+                    "inference_input": {
+                        "target_crop_enabled": bool(target_crop_enabled),
+                        "crop_bbox": None,
+                        "width": 0,
+                        "height": 0,
+                    },
+                }
             else:
                 bbox = mask_bbox(mask)
                 mask_area_ratio = float((mask > 0).sum()) / float(max(width * height, 1))
                 if bbox is None:
-                    row = {"usable": False, "drop_reason": "runner_mask_empty"}
-                    labels = None
+                    row = {
+                        "usable": False,
+                        "drop_reason": "runner_mask_empty",
+                        "inference_input": {
+                            "target_crop_enabled": bool(target_crop_enabled),
+                            "crop_bbox": None,
+                            "width": 0,
+                            "height": 0,
+                        },
+                    }
                 else:
+                    apply_kwargs: dict[str, Any] = {"frame_index": frame_index}
+                    if target_crop_enabled:
+                        apply_kwargs.update(
+                            {
+                                "target_crop_enabled": True,
+                                "target_crop_padding_ratio": effective_padding_ratio,
+                                "target_crop_padding_pixels": effective_padding_pixels,
+                            }
+                        )
                     densepose_output = apply_densepose_to_frame(
                         frame,
                         mask,
                         backend,
-                        frame_index=frame_index,
+                        **apply_kwargs,
                     )
                     if isinstance(densepose_output, DensePoseFrameOutput):
                         row = densepose_output.row
                         labels = densepose_output.labels
                     else:
                         row = densepose_output
-                        labels = None
+                    row.setdefault(
+                        "inference_input",
+                        {
+                            "target_crop_enabled": False,
+                            "crop_bbox": [0, 0, width, height],
+                            "width": width,
+                            "height": height,
+                        },
+                    )
                 row["mask_area_ratio"] = round(mask_area_ratio, 6)
                 row.setdefault("runner_bbox", bbox)
                 if writer is not None:
@@ -538,6 +726,7 @@ def run_densepose(
                         elapsed_seconds=time.monotonic() - started_at,
                         frame_index=frame_index,
                         usable=bool(row.get("usable")),
+                        inference_input=row.get("inference_input"),
                     )
                 )
             frame_index += 1
@@ -576,6 +765,7 @@ def run_densepose(
         densepose_path=densepose_path,
         frame_count=len(rows),
         usable_frames=usable_frames,
+        inference_settings=inference_settings,
     )
     if progress_callback:
         progress_callback(
@@ -594,4 +784,5 @@ def run_densepose(
         "elapsed_seconds": round(time.monotonic() - started_at, 3),
         "densepose": str(densepose_path),
         "qa_overlay": str(qa_overlay_path) if write_qa_overlay else None,
+        "inference_settings": inference_settings,
     }

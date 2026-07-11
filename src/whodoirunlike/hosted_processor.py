@@ -10,6 +10,7 @@ import platform
 import re
 import secrets
 import shutil
+import tempfile
 import threading
 import time
 import traceback
@@ -25,8 +26,16 @@ from fastapi import APIRouter, BackgroundTasks, HTTPException, Request
 from pydantic import BaseModel
 
 from whodoirunlike.cv_flow import utc_now_iso, write_json
-from whodoirunlike.full_pipeline import run_full_cv_pipeline
-from whodoirunlike.identity_runner import DEFAULT_IDENTITY_BACKEND, identity_setup_status
+from whodoirunlike.full_pipeline import (
+    DEFAULT_INLINE_SEGMENTATION_MODEL,
+    INLINE_MASK_BACKENDS,
+    run_full_cv_pipeline,
+)
+from whodoirunlike.identity_runner import (
+    BOXMOT_BACKENDS,
+    DEFAULT_IDENTITY_BACKEND,
+    identity_setup_status,
+)
 from whodoirunlike.processing_telemetry import (
     ProcessingTelemetry,
     create_hosted_telemetry,
@@ -37,6 +46,7 @@ from whodoirunlike.running_clip_run import RunningClipRun
 from whodoirunlike.sam2_runner import inspect_video
 from whodoirunlike.sam31_gpu_runner import DEFAULT_SAM31_GPU_MODEL
 from whodoirunlike.sam31_mlx_runner import DEFAULT_SAM31_MLX_MODEL
+from whodoirunlike.video_io import make_browser_playable_mp4
 
 
 LOGGER = logging.getLogger(__name__)
@@ -55,6 +65,8 @@ DENSEPOSE_DEFAULT_WEIGHTS = (
 RUN_ID_PATTERN = re.compile(r"^[a-f0-9-]{32,36}$", re.IGNORECASE)
 PROCESSOR_USER_AGENT = "Mozilla/5.0 (compatible; whodoirunlike-processor/1.0)"
 DEFAULT_HOSTED_MASK_BACKEND = "sam31_gpu"
+SPEED_PROFILE_ENV = "WHODOIRUNLIKE_SPEED_PROFILE"
+MAX_SAFE_SPEED_PROFILE = "max_safe"
 # Job reports can require multiple conditional R2 writes. These calls are
 # best-effort but synchronous, so a Worker outage can add up to 10 seconds at a
 # report boundary; the larger deadline prevents partial status mutations under
@@ -140,6 +152,10 @@ _HOSTED_PUBLISHABLE_ARTIFACTS = (
     ("form_feature_arrays", "form_features.npz"),
     ("qc_metrics", "qc_metrics.json"),
     ("hosted_pipeline_result", "hosted_pipeline_result.json"),
+)
+_RESULT_READY_ARTIFACT_NAMES = ("fused_overlay.mp4",)
+_DEFERRED_BROWSER_ARTIFACT_NAMES = frozenset(
+    {"runner_mask.mp4", "masked_runner.mp4"}
 )
 _PROCESSOR_STARTED_AT = time.monotonic()
 _PROCESSOR_INVOCATION_LOCK = threading.Lock()
@@ -734,6 +750,115 @@ def _public_artifact_name(
     return path.name
 
 
+def _deferred_browser_encoding_paths(
+    manifest: dict[str, Any] | None,
+) -> set[Path]:
+    if not isinstance(manifest, dict):
+        return set()
+    stage = (manifest.get("stages") or {}).get("whole_runner_mask") or {}
+    deferred = stage.get("deferred_browser_encoding") or {}
+    if stage.get("backend") != "yolo26n_seg_inline" or deferred.get("required") is not True:
+        return set()
+    values = deferred.get("paths") or []
+    return {
+        Path(str(value)).resolve(strict=False)
+        for value in values
+        if Path(str(value)).name in _DEFERRED_BROWSER_ARTIFACT_NAMES
+    }
+
+
+def _finalized_deferred_browser_payload(
+    value: Any,
+    *,
+    completed_at: str,
+) -> tuple[Any, bool]:
+    changed = False
+    if isinstance(value, list):
+        items = []
+        for item in value:
+            finalized, item_changed = _finalized_deferred_browser_payload(
+                item,
+                completed_at=completed_at,
+            )
+            items.append(finalized)
+            changed = changed or item_changed
+        return items, changed
+    if not isinstance(value, dict):
+        return value, False
+
+    finalized_object: dict[str, Any] = {}
+    for key, item in value.items():
+        finalized, item_changed = _finalized_deferred_browser_payload(
+            item,
+            completed_at=completed_at,
+        )
+        finalized_object[key] = finalized
+        changed = changed or item_changed
+
+    deferred = finalized_object.get("deferred_browser_encoding")
+    if isinstance(deferred, dict) and deferred.get("required") is True:
+        finalized_object["deferred_browser_encoding"] = {
+            **deferred,
+            "required": False,
+            "paths": [],
+            "completed_at": completed_at,
+        }
+        changed = True
+    return finalized_object, changed
+
+
+def _write_json_atomically(path: Path, payload: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w",
+            delete=False,
+            dir=path.parent,
+            encoding="utf-8",
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+        ) as output:
+            temporary_path = Path(output.name)
+            json.dump(payload, output, indent=2)
+            output.write("\n")
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary_path, path)
+    except Exception:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
+        raise
+
+
+def _finalize_deferred_browser_encoding(
+    run: RunningClipRun,
+    *,
+    completed_at: str,
+) -> None:
+    manifest = run.read_manifest()
+    result_path = run.artifact_path("hosted_pipeline_result", manifest)
+    if result_path.is_file():
+        result_payload = json.loads(result_path.read_text(encoding="utf-8"))
+        finalized_result, result_changed = _finalized_deferred_browser_payload(
+            result_payload,
+            completed_at=completed_at,
+        )
+        if result_changed:
+            _write_json_atomically(result_path, finalized_result)
+
+    run.update_stage(
+        "whole_runner_mask",
+        {
+            "deferred_browser_encoding": {
+                "required": False,
+                "paths": [],
+                "completed_at": completed_at,
+            }
+        },
+    )
+
+
 def _upload_artifacts(
     payload: WorkerJobRequest,
     run_dir: Path,
@@ -744,9 +869,64 @@ def _upload_artifacts(
     manifest = run.read_manifest() if run.manifest_path.is_file() else None
     artifact_attempt_id = ensure_attempt_id(payload.attempt_id)
     uploaded: list[str] = []
-    for path in _artifact_files(run_dir):
-        public_name = _public_artifact_name(run, path, manifest)
+    upload_queue = [
+        (_public_artifact_name(run, path, manifest), path)
+        for path in _artifact_files(run_dir)
+    ]
+    deferred_paths = _deferred_browser_encoding_paths(manifest)
+    if deferred_paths:
+        upload_queue.sort(
+            key=lambda item: (
+                0
+                if item[0] in _RESULT_READY_ARTIFACT_NAMES
+                else 1
+                if item[1].resolve(strict=False) in deferred_paths
+                else 3
+                if item[0] == "cv_run_manifest.json"
+                else 2
+            )
+        )
+    else:
+        upload_queue.sort(
+            key=lambda item: (
+                item[0] not in _RESULT_READY_ARTIFACT_NAMES,
+                _RESULT_READY_ARTIFACT_NAMES.index(item[0])
+                if item[0] in _RESULT_READY_ARTIFACT_NAMES
+                else 0,
+            )
+        )
+    encoded_deferred_paths: set[Path] = set()
+    deferred_state_finalized = False
+    for public_name, path in upload_queue:
         artifact_type = public_name.rsplit(".", 1)[0]
+        resolved_path = path.resolve(strict=False)
+        if resolved_path in deferred_paths:
+            encode_context = (
+                telemetry.span(
+                    "artifact_publish",
+                    "encode",
+                    measurements={
+                        "artifact_type": artifact_type,
+                        "bytes": path.stat().st_size,
+                        "deferred_from_stage": "target_tracking",
+                    },
+                )
+                if telemetry is not None
+                else nullcontext()
+            )
+            with encode_context:
+                make_browser_playable_mp4(path)
+            encoded_deferred_paths.add(resolved_path)
+        if (
+            deferred_paths
+            and encoded_deferred_paths == deferred_paths
+            and not deferred_state_finalized
+        ):
+            _finalize_deferred_browser_encoding(
+                run,
+                completed_at=utc_now_iso(),
+            )
+            deferred_state_finalized = True
         span_context = (
             telemetry.span(
                 "artifact_publish",
@@ -768,7 +948,7 @@ def _upload_artifacts(
                 path=path,
             )
         uploaded.append(public_name)
-        if telemetry is not None and public_name == "fused_overlay.mp4":
+        if telemetry is not None and public_name in _RESULT_READY_ARTIFACT_NAMES:
             telemetry.result_ready(
                 {
                     "artifact_type": artifact_type,
@@ -783,6 +963,49 @@ def _env_bool(name: str, default: bool = False) -> bool:
     if raw is None:
         return default
     return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_int(name: str, default: int, *, minimum: int = 0) -> int:
+    try:
+        return max(minimum, int(os.getenv(name, str(default))))
+    except (TypeError, ValueError):
+        return default
+
+
+def _inline_mask_settings() -> dict[str, Any]:
+    return {
+        "identity_detector_model": os.getenv(
+            "WHODOIRUNLIKE_IDENTITY_DETECTOR_MODEL",
+            "",
+        ).strip()
+        or None,
+        "inline_mask_dilation_pixels": _env_int(
+            "WHODOIRUNLIKE_INLINE_MASK_DILATION_PIXELS",
+            5,
+        ),
+        "inline_mask_temporal_reset_gap_frames": _env_int(
+            "WHODOIRUNLIKE_INLINE_MASK_TEMPORAL_RESET_GAP_FRAMES",
+            3,
+            minimum=0,
+        ),
+        "inline_mask_fallback_to_track_box": _env_bool(
+            "WHODOIRUNLIKE_INLINE_MASK_FALLBACK_TO_TRACK_BOX",
+            True,
+        ),
+        "inline_mask_defer_browser_encoding": _env_bool(
+            "WHODOIRUNLIKE_INLINE_MASK_DEFER_BROWSER_ENCODING",
+            True,
+        ),
+        "inline_mask_sam_fallback": _env_bool(
+            "WHODOIRUNLIKE_INLINE_MASK_SAM_FALLBACK",
+            True,
+        ),
+        "inline_mask_fallback_backend": os.getenv(
+            "WHODOIRUNLIKE_INLINE_MASK_FALLBACK_BACKEND",
+            "sam31_gpu",
+        ).strip()
+        or "sam31_gpu",
+    }
 
 
 def _env_float(name: str, default: float) -> float:
@@ -933,6 +1156,56 @@ def sam31_mlx_setup_status() -> dict[str, Any]:
 
 def mask_setup_status(mask_backend: str) -> dict[str, Any]:
     normalized = mask_backend.strip().lower()
+    if normalized in INLINE_MASK_BACKENDS:
+        configured_model = os.getenv(
+            "WHODOIRUNLIKE_IDENTITY_DETECTOR_MODEL",
+            "",
+        ).strip()
+        model = configured_model or DEFAULT_INLINE_SEGMENTATION_MODEL
+        identity_backend = os.getenv(
+            "WHODOIRUNLIKE_IDENTITY_BACKEND",
+            DEFAULT_IDENTITY_BACKEND,
+        )
+        identity_status = identity_setup_status(identity_backend)
+        reasons = list(identity_status.get("reasons") or [])
+        canonical_identity_backend = identity_status.get("backend")
+        if canonical_identity_backend not in BOXMOT_BACKENDS:
+            reasons.append(
+                "YOLO26 inline segmentation requires a BoxMOT identity backend "
+                "so masks can be associated with the selected runner track."
+            )
+        model_path: Path | None = None
+        if configured_model and not _is_url(configured_model):
+            model_path = _resolve_repo_path(configured_model)
+            if not model_path.is_file():
+                reasons.append(
+                    "WHODOIRUNLIKE_IDENTITY_DETECTOR_MODEL does not exist as a "
+                    f"local file: {model_path}"
+                )
+        model_name = Path(urllib.parse.urlsplit(model).path).name.lower()
+        model_stem = Path(model_name).stem
+        if model_stem.startswith(("yolo", "yolov")) and "seg" not in model_stem:
+            reasons.append(
+                "WHODOIRUNLIKE_IDENTITY_DETECTOR_MODEL names a YOLO detection-only "
+                f"asset ({model_name}); inline masking requires a segmentation model."
+            )
+        return {
+            "ready": bool(identity_status.get("ready")) and not reasons,
+            "reasons": reasons,
+            "backend": "yolo26n_seg_inline",
+            "model": model,
+            "model_validation": {
+                "source": (
+                    "local"
+                    if model_path is not None
+                    else "remote"
+                    if configured_model and _is_url(configured_model)
+                    else "default_asset"
+                ),
+                "local_path": str(model_path) if model_path is not None else None,
+            },
+            "identity": identity_status,
+        }
     if normalized in {"sam31_gpu", "sam3.1_gpu", "sam31_cuda", "sam3.1_cuda"}:
         return sam31_gpu_setup_status()
     if normalized in {"sam31", "sam31_mlx", "sam3.1_mlx", "mlx"}:
@@ -1043,11 +1316,124 @@ def _readiness_check(label: str, callback: Any) -> dict[str, Any]:
         }
 
 
+def _speed_profile_status() -> dict[str, Any]:
+    raw_profile = os.getenv(SPEED_PROFILE_ENV, "").strip()
+    profile = raw_profile.lower() or None
+    if profile is None:
+        return {
+            "ready": True,
+            "reasons": [],
+            "profile": None,
+            "active": False,
+        }
+    if profile != MAX_SAFE_SPEED_PROFILE:
+        return {
+            "ready": False,
+            "reasons": [
+                f"Unsupported {SPEED_PROFILE_ENV}={raw_profile!r}; "
+                f"expected {MAX_SAFE_SPEED_PROFILE!r} or no profile."
+            ],
+            "profile": profile,
+            "active": True,
+        }
+
+    reasons: list[str] = []
+
+    def require(
+        name: str,
+        expected: str,
+        predicate: Any,
+    ) -> None:
+        raw_value = os.getenv(name)
+        value = (raw_value or "").strip()
+        if raw_value is None or not value:
+            reasons.append(
+                f"{name} must be explicitly set to {expected} for "
+                f"{SPEED_PROFILE_ENV}={MAX_SAFE_SPEED_PROFILE}."
+            )
+            return
+        if not predicate(value):
+            reasons.append(
+                f"{name}={value!r} does not satisfy the {MAX_SAFE_SPEED_PROFILE} "
+                f"requirement; expected {expected}."
+            )
+
+    def truthy(value: str) -> bool:
+        return value.lower() in {"1", "true", "yes", "on"}
+
+    def falsey(value: str) -> bool:
+        return value.lower() in {"0", "false", "no", "off"}
+
+    def cuda(value: str) -> bool:
+        return re.fullmatch(r"cuda(?::\d+)?", value.lower()) is not None
+
+    require("WHODOIRUNLIKE_ENVIRONMENT", "scratch", lambda value: value.lower() == "scratch")
+    require(
+        "WHODOIRUNLIKE_MASK_BACKEND",
+        "a YOLO26 inline segmentation backend",
+        lambda value: value.lower() in INLINE_MASK_BACKENDS,
+    )
+    require("WHODOIRUNLIKE_PARALLEL_POSE_DENSEPOSE", "true", truthy)
+    require("WHODOIRUNLIKE_PARALLEL_POST_FUSION", "true", truthy)
+    require(
+        "WHODOIRUNLIKE_POSE_BACKEND",
+        "an mmpose backend",
+        lambda value: value.lower().startswith("mmpose_"),
+    )
+    require("MMPOSE_DEVICE", "cuda or cuda:<index>", cuda)
+    require("MMPOSE_USE_DETECTOR", "false", falsey)
+    require(
+        "RTMW_RUNTIME_BACKEND",
+        "onnxruntime",
+        lambda value: value.lower() == "onnxruntime",
+    )
+    require("WHODOIRUNLIKE_SKIP_DENSEPOSE", "false", falsey)
+    require("DENSEPOSE_DEVICE", "cuda or cuda:<index>", cuda)
+    require("DENSEPOSE_TARGET_CROP_ENABLED", "true", truthy)
+    require(
+        "DENSEPOSE_INPUT_MIN_SIZE_TEST",
+        "512",
+        lambda value: value == "512",
+    )
+    require(
+        "DENSEPOSE_INPUT_MAX_SIZE_TEST",
+        "960",
+        lambda value: value == "960",
+    )
+    require("WHODOIRUNLIKE_INLINE_MASK_DEFER_BROWSER_ENCODING", "true", truthy)
+    require("WHODOIRUNLIKE_INLINE_MASK_SAM_FALLBACK", "true", truthy)
+    require(
+        "WHODOIRUNLIKE_INLINE_MASK_FALLBACK_BACKEND",
+        "sam31_gpu",
+        lambda value: value.lower()
+        in {"sam31_gpu", "sam3.1_gpu", "sam31_cuda", "sam3.1_cuda"},
+    )
+    return {
+        "ready": not reasons,
+        "reasons": reasons,
+        "profile": profile,
+        "active": True,
+    }
+
+
 def processor_readiness() -> dict[str, Any]:
     identity_backend = os.getenv("WHODOIRUNLIKE_IDENTITY_BACKEND", DEFAULT_IDENTITY_BACKEND)
     pose_backend = os.getenv("WHODOIRUNLIKE_POSE_BACKEND", "mmpose_rtmpose_l_384")
     mask_backend = _mask_backend()
     skip_densepose = _env_bool("WHODOIRUNLIKE_SKIP_DENSEPOSE")
+    parallel_pose_densepose = _env_bool("WHODOIRUNLIKE_PARALLEL_POSE_DENSEPOSE")
+    parallel_post_fusion = _env_bool("WHODOIRUNLIKE_PARALLEL_POST_FUSION")
+    inline_mask_settings = _inline_mask_settings()
+    execution_policy_reasons: list[str] = []
+    if (
+        parallel_pose_densepose
+        and not skip_densepose
+        and not pose_backend.startswith("mmpose_")
+    ):
+        execution_policy_reasons.append(
+            "WHODOIRUNLIKE_PARALLEL_POSE_DENSEPOSE requires an mmpose backend "
+            "with isolated QA output."
+        )
     checks = {
         "processor_secret": _readiness_check("processor_secret", _secret_status),
         "identity": _readiness_check(
@@ -1061,13 +1447,22 @@ def processor_readiness() -> dict[str, Any]:
             if skip_densepose
             else _readiness_check("densepose", densepose_setup_status)
         ),
+        "execution_policy": {
+            "ready": not execution_policy_reasons,
+            "reasons": execution_policy_reasons,
+        },
+        "speed_profile": _speed_profile_status(),
     }
     return {
         "ready_for_full_pipeline": all(bool(check.get("ready")) for check in checks.values()),
+        "speed_profile": checks["speed_profile"]["profile"],
         "identity_backend": identity_backend,
         "pose_backend": pose_backend,
         "mask_backend": mask_backend,
         "skip_densepose": skip_densepose,
+        "parallel_pose_densepose": parallel_pose_densepose,
+        "parallel_post_fusion": parallel_post_fusion,
+        "inline_mask": inline_mask_settings,
         "checks": checks,
     }
 
@@ -1085,6 +1480,9 @@ def process_hosted_job(payload: WorkerJobRequest, *, raise_on_error: bool = Fals
     pose_backend = os.getenv("WHODOIRUNLIKE_POSE_BACKEND", "mmpose_rtmpose_l_384")
     mask_backend = _mask_backend()
     skip_densepose = _env_bool("WHODOIRUNLIKE_SKIP_DENSEPOSE")
+    parallel_pose_densepose = _env_bool("WHODOIRUNLIKE_PARALLEL_POSE_DENSEPOSE")
+    parallel_post_fusion = _env_bool("WHODOIRUNLIKE_PARALLEL_POST_FUSION")
+    inline_mask_settings = _inline_mask_settings()
     attempt_elapsed_offset, has_attempt_timing = _elapsed_from_timestamp(
         payload.attempt_started_at or payload.processor_enqueued_at,
         invocation_started_at,
@@ -1105,6 +1503,9 @@ def process_hosted_job(payload: WorkerJobRequest, *, raise_on_error: bool = Fals
             "pose_backend": pose_backend,
             "mask_backend": mask_backend,
             "skip_densepose": skip_densepose,
+            "parallel_pose_densepose": parallel_pose_densepose,
+            "parallel_post_fusion": parallel_post_fusion,
+            **inline_mask_settings,
             "attempt_timing_available": has_attempt_timing,
         },
         sequence_start=max(100, payload.telemetry_sequence_start or 100),
@@ -1113,6 +1514,12 @@ def process_hosted_job(payload: WorkerJobRequest, *, raise_on_error: bool = Fals
         ),
     )
     try:
+        speed_profile_status = _speed_profile_status()
+        if speed_profile_status["active"] and not speed_profile_status["ready"]:
+            reasons = "; ".join(speed_profile_status["reasons"])
+            raise RuntimeError(
+                f"Speed profile {speed_profile_status['profile']!r} is not ready: {reasons}"
+            )
         _post_worker_report_best_effort(
             callback_base_url=payload.callback_base_url,
             run_id=payload.run_id,
@@ -1170,6 +1577,9 @@ def process_hosted_job(payload: WorkerJobRequest, *, raise_on_error: bool = Fals
             mask_backend=mask_backend,
             mask_quality_mode=os.getenv("WHODOIRUNLIKE_MASK_QUALITY_MODE", "native"),
             skip_densepose=skip_densepose,
+            parallel_pose_densepose=parallel_pose_densepose,
+            parallel_post_fusion=parallel_post_fusion,
+            **inline_mask_settings,
             telemetry=telemetry,
         )
         with telemetry.stage("analysis_complete"):

@@ -46,6 +46,5 @@ jobs:
           build-args: |
             WHODOIRUNLIKE_PROCESSOR_VERSION=${{ github.sha }}
           tags: |
-            ${{ env.IMAGE_NAME }}:latest
             ${{ env.IMAGE_NAME }}:${{ github.sha }}
           provenance: false

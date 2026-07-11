@@ -3,8 +3,9 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from statistics import mean
 from typing import Any, Callable, Iterable, Sequence
@@ -27,6 +28,7 @@ from whodoirunlike.video_io import make_browser_playable_mp4s
 MMPoseProgressCallback = Callable[[dict[str, Any]], None]
 MMPOSE_DEVICE_ENV = "MMPOSE_DEVICE"
 RTMW_RUNTIME_BACKEND_ENV = "RTMW_RUNTIME_BACKEND"
+MMPOSE_USE_DETECTOR_ENV = "MMPOSE_USE_DETECTOR"
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_RTMW_RUNTIME_BACKEND = "onnxruntime"
 YOLOX_M_HUMANART_ONNX = (
@@ -119,6 +121,24 @@ MMPOSE_MODEL_SPECS: dict[str, MMPoseModelSpec] = {
 DEFAULT_MMPOSE_BACKEND = "mmpose_rtmw_l_384"
 _MMPOSE_IMPORT_CHECKED = False
 _MMPOSE_IMPORT_ERROR: str | None = None
+_RTMLIB_MODEL_CACHE: dict[tuple[Any, ...], Any] = {}
+_RTMLIB_MODEL_CACHE_LOCK = threading.RLock()
+
+
+@dataclass
+class _LockedRTMLibModel:
+    model: Any
+    inference_lock: threading.RLock = field(
+        default_factory=threading.RLock,
+        repr=False,
+    )
+
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        with self.inference_lock:
+            return self.model(*args, **kwargs)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.model, name)
 
 COCO_WHOLEBODY_NAMES = [
     "nose",
@@ -214,6 +234,13 @@ def mmpose_model_spec(model_id: str | None = None) -> MMPoseModelSpec:
     return MMPOSE_MODEL_SPECS[model_id]
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
 def mmpose_setup_status(model_id: str | None = None) -> dict[str, Any]:
     global _MMPOSE_IMPORT_CHECKED, _MMPOSE_IMPORT_ERROR
 
@@ -245,6 +272,7 @@ def mmpose_setup_status(model_id: str | None = None) -> dict[str, Any]:
     device = os.environ.get(MMPOSE_DEVICE_ENV, "cpu").strip() or "cpu"
     runtime_backend = os.environ.get(RTMW_RUNTIME_BACKEND_ENV, DEFAULT_RTMW_RUNTIME_BACKEND).strip()
     runtime_backend = runtime_backend or DEFAULT_RTMW_RUNTIME_BACKEND
+    use_detector = _env_bool(MMPOSE_USE_DETECTOR_ENV, True)
     return {
         "ready": not reasons,
         "reasons": reasons,
@@ -253,6 +281,7 @@ def mmpose_setup_status(model_id: str | None = None) -> dict[str, Any]:
         "family": spec.family,
         "runtime": "rtmlib",
         "runtime_backend": runtime_backend,
+        "use_detector": use_detector,
         "detector_url": spec.detector_url,
         "pose_url": spec.pose_url,
         "detector_input_size": list(spec.detector_input_size),
@@ -265,6 +294,7 @@ def mmpose_setup_status(model_id: str | None = None) -> dict[str, Any]:
         "env": {
             "device": MMPOSE_DEVICE_ENV,
             "runtime_backend": RTMW_RUNTIME_BACKEND_ENV,
+            "use_detector": MMPOSE_USE_DETECTOR_ENV,
         },
         "dependencies": dependencies,
     }
@@ -515,7 +545,7 @@ def select_mmpose_prediction(
             best_iou = mask_iou
             best_score = score
 
-    if best_prediction is None and fallback:
+    if best_prediction is None and mask_bbox is None and fallback:
         best_index, best_prediction, best_bbox, best_iou = fallback
     return best_index, best_prediction, best_bbox, best_iou
 
@@ -696,6 +726,7 @@ def summarize_mmpose_pose(
                 RTMW_RUNTIME_BACKEND_ENV, DEFAULT_RTMW_RUNTIME_BACKEND
             ).strip()
             or DEFAULT_RTMW_RUNTIME_BACKEND,
+            "use_detector": _env_bool(MMPOSE_USE_DETECTOR_ENV, True),
             "family": spec.family,
             "label": spec.label,
             "detector_url": spec.detector_url,
@@ -728,6 +759,7 @@ def update_manifest_after_mmpose_pose(
     raw_mmpose_landmarks_path: Path,
     skeleton_render_path: Path,
     qa_overlay_path: Path,
+    qa_overlay_key: str,
     features_path: Path,
     result: dict[str, Any],
 ) -> None:
@@ -738,7 +770,7 @@ def update_manifest_after_mmpose_pose(
     paths["pose_landmarks"] = str(pose_landmarks_path)
     paths["mmpose_landmarks"] = str(raw_mmpose_landmarks_path)
     paths["skeleton_render"] = str(skeleton_render_path)
-    paths["qa_overlay"] = str(qa_overlay_path)
+    paths[qa_overlay_key] = str(qa_overlay_path)
     paths["features"] = str(features_path)
     quality = result.get("quality", {})
     manifest.setdefault("stages", {}).setdefault("pose", {}).pop("error", None)
@@ -759,7 +791,7 @@ def update_manifest_after_mmpose_pose(
             "renders": {
                 "status": "partial_complete",
                 "skeleton_render": str(skeleton_render_path),
-                "qa_overlay": str(qa_overlay_path),
+                qa_overlay_key: str(qa_overlay_path),
             },
             "features": {"status": "complete", "output": str(features_path)},
         },
@@ -783,20 +815,51 @@ def build_rtmlib_model(
     *,
     device: str,
     runtime_backend: str,
+    use_detector: bool | None = None,
+    cache_enabled: bool = True,
 ) -> Any:
-    from rtmlib import Custom
-
-    return Custom(
-        det_class="YOLOX",
-        det=spec.detector_url,
-        det_input_size=spec.detector_input_size,
-        pose_class="RTMPose",
-        pose=spec.pose_url,
-        pose_input_size=spec.pose_input_size,
-        to_openpose=False,
-        backend=runtime_backend,
-        device=device,
+    detector_enabled = (
+        _env_bool(MMPOSE_USE_DETECTOR_ENV, True)
+        if use_detector is None
+        else bool(use_detector)
     )
+    key = (
+        spec.id,
+        spec.detector_url if detector_enabled else None,
+        spec.pose_url,
+        spec.detector_input_size,
+        spec.pose_input_size,
+        str(runtime_backend),
+        str(device),
+        detector_enabled,
+    )
+    with _RTMLIB_MODEL_CACHE_LOCK:
+        if cache_enabled and key in _RTMLIB_MODEL_CACHE:
+            return _RTMLIB_MODEL_CACHE[key]
+
+        from rtmlib import Custom
+
+        model = _LockedRTMLibModel(
+            Custom(
+                det_class="YOLOX" if detector_enabled else None,
+                det=spec.detector_url if detector_enabled else None,
+                det_input_size=spec.detector_input_size,
+                pose_class="RTMPose",
+                pose=spec.pose_url,
+                pose_input_size=spec.pose_input_size,
+                to_openpose=False,
+                backend=runtime_backend,
+                device=device,
+            )
+        )
+        if cache_enabled:
+            _RTMLIB_MODEL_CACHE[key] = model
+        return model
+
+
+def clear_rtmlib_model_cache() -> None:
+    with _RTMLIB_MODEL_CACHE_LOCK:
+        _RTMLIB_MODEL_CACHE.clear()
 
 
 def process_mmpose_video(
@@ -811,6 +874,7 @@ def process_mmpose_video(
     spec: MMPoseModelSpec,
     device: str,
     runtime_backend: str = DEFAULT_RTMW_RUNTIME_BACKEND,
+    normalize_qa_overlay: bool = True,
     progress_callback: MMPoseProgressCallback | None = None,
 ) -> dict[str, Any]:
     started_at = time.monotonic()
@@ -880,8 +944,11 @@ def process_mmpose_video(
             mask = _mask_frame(mask_capture, width, height)
             crop_frame, crop = _crop_target_frame(source_frame, mask)
             mask_bbox = _mask_bbox(mask)
-            keypoints, scores = model(crop_frame)
-            predictions = rtmlib_arrays_to_predictions(keypoints, scores)
+            if mask_bbox is None:
+                predictions: list[dict[str, Any]] = []
+            else:
+                keypoints, scores = model(crop_frame)
+                predictions = rtmlib_arrays_to_predictions(keypoints, scores)
             selected_index, selected, bbox, mask_iou = select_mmpose_prediction(
                 predictions,
                 crop=crop,
@@ -896,7 +963,13 @@ def process_mmpose_video(
                 "frame_height": height,
                 "detected": bool(predictions),
                 "usable": selected is not None,
-                "drop_reason": None if selected is not None else "rtmw_missing_or_off_mask",
+                "drop_reason": (
+                    None
+                    if selected is not None
+                    else "runner_mask_missing_or_empty"
+                    if mask_bbox is None
+                    else "rtmw_missing_or_off_mask"
+                ),
                 "selected_pose_index": selected_index,
                 "candidate_count": len(predictions),
                 "mask_iou": round(mask_iou, 4),
@@ -956,7 +1029,10 @@ def process_mmpose_video(
                 elapsed_seconds=time.monotonic() - started_at,
             )
         )
-    make_browser_playable_mp4s([skeleton_render_path, qa_overlay_path])
+    browser_outputs = [skeleton_render_path]
+    if normalize_qa_overlay:
+        browser_outputs.append(qa_overlay_path)
+    make_browser_playable_mp4s(browser_outputs)
     if progress_callback:
         progress_callback(
             build_pose_progress(
@@ -985,6 +1061,7 @@ def run_mmpose_pose(
     run_dir: Path,
     model_id: str = DEFAULT_MMPOSE_BACKEND,
     device: str | None = None,
+    isolate_qa_overlay: bool = False,
     progress_callback: MMPoseProgressCallback | None = None,
 ) -> dict[str, Any]:
     started_at = time.monotonic()
@@ -998,7 +1075,8 @@ def run_mmpose_pose(
     raw_mmpose_landmarks_path = run.artifact_path("mmpose_landmarks", manifest)
     pose_landmarks_path = run.artifact_path("pose_landmarks", manifest)
     skeleton_render_path = run.artifact_path("skeleton_render", manifest)
-    qa_overlay_path = run.artifact_path("qa_overlay", manifest)
+    qa_overlay_key = "pose_qa_overlay" if isolate_qa_overlay else "qa_overlay"
+    qa_overlay_path = run.artifact_path(qa_overlay_key, manifest)
     features_path = run.artifact_path("features", manifest)
 
     if not setup["ready"]:
@@ -1028,6 +1106,7 @@ def run_mmpose_pose(
             spec=spec,
             device=device or str(setup["device"]),
             runtime_backend=str(setup.get("runtime_backend") or DEFAULT_RTMW_RUNTIME_BACKEND),
+            normalize_qa_overlay=not isolate_qa_overlay,
             progress_callback=progress_callback,
         )
         update_manifest_after_mmpose_pose(
@@ -1037,6 +1116,7 @@ def run_mmpose_pose(
             raw_mmpose_landmarks_path=raw_mmpose_landmarks_path,
             skeleton_render_path=skeleton_render_path,
             qa_overlay_path=qa_overlay_path,
+            qa_overlay_key=qa_overlay_key,
             features_path=features_path,
             result=result,
         )

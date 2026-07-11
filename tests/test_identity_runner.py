@@ -1,19 +1,103 @@
 from __future__ import annotations
 
 import json
+import sys
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from types import ModuleType
 
 import cv2
 import numpy as np
 import pyarrow.parquet as pq
 import pytest
 
-from whodoirunlike import identity_runner
+from whodoirunlike import identity_runner, inline_segmentation
 from whodoirunlike.identity_runner import (
     canonical_identity_backend,
     prompt_initial_box,
     run_identity_tracking,
 )
+
+
+def test_yolo_model_cache_reuses_and_serializes_mutable_predictor(monkeypatch) -> None:
+    state_lock = threading.Lock()
+    active = 0
+    peak = 0
+    builds = 0
+    fake_ultralytics = ModuleType("ultralytics")
+
+    class Model:
+        task = "segment"
+
+        def predict(self, *_args: object, **_kwargs: object) -> list[object]:
+            nonlocal active, peak
+            with state_lock:
+                active += 1
+                peak = max(peak, active)
+            time.sleep(0.02)
+            with state_lock:
+                active -= 1
+            return []
+
+    def yolo(_model: str) -> Model:
+        nonlocal builds
+        builds += 1
+        return Model()
+
+    fake_ultralytics.YOLO = yolo  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "ultralytics", fake_ultralytics)
+    identity_runner.clear_yolo_model_cache()
+    try:
+        first = identity_runner._load_yolo_model("yolo26n-seg.pt")
+        second = identity_runner._load_yolo_model("yolo26n-seg.pt")
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            list(executor.map(lambda _: first.predict(np.zeros((8, 8, 3))), range(2)))
+    finally:
+        identity_runner.clear_yolo_model_cache()
+
+    assert first is second
+    assert builds == 1
+    assert peak == 1
+    assert first.task == "segment"
+
+
+def test_inline_yolo_requests_masks_in_original_frame_coordinates() -> None:
+    calls: list[dict[str, object]] = []
+
+    class Result:
+        boxes = None
+
+    class Model:
+        def predict(self, _frame: np.ndarray, **kwargs: object) -> list[Result]:
+            calls.append(kwargs)
+            return [Result()]
+
+    frame = np.zeros((54, 96, 3), dtype=np.uint8)
+    identity_runner._run_yolo_person_inference(
+        Model(),
+        frame,
+        device="cpu",
+        confidence=0.25,
+        iou=0.7,
+        imgsz=96,
+        mask_threshold=0.5,
+        include_masks=True,
+    )
+    identity_runner._run_yolo_person_inference(
+        Model(),
+        frame,
+        device="cpu",
+        confidence=0.25,
+        iou=0.7,
+        imgsz=96,
+        mask_threshold=0.5,
+        include_masks=False,
+    )
+
+    assert calls[0]["retina_masks"] is True
+    assert "retina_masks" not in calls[1]
 
 
 def write_identity_video(path: Path) -> None:
@@ -207,6 +291,21 @@ def test_canonical_identity_backend_accepts_plan_aliases() -> None:
     assert canonical_identity_backend("template") == "prompt_template_tracker_v1"
 
 
+def test_inline_segmentation_requires_boxmot_identity_backend(tmp_path: Path) -> None:
+    run_dir = tmp_path / "cv_runs" / "identity-clip"
+    run_dir.mkdir(parents=True)
+    write_identity_run(run_dir)
+
+    with pytest.raises(ValueError, match="requires a BoxMOT identity backend"):
+        run_identity_tracking(
+            run_dir=run_dir,
+            backend="prompt_template_tracker_v1",
+            inline_segmentation=True,
+        )
+
+    assert not (run_dir / "runner_mask.mp4").exists()
+
+
 class FakeBoxes:
     def __init__(self, frame_index: int) -> None:
         x = 22 + frame_index
@@ -236,6 +335,681 @@ class FakeBoxmotTracker:
             return np.empty((0, 8), dtype=np.float32)
         det = detections[0]
         return np.array([[det[0], det[1], det[2], det[3], 7, det[4], 0, 0]], dtype=np.float32)
+
+
+class UnifiedSegmentationBoxes:
+    def __init__(self, frame_index: int) -> None:
+        target_x = 22 + frame_index
+        self.xyxy = np.array(
+            [[target_x, 18, target_x + 14, 48], [60, 18, 74, 48]],
+            dtype=np.float32,
+        )
+        self.conf = np.array([0.94, 0.93], dtype=np.float32)
+        self.cls = np.array([0, 0], dtype=np.float32)
+
+
+class UnifiedSegmentationMasks:
+    def __init__(self, frame_index: int) -> None:
+        target_x = 22 + frame_index
+        data = np.zeros((2, 64, 96), dtype=np.float32)
+        data[0, 18:49, target_x : target_x + 15] = 1.0
+        data[1, 18:49, 60:75] = 1.0
+        self.data = data
+
+
+class UnifiedSegmentationResult:
+    def __init__(self, frame_index: int) -> None:
+        self.boxes = UnifiedSegmentationBoxes(frame_index)
+        self.masks = UnifiedSegmentationMasks(frame_index)
+
+
+class UnifiedSegmentationYolo:
+    def __init__(self) -> None:
+        self.frame_index = 0
+        self.predict_calls = 0
+
+    def predict(self, frame: np.ndarray, **kwargs: object) -> list[UnifiedSegmentationResult]:
+        result = UnifiedSegmentationResult(self.frame_index)
+        self.frame_index += 1
+        self.predict_calls += 1
+        return [result]
+
+
+class UnifiedSegmentationTracker:
+    def update(self, detections: np.ndarray, frame: np.ndarray) -> np.ndarray:
+        rows = [
+            [*detections[0, :4], 7, detections[0, 4], 0, 0],
+            [*detections[1, :4], 8, detections[1, 4], 0, 1],
+        ]
+        return np.asarray(rows, dtype=np.float32)
+
+
+class ExplosiveMaskTensor:
+    @property
+    def data(self) -> np.ndarray:
+        raise AssertionError("detector-only mode must not transfer segmentation tensors")
+
+
+class DetectorOnlyResult:
+    def __init__(self, frame_index: int) -> None:
+        self.boxes = FakeBoxes(frame_index)
+        self.masks = ExplosiveMaskTensor()
+
+
+class DetectorOnlyYolo:
+    def __init__(self) -> None:
+        self.frame_index = 0
+
+    def predict(self, frame: np.ndarray, **kwargs: object) -> list[DetectorOnlyResult]:
+        result = DetectorOnlyResult(self.frame_index)
+        self.frame_index += 1
+        return [result]
+
+
+def test_boxmot_detector_only_mode_does_not_read_segmentation_tensors(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_dir = tmp_path / "cv_runs" / "identity-clip"
+    run_dir.mkdir(parents=True)
+    write_identity_run(run_dir)
+
+    monkeypatch.setattr(
+        identity_runner,
+        "identity_setup_status",
+        lambda backend=None: {"ready": True, "reasons": [], "install_command": None},
+    )
+    monkeypatch.setattr(
+        identity_runner,
+        "_load_yolo_model",
+        lambda detector_model: DetectorOnlyYolo(),
+    )
+    monkeypatch.setattr(
+        identity_runner,
+        "_create_boxmot_tracker",
+        lambda backend, reid_weights, device, half: FakeBoxmotTracker(),
+    )
+
+    result = run_identity_tracking(run_dir=run_dir, backend="boxmot_botsort", device="cpu")
+
+    assert result["status"] == "complete"
+    assert result["inline_mask"] is None
+    assert not (run_dir / "runner_mask.mp4").exists()
+
+
+def test_inline_segmentation_fails_when_model_produces_no_masks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_dir = tmp_path / "cv_runs" / "identity-clip"
+    run_dir.mkdir(parents=True)
+    write_identity_run(run_dir)
+
+    monkeypatch.setattr(
+        identity_runner,
+        "identity_setup_status",
+        lambda backend=None: {"ready": True, "reasons": [], "install_command": None},
+    )
+    monkeypatch.setattr(identity_runner, "_load_yolo_model", lambda detector_model: FakeYolo())
+    monkeypatch.setattr(
+        identity_runner,
+        "_create_boxmot_tracker",
+        lambda backend, reid_weights, device, half: FakeBoxmotTracker(),
+    )
+
+    with pytest.raises(RuntimeError, match="did not produce any person segmentation masks"):
+        run_identity_tracking(
+            run_dir=run_dir,
+            backend="boxmot_botsort",
+            detector_model="yolo11n.pt",
+            device="cpu",
+            inline_segmentation=True,
+        )
+
+    assert not (run_dir / "runner_mask.mp4").exists()
+
+
+class OffTrackSegmentationYolo(UnifiedSegmentationYolo):
+    def predict(self, frame: np.ndarray, **kwargs: object) -> list[UnifiedSegmentationResult]:
+        results = super().predict(frame, **kwargs)
+        if self.frame_index - 1 == 4:
+            target_mask = results[0].masks.data[0]
+            target_mask.fill(0)
+            target_mask[0:10, 0:10] = 1.0
+        return results
+
+
+class SeveralOffTrackSegmentationYolo(UnifiedSegmentationYolo):
+    def predict(self, frame: np.ndarray, **kwargs: object) -> list[UnifiedSegmentationResult]:
+        results = super().predict(frame, **kwargs)
+        if self.frame_index - 1 in {4, 5, 6}:
+            target_mask = results[0].masks.data[0]
+            target_mask.fill(0)
+            target_mask[0:10, 0:10] = 1.0
+        return results
+
+
+class AreaJumpSegmentationYolo(UnifiedSegmentationYolo):
+    def predict(self, frame: np.ndarray, **kwargs: object) -> list[UnifiedSegmentationResult]:
+        results = super().predict(frame, **kwargs)
+        if self.frame_index - 1 == 4:
+            target_x = 22 + (self.frame_index - 1)
+            target_mask = results[0].masks.data[0]
+            target_mask.fill(0)
+            target_mask[28:31, target_x + 5 : target_x + 8] = 1.0
+        return results
+
+
+def test_boxmot_identity_tracking_emits_selected_runner_mask_from_same_yolo_pass(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_dir = tmp_path / "cv_runs" / "identity-clip"
+    run_dir.mkdir(parents=True)
+    write_identity_run(run_dir)
+    write_switch_identity_video(run_dir / "source_segment.mp4")
+    detector = UnifiedSegmentationYolo()
+    progress_phases: list[str] = []
+
+    monkeypatch.setattr(
+        identity_runner,
+        "identity_setup_status",
+        lambda backend=None: {"ready": True, "reasons": [], "install_command": None},
+    )
+    monkeypatch.setattr(identity_runner, "_load_yolo_model", lambda detector_model: detector)
+    monkeypatch.setattr(
+        identity_runner,
+        "_create_boxmot_tracker",
+        lambda backend, reid_weights, device, half: UnifiedSegmentationTracker(),
+    )
+
+    result = run_identity_tracking(
+        run_dir=run_dir,
+        backend="boxmot_botsort",
+        detector_model="yolo26n-seg.pt",
+        device="cpu",
+        inline_segmentation=True,
+        inline_mask_dilation_pixels=2,
+        inline_mask_temporal_reset_gap_frames=7,
+        progress_callback=lambda payload: progress_phases.append(str(payload["phase"])),
+    )
+
+    assert detector.predict_calls == 18
+    assert result["metrics"]["target_track_id"] == 7
+    assert result["inline_mask"]["status"] == "complete"
+    assert result["inline_mask"]["summary"]["associated_frames"] == 18
+    assert result["inline_mask"]["summary"]["track_box_fallback_frames"] == 0
+    assert result["inline_mask"]["summary"]["dilation_pixels"] == 2
+    assert result["inline_mask"]["safety"]["temporal_reset_gap_frames"] == 7
+    assert result["inline_mask"]["timing"]["render_seconds"] >= 0
+    assert result["inline_mask"]["timing"]["encode_seconds"] >= 0
+    metadata_first = json.loads(
+        Path(result["inline_mask"]["metadata"]).read_text(encoding="utf-8").splitlines()[0]
+    )
+    assert metadata_first["mask_area"] > 465
+    assert metadata_first["usable"] is True
+    assert metadata_first["centroid"] is not None
+    assert metadata_first["centroid_delta_px"] is None
+
+    mask_summary = result["inline_mask"]["summary"]
+    assert result["inline_mask"]["mask_summary"] == mask_summary
+    assert mask_summary["fps"] == 10.0
+    assert mask_summary["width"] == 96
+    assert mask_summary["height"] == 64
+    assert mask_summary["output_path"] == result["inline_mask"]["masks_jsonl"]
+    assert mask_summary["mean_mask_churn"] == pytest.approx(
+        1.0 - mask_summary["mean_temporal_iou"],
+        abs=1e-6,
+    )
+
+    mask_capture = cv2.VideoCapture(result["inline_mask"]["runner_mask"])
+    ok, mask_frame = mask_capture.read()
+    mask_capture.release()
+    assert ok
+    mask = cv2.cvtColor(mask_frame, cv2.COLOR_BGR2GRAY)
+    assert int(mask[30, 28]) > 20
+    assert int(mask[30, 67]) < 20
+
+    manifest = json.loads((run_dir / "cv_run_manifest.json").read_text(encoding="utf-8"))
+    assert manifest["stages"]["whole_runner_mask"]["status"] == "complete"
+    assert manifest["stages"]["whole_runner_mask"]["backend"] == "yolo26n_seg_inline"
+    assert manifest["stages"]["whole_runner_mask"]["mask_summary"] == mask_summary
+    assert manifest["paths"]["runner_mask"] == result["inline_mask"]["runner_mask"]
+    assert manifest["paths"]["masks_jsonl"] == result["inline_mask"]["masks_jsonl"]
+    phase_order = [
+        "detect_track",
+        "postprocessing",
+        "rendering_inline_mask",
+        "encoding_inline_mask",
+        "writing_inline_mask_outputs",
+        "completed",
+    ]
+    assert [
+        next(index for index, phase in enumerate(progress_phases) if phase == expected)
+        for expected in phase_order
+    ] == sorted(
+        next(index for index, phase in enumerate(progress_phases) if phase == expected)
+        for expected in phase_order
+    )
+
+
+def test_inline_segmentation_can_defer_browser_encoding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_dir = tmp_path / "cv_runs" / "identity-clip"
+    run_dir.mkdir(parents=True)
+    write_identity_run(run_dir)
+    write_switch_identity_video(run_dir / "source_segment.mp4")
+    progress_phases: list[str] = []
+
+    monkeypatch.setattr(
+        identity_runner,
+        "identity_setup_status",
+        lambda backend=None: {"ready": True, "reasons": [], "install_command": None},
+    )
+    monkeypatch.setattr(
+        identity_runner,
+        "_load_yolo_model",
+        lambda detector_model: UnifiedSegmentationYolo(),
+    )
+    monkeypatch.setattr(
+        identity_runner,
+        "_create_boxmot_tracker",
+        lambda backend, reid_weights, device, half: UnifiedSegmentationTracker(),
+    )
+    monkeypatch.setattr(
+        inline_segmentation,
+        "make_browser_playable_mp4s",
+        lambda paths: pytest.fail(f"browser encoding unexpectedly ran for {list(paths)}"),
+    )
+
+    result = run_identity_tracking(
+        run_dir=run_dir,
+        backend="boxmot_botsort",
+        detector_model="yolo26n-seg.pt",
+        device="cpu",
+        inline_segmentation=True,
+        inline_mask_defer_browser_encoding=True,
+        progress_callback=lambda payload: progress_phases.append(str(payload["phase"])),
+    )
+
+    inline_mask = result["inline_mask"]
+    expected_paths = [
+        inline_mask["runner_mask"],
+        inline_mask["masked_runner"],
+        inline_mask["qa_overlay"],
+    ]
+    assert inline_mask["deferred_browser_encoding"] == {
+        "required": True,
+        "paths": expected_paths,
+    }
+    assert all(Path(path).is_file() for path in expected_paths)
+    assert "encoding_inline_mask" not in progress_phases
+
+    manifest = json.loads((run_dir / "cv_run_manifest.json").read_text(encoding="utf-8"))
+    assert manifest["stages"]["whole_runner_mask"]["deferred_browser_encoding"] == {
+        "required": True,
+        "paths": expected_paths,
+    }
+
+
+def test_inline_segmentation_blanks_severe_off_track_mask_and_recommends_sam(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_dir = tmp_path / "cv_runs" / "identity-clip"
+    run_dir.mkdir(parents=True)
+    write_identity_run(run_dir)
+    write_switch_identity_video(run_dir / "source_segment.mp4")
+
+    monkeypatch.setattr(
+        identity_runner,
+        "identity_setup_status",
+        lambda backend=None: {"ready": True, "reasons": [], "install_command": None},
+    )
+    monkeypatch.setattr(
+        identity_runner,
+        "_load_yolo_model",
+        lambda detector_model: OffTrackSegmentationYolo(),
+    )
+    monkeypatch.setattr(
+        identity_runner,
+        "_create_boxmot_tracker",
+        lambda backend, reid_weights, device, half: UnifiedSegmentationTracker(),
+    )
+
+    result = run_identity_tracking(
+        run_dir=run_dir,
+        backend="boxmot_botsort",
+        detector_model="yolo26n-seg.pt",
+        device="cpu",
+        inline_segmentation=True,
+        inline_mask_dilation_pixels=0,
+    )
+
+    inline_mask = result["inline_mask"]
+    fallback = inline_mask["fallback"]
+    assert fallback == {
+        "used": False,
+        "frame_indexes": [],
+        "reasons": {"segmentation_mask_off_track": 1},
+        "sam_fallback_recommended": True,
+    }
+    assert inline_mask["summary"]["track_box_fallback_frames"] == 0
+    assert inline_mask["summary"]["rejected_segmentation_frames"] == 1
+    assert inline_mask["summary"]["severe_rejection_frames"] == 1
+    assert inline_mask["summary"]["sam_fallback_recommended"] is True
+    metadata_rows = [
+        json.loads(line)
+        for line in Path(inline_mask["metadata"]).read_text(encoding="utf-8").splitlines()
+    ]
+    assert metadata_rows[4]["source"] == "blank"
+    assert metadata_rows[4]["mask_area"] == 0
+    assert metadata_rows[4]["usable"] is False
+    assert metadata_rows[4]["fallback_reason"] == "segmentation_mask_off_track"
+
+
+def test_inline_segmentation_recommends_sam_when_rejected_masks_are_not_box_filled(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_dir = tmp_path / "cv_runs" / "identity-clip"
+    run_dir.mkdir(parents=True)
+    write_identity_run(run_dir)
+    write_switch_identity_video(run_dir / "source_segment.mp4")
+
+    monkeypatch.setattr(
+        identity_runner,
+        "identity_setup_status",
+        lambda backend=None: {"ready": True, "reasons": [], "install_command": None},
+    )
+    monkeypatch.setattr(
+        identity_runner,
+        "_load_yolo_model",
+        lambda detector_model: SeveralOffTrackSegmentationYolo(),
+    )
+    monkeypatch.setattr(
+        identity_runner,
+        "_create_boxmot_tracker",
+        lambda backend, reid_weights, device, half: UnifiedSegmentationTracker(),
+    )
+
+    result = run_identity_tracking(
+        run_dir=run_dir,
+        backend="boxmot_botsort",
+        detector_model="yolo26n-seg.pt",
+        device="cpu",
+        inline_segmentation=True,
+        inline_mask_dilation_pixels=0,
+        inline_mask_fallback_to_track_box=False,
+    )
+
+    summary = result["inline_mask"]["summary"]
+    assert summary["track_box_fallback_frames"] == 0
+    assert summary["rejected_segmentation_frames"] == 3
+    assert summary["degraded_mask_frames"] == 3
+    assert summary["sam_fallback_recommended"] is True
+
+
+def test_inline_segmentation_rejects_temporally_implausible_area_jump(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_dir = tmp_path / "cv_runs" / "identity-clip"
+    run_dir.mkdir(parents=True)
+    write_identity_run(run_dir)
+    write_switch_identity_video(run_dir / "source_segment.mp4")
+
+    monkeypatch.setattr(
+        identity_runner,
+        "identity_setup_status",
+        lambda backend=None: {"ready": True, "reasons": [], "install_command": None},
+    )
+    monkeypatch.setattr(
+        identity_runner,
+        "_load_yolo_model",
+        lambda detector_model: AreaJumpSegmentationYolo(),
+    )
+    monkeypatch.setattr(
+        identity_runner,
+        "_create_boxmot_tracker",
+        lambda backend, reid_weights, device, half: UnifiedSegmentationTracker(),
+    )
+
+    result = run_identity_tracking(
+        run_dir=run_dir,
+        backend="boxmot_botsort",
+        detector_model="yolo26n-seg.pt",
+        device="cpu",
+        inline_segmentation=True,
+        inline_mask_dilation_pixels=0,
+    )
+
+    inline_mask = result["inline_mask"]
+    assert inline_mask["fallback"]["frame_indexes"] == [4]
+    assert inline_mask["fallback"]["reasons"] == {"segmentation_mask_area_jump": 1}
+    assert inline_mask["safety"]["temporal_rejection_frame_indexes"] == [4]
+
+
+def test_inline_segmentation_resets_temporal_baseline_after_configured_gap(
+    tmp_path: Path,
+) -> None:
+    frames = [np.zeros((64, 96, 3), dtype=np.uint8) for _ in range(6)]
+
+    def candidate(x: int) -> dict[str, object]:
+        mask = np.zeros((64, 96), dtype=np.uint8)
+        mask[18:49, x : x + 15] = 1
+        ok, encoded = cv2.imencode(".png", mask * 255)
+        assert ok
+        return {
+            "box": (x, 18, 15, 31),
+            "_identity_state": "usable",
+            "_inline_mask_png": encoded.tobytes(),
+            "_inline_mask_association_method": "tracker_detection_index",
+            "_inline_mask_detection_index": 0,
+            "_inline_mask_track_box_iou": 1.0,
+        }
+
+    result = inline_segmentation.write_selected_runner_mask_artifacts(
+        frames=frames,
+        fps=30.0,
+        target_candidates={0: candidate(4), 5: candidate(68)},
+        runner_mask_path=tmp_path / "runner_mask.mp4",
+        masked_runner_path=tmp_path / "masked_runner.mp4",
+        qa_overlay_path=tmp_path / "qa_overlay.mp4",
+        metadata_path=tmp_path / "runner_mask_metadata.jsonl",
+        masks_jsonl_path=tmp_path / "masks.jsonl",
+        model="yolo26n-seg.pt",
+        config=inline_segmentation.InlineMaskConfig(
+            dilation_pixels=0,
+            temporal_reset_gap_frames=2,
+        ),
+        browser_playable=False,
+    )
+
+    metadata_rows = [
+        json.loads(line)
+        for line in Path(result["metadata"]).read_text(encoding="utf-8").splitlines()
+    ]
+    assert metadata_rows[5]["source"] == "yolo_segmentation"
+    assert metadata_rows[5]["fallback_reason"] is None
+    assert metadata_rows[5]["temporal_frame_gap"] == 5
+    assert result["summary"]["associated_frames"] == 2
+    assert result["safety"]["temporal_baseline_reset_frame_indexes"] == [5]
+
+
+def test_inline_segmentation_recommends_sam_for_material_missing_target_gap(
+    tmp_path: Path,
+) -> None:
+    frames = [np.zeros((64, 96, 3), dtype=np.uint8) for _ in range(3)]
+
+    def candidate(x: int) -> dict[str, object]:
+        mask = np.zeros((64, 96), dtype=np.uint8)
+        mask[18:49, x : x + 15] = 1
+        ok, encoded = cv2.imencode(".png", mask * 255)
+        assert ok
+        return {
+            "box": (x, 18, 15, 31),
+            "_identity_state": "usable",
+            "_inline_mask_png": encoded.tobytes(),
+            "_inline_mask_track_box_iou": 1.0,
+        }
+
+    result = inline_segmentation.write_selected_runner_mask_artifacts(
+        frames=frames,
+        fps=30.0,
+        target_candidates={0: candidate(4), 2: candidate(6)},
+        runner_mask_path=tmp_path / "runner_mask.mp4",
+        masked_runner_path=tmp_path / "masked_runner.mp4",
+        qa_overlay_path=tmp_path / "qa_overlay.mp4",
+        metadata_path=tmp_path / "runner_mask_metadata.jsonl",
+        masks_jsonl_path=tmp_path / "masks.jsonl",
+        model="yolo26n-seg.pt",
+        config=inline_segmentation.InlineMaskConfig(dilation_pixels=0),
+        browser_playable=False,
+    )
+
+    summary = result["summary"]
+    assert summary["missing_target_frames"] == 1
+    assert summary["missing_target_rate"] == pytest.approx(1 / 3, abs=1e-6)
+    assert summary["maximum_consecutive_missing_target_frames"] == 1
+    assert summary["sam_fallback_recommended"] is True
+
+
+def test_inline_segmentation_scales_temporal_motion_allowance_with_frame_gap(
+    tmp_path: Path,
+) -> None:
+    frames = [np.zeros((64, 96, 3), dtype=np.uint8) for _ in range(3)]
+
+    def candidate(x: int) -> dict[str, object]:
+        mask = np.zeros((64, 96), dtype=np.uint8)
+        mask[18:49, x : x + 15] = 1
+        ok, encoded = cv2.imencode(".png", mask * 255)
+        assert ok
+        return {
+            "box": (x, 18, 15, 31),
+            "_identity_state": "usable",
+            "_inline_mask_png": encoded.tobytes(),
+            "_inline_mask_track_box_iou": 1.0,
+        }
+
+    result = inline_segmentation.write_selected_runner_mask_artifacts(
+        frames=frames,
+        fps=30.0,
+        target_candidates={0: candidate(4), 2: candidate(44)},
+        runner_mask_path=tmp_path / "runner_mask.mp4",
+        masked_runner_path=tmp_path / "masked_runner.mp4",
+        qa_overlay_path=tmp_path / "qa_overlay.mp4",
+        metadata_path=tmp_path / "runner_mask_metadata.jsonl",
+        masks_jsonl_path=tmp_path / "masks.jsonl",
+        model="yolo26n-seg.pt",
+        config=inline_segmentation.InlineMaskConfig(
+            dilation_pixels=0,
+            temporal_reset_gap_frames=3,
+        ),
+        browser_playable=False,
+    )
+
+    metadata_rows = [
+        json.loads(line)
+        for line in Path(result["metadata"]).read_text(encoding="utf-8").splitlines()
+    ]
+    assert metadata_rows[2]["source"] == "yolo_segmentation"
+    assert metadata_rows[2]["fallback_reason"] is None
+    assert metadata_rows[2]["temporal_frame_gap"] == 2
+    assert result["safety"]["temporal_rejection_frame_indexes"] == []
+    assert result["safety"]["temporal_baseline_reset_frame_indexes"] == []
+
+
+def test_inline_segmentation_scales_area_change_allowance_with_frame_gap(
+    tmp_path: Path,
+) -> None:
+    frames = [np.zeros((64, 96, 3), dtype=np.uint8) for _ in range(3)]
+
+    def candidate(size: int) -> dict[str, object]:
+        x = 48 - size // 2
+        y = 32 - size // 2
+        mask = np.zeros((64, 96), dtype=np.uint8)
+        mask[y : y + size, x : x + size] = 1
+        ok, encoded = cv2.imencode(".png", mask * 255)
+        assert ok
+        return {
+            "box": (x, y, size, size),
+            "_identity_state": "usable",
+            "_inline_mask_png": encoded.tobytes(),
+            "_inline_mask_track_box_iou": 1.0,
+        }
+
+    result = inline_segmentation.write_selected_runner_mask_artifacts(
+        frames=frames,
+        fps=30.0,
+        target_candidates={0: candidate(5), 2: candidate(10)},
+        runner_mask_path=tmp_path / "runner_mask.mp4",
+        masked_runner_path=tmp_path / "masked_runner.mp4",
+        qa_overlay_path=tmp_path / "qa_overlay.mp4",
+        metadata_path=tmp_path / "runner_mask_metadata.jsonl",
+        masks_jsonl_path=tmp_path / "masks.jsonl",
+        model="yolo26n-seg.pt",
+        config=inline_segmentation.InlineMaskConfig(
+            dilation_pixels=0,
+            temporal_reset_gap_frames=3,
+        ),
+        browser_playable=False,
+    )
+
+    metadata_rows = [
+        json.loads(line)
+        for line in Path(result["metadata"]).read_text(encoding="utf-8").splitlines()
+    ]
+    assert metadata_rows[2]["source"] == "yolo_segmentation"
+    assert metadata_rows[2]["fallback_reason"] is None
+    assert metadata_rows[2]["area_change_ratio"] == 4.0
+    assert metadata_rows[2]["maximum_area_change_ratio"] == 6.0
+
+
+def test_inline_segmentation_blanks_severe_adjacent_centroid_jump(
+    tmp_path: Path,
+) -> None:
+    frames = [np.zeros((64, 96, 3), dtype=np.uint8) for _ in range(2)]
+
+    def candidate(x: int) -> dict[str, object]:
+        mask = np.zeros((64, 96), dtype=np.uint8)
+        mask[18:49, x : x + 15] = 1
+        ok, encoded = cv2.imencode(".png", mask * 255)
+        assert ok
+        return {
+            "box": (x, 18, 15, 31),
+            "_identity_state": "usable",
+            "_inline_mask_png": encoded.tobytes(),
+            "_inline_mask_track_box_iou": 1.0,
+        }
+
+    result = inline_segmentation.write_selected_runner_mask_artifacts(
+        frames=frames,
+        fps=30.0,
+        target_candidates={0: candidate(4), 1: candidate(68)},
+        runner_mask_path=tmp_path / "runner_mask.mp4",
+        masked_runner_path=tmp_path / "masked_runner.mp4",
+        qa_overlay_path=tmp_path / "qa_overlay.mp4",
+        metadata_path=tmp_path / "runner_mask_metadata.jsonl",
+        masks_jsonl_path=tmp_path / "masks.jsonl",
+        model="yolo26n-seg.pt",
+        config=inline_segmentation.InlineMaskConfig(dilation_pixels=0),
+        browser_playable=False,
+    )
+
+    metadata_rows = [
+        json.loads(line)
+        for line in Path(result["metadata"]).read_text(encoding="utf-8").splitlines()
+    ]
+    assert metadata_rows[1]["source"] == "blank"
+    assert metadata_rows[1]["fallback_reason"] == "segmentation_mask_centroid_jump"
+    assert metadata_rows[1]["usable"] is False
+    assert result["summary"]["severe_rejection_frames"] == 1
+    assert result["summary"]["track_box_fallback_frames"] == 0
+    assert result["summary"]["sam_fallback_recommended"] is True
+    assert result["safety"]["temporal_rejection_frame_indexes"] == [1]
 
 
 class SwitchFakeBoxes:
@@ -367,6 +1141,28 @@ class NearLookalikeGapFakeYolo:
         return [result]
 
 
+class NearLookalikeGapSegmentationResult(NearLookalikeGapFakeResult):
+    def __init__(self, frame_index: int) -> None:
+        super().__init__(frame_index)
+        boxes = self.boxes.xyxy
+        data = np.zeros((len(boxes), 64, 96), dtype=np.float32)
+        for index, (x1, y1, x2, y2) in enumerate(boxes.astype(int)):
+            data[index, y1 : y2 + 1, x1 : x2 + 1] = 1.0
+        self.masks = type("FakeMasks", (), {"data": data})()
+
+
+class NearLookalikeGapSegmentationYolo:
+    def __init__(self) -> None:
+        self.frame_index = 0
+
+    def predict(
+        self, frame: np.ndarray, **kwargs: object
+    ) -> list[NearLookalikeGapSegmentationResult]:
+        result = NearLookalikeGapSegmentationResult(self.frame_index)
+        self.frame_index += 1
+        return [result]
+
+
 class NearLookalikeGapFakeBoxmotTracker:
     def update(self, detections: np.ndarray, frame: np.ndarray) -> np.ndarray:
         if detections.size == 0:
@@ -437,7 +1233,9 @@ def test_boxmot_identity_tracking_recovers_when_tracker_id_switches(
         "identity_setup_status",
         lambda backend=None: {"ready": True, "reasons": [], "install_command": None},
     )
-    monkeypatch.setattr(identity_runner, "_load_yolo_model", lambda detector_model: SwitchFakeYolo())
+    monkeypatch.setattr(
+        identity_runner, "_load_yolo_model", lambda detector_model: SwitchFakeYolo()
+    )
     monkeypatch.setattr(
         identity_runner,
         "_create_boxmot_tracker",
@@ -520,7 +1318,9 @@ def test_boxmot_identity_tracking_rejects_impossible_lookalike_jump(
         "identity_setup_status",
         lambda backend=None: {"ready": True, "reasons": [], "install_command": None},
     )
-    monkeypatch.setattr(identity_runner, "_load_yolo_model", lambda detector_model: LookalikeFakeYolo())
+    monkeypatch.setattr(
+        identity_runner, "_load_yolo_model", lambda detector_model: LookalikeFakeYolo()
+    )
     monkeypatch.setattr(
         identity_runner,
         "_create_boxmot_tracker",
@@ -580,10 +1380,54 @@ def test_boxmot_identity_tracking_marks_missing_instead_of_near_lookalike_handof
     ]
     assert lookalike_target_rows == []
 
-    target_rows = {
-        int(row["frame_index"]): row
-        for row in track_rows
-        if row["is_target"]
-    }
+    target_rows = {int(row["frame_index"]): row for row in track_rows if row["is_target"]}
     assert target_rows[8]["track_id"] == 6
     assert target_rows[8]["identity_state"] == "identity_risk"
+
+
+def test_inline_segmentation_blanks_identity_risk_without_box_fallback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_dir = tmp_path / "cv_runs" / "identity-clip"
+    run_dir.mkdir(parents=True)
+    write_identity_run(run_dir)
+    write_lookalike_jump_video(run_dir / "source_segment.mp4")
+
+    monkeypatch.setattr(
+        identity_runner,
+        "identity_setup_status",
+        lambda backend=None: {"ready": True, "reasons": [], "install_command": None},
+    )
+    monkeypatch.setattr(
+        identity_runner,
+        "_load_yolo_model",
+        lambda detector_model: NearLookalikeGapSegmentationYolo(),
+    )
+    monkeypatch.setattr(
+        identity_runner,
+        "_create_boxmot_tracker",
+        lambda backend, reid_weights, device, half: NearLookalikeGapFakeBoxmotTracker(),
+    )
+
+    result = run_identity_tracking(
+        run_dir=run_dir,
+        backend="boxmot_botsort",
+        detector_model="yolo26n-seg.pt",
+        device="cpu",
+        inline_segmentation=True,
+        inline_mask_dilation_pixels=0,
+    )
+
+    safety = result["inline_mask"]["safety"]
+    assert 8 in safety["identity_risk_blank_frame_indexes"]
+    assert result["inline_mask"]["summary"]["sam_fallback_recommended"] is True
+    assert result["inline_mask"]["fallback"]["sam_fallback_recommended"] is True
+    metadata_rows = [
+        json.loads(line)
+        for line in Path(result["inline_mask"]["metadata"]).read_text(encoding="utf-8").splitlines()
+    ]
+    assert metadata_rows[8]["identity_state"] == "identity_risk"
+    assert metadata_rows[8]["source"] == "blank"
+    assert metadata_rows[8]["fallback"] is False
+    assert metadata_rows[8]["mask_area"] == 0

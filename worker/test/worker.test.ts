@@ -115,6 +115,90 @@ describe("processing attempt boundaries", () => {
     ).toBeNull();
   });
 
+  it("exposes a ready overlay while the processing attempt remains nonterminal", async () => {
+    const job = await uploadClip();
+    const running = await postReport(job, {
+      status: "running",
+      progress: { phase: "uploading_artifacts" },
+    });
+    expect(running.status).toBe(200);
+
+    const acceptedArtifact = await exports.default.fetch(
+      `https://example.test/v1/jobs/${job.run_id}/artifacts/fused_overlay.mp4`,
+      {
+        method: "PUT",
+        headers: processorHeaders({
+          "Content-Type": "video/mp4",
+          "X-Processing-Attempt-Id": job.attempt_id,
+        }),
+        body: new Uint8Array([4, 5, 6]),
+      },
+    );
+    expect(acceptedArtifact.status).toBe(200);
+
+    const response = await exports.default.fetch(
+      `https://example.test/v1/jobs/${job.run_id}`,
+    );
+    const publicJob = await response.json<{
+      status: string;
+      result_ready?: boolean;
+      result_ready_at?: string | null;
+      artifacts: Record<string, { href: string }>;
+    }>();
+    expect(publicJob.status).toBe("running");
+    expect(publicJob.result_ready).toBe(true);
+    expect(publicJob.result_ready_at).toMatch(/^\d{4}-\d{2}-\d{2}T/);
+    expect(publicJob.artifacts["fused_overlay.mp4"].href).toBe(
+      `https://api.whodoirunlike.com/v1/artifacts/${job.run_id}/fused_overlay.mp4`,
+    );
+    const artifactResponse = await exports.default.fetch(
+      `https://example.test/v1/artifacts/${job.run_id}/fused_overlay.mp4`,
+    );
+    expect(artifactResponse.status).toBe(200);
+    expect(new Uint8Array(await artifactResponse.arrayBuffer())).toEqual(
+      new Uint8Array([4, 5, 6]),
+    );
+  });
+
+  it("does not expose an artifact recorded for another processing attempt", async () => {
+    const job = await uploadClip();
+    const staleAttemptId = crypto.randomUUID();
+    const artifactName = "fused_overlay.mp4";
+    const artifactKey = `artifacts/${job.run_id}/${staleAttemptId}/${artifactName}`;
+    await env.CLIPS.put(artifactKey, new Uint8Array([7, 8, 9]), {
+      httpMetadata: { contentType: "video/mp4" },
+    });
+
+    const record = await readInternalJob(job.run_id);
+    record.artifacts = {
+      [artifactName]: {
+        key: artifactKey,
+        attempt_id: staleAttemptId,
+        content_type: "video/mp4",
+        size_bytes: 3,
+        updated_at: new Date().toISOString(),
+      },
+    };
+    await env.CLIPS.put(`jobs/${job.run_id}.json`, JSON.stringify(record), {
+      httpMetadata: { contentType: "application/json; charset=utf-8" },
+    });
+
+    const jobResponse = await exports.default.fetch(
+      `https://example.test/v1/jobs/${job.run_id}`,
+    );
+    const publicJob = await jobResponse.json<{
+      result_ready: boolean;
+      artifacts: Record<string, { href: string }>;
+    }>();
+    expect(publicJob.result_ready).toBe(false);
+    expect(publicJob.artifacts).not.toHaveProperty(artifactName);
+
+    const artifactResponse = await exports.default.fetch(
+      `https://example.test/v1/artifacts/${job.run_id}/${artifactName}`,
+    );
+    expect(artifactResponse.status).toBe(404);
+  });
+
   it("moves current terminal telemetry through a safe public terminal state", async () => {
     const job = await uploadClip();
     const running = await postReport(job, {

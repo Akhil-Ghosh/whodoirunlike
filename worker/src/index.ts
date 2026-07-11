@@ -133,6 +133,7 @@ const DEFAULT_MAX_UPLOAD_BYTES = 75 * 1024 * 1024;
 const JSON_HEADERS = {
   "Content-Type": "application/json; charset=utf-8",
 };
+const RESULT_READY_ARTIFACT_NAME = "fused_overlay.mp4";
 
 export default {
   async fetch(request, env, ctx): Promise<Response> {
@@ -736,7 +737,7 @@ async function handleGetArtifact(
     return errorResponse(request, env, 404, "Job not found.");
   }
   const artifact = job.artifacts[artifactName];
-  if (!artifact) {
+  if (!artifact || !artifactBelongsToCurrentAttempt(job, artifact)) {
     return errorResponse(request, env, 404, "Artifact not found.");
   }
   const object = await env.CLIPS.get(artifact.key);
@@ -1024,16 +1025,23 @@ function runPodEndpointId(env: Env): string {
 }
 
 function publicJob(job: JobRecord, baseUrl: string): Record<string, unknown> {
+  const resultReadyArtifact = job.artifacts[RESULT_READY_ARTIFACT_NAME];
+  const resultReady = Boolean(
+    resultReadyArtifact &&
+    artifactBelongsToCurrentAttempt(job, resultReadyArtifact),
+  );
   const artifacts = Object.fromEntries(
-    Object.entries(job.artifacts).map(([name, artifact]) => [
-      name,
-      {
-        href: `${baseUrl}/v1/artifacts/${job.run_id}/${encodeURIComponent(name)}`,
-        content_type: artifact.content_type,
-        size_bytes: artifact.size_bytes,
-        updated_at: artifact.updated_at,
-      },
-    ]),
+    Object.entries(job.artifacts)
+      .filter(([, artifact]) => artifactBelongsToCurrentAttempt(job, artifact))
+      .map(([name, artifact]) => [
+        name,
+        {
+          href: `${baseUrl}/v1/artifacts/${job.run_id}/${encodeURIComponent(name)}`,
+          content_type: artifact.content_type,
+          size_bytes: artifact.size_bytes,
+          updated_at: artifact.updated_at,
+        },
+      ]),
   );
 
   return {
@@ -1046,6 +1054,8 @@ function publicJob(job: JobRecord, baseUrl: string): Record<string, unknown> {
     created_at: job.created_at,
     upload_completed_at: job.upload_completed_at ?? null,
     updated_at: job.updated_at,
+    result_ready: resultReady,
+    result_ready_at: resultReady ? resultReadyArtifact.updated_at : null,
     upload: {
       filename: job.upload.filename,
       content_type: job.upload.content_type,
@@ -1071,6 +1081,13 @@ function publicJob(job: JobRecord, baseUrl: string): Record<string, unknown> {
         : null,
     },
   };
+}
+
+function artifactBelongsToCurrentAttempt(
+  job: JobRecord,
+  artifact: ArtifactRecord,
+): boolean {
+  return Boolean(job.attempt_id && artifact.attempt_id === job.attempt_id);
 }
 
 type WorkerLifecycleDetails = Pick<

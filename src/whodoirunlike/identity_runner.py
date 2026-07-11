@@ -5,7 +5,8 @@ import time
 import importlib
 import importlib.util
 import inspect
-from dataclasses import dataclass
+import threading
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterable, Sequence
 
@@ -13,6 +14,14 @@ import cv2
 import numpy as np
 
 from whodoirunlike.cv_flow import read_json, utc_now_iso, write_json
+from whodoirunlike.inline_segmentation import (
+    INLINE_MASK_BACKEND,
+    InlineMaskConfig,
+    YoloPersonInference,
+    attach_segmentation_evidence,
+    parse_yolo_person_inference,
+    write_selected_runner_mask_artifacts,
+)
 from whodoirunlike.running_clip_run import RunningClipRun
 
 
@@ -41,6 +50,28 @@ BOXMOT_BACKEND_ALIASES = {
 DEFAULT_DETECTOR_MODEL = "yolo11n.pt"
 DEFAULT_REID_WEIGHTS = "osnet_x0_25_msmt17.pt"
 IdentityProgressCallback = Callable[[dict[str, Any]], None]
+_YOLO_MODEL_CACHE: dict[str, _LockedYoloModel] = {}
+_YOLO_MODEL_CACHE_LOCK = threading.RLock()
+
+
+@dataclass
+class _LockedYoloModel:
+    model: Any
+    inference_lock: threading.RLock = field(
+        default_factory=threading.RLock,
+        repr=False,
+    )
+
+    @property
+    def task(self) -> Any:
+        return getattr(self.model, "task", None)
+
+    def predict(self, *args: Any, **kwargs: Any) -> Any:
+        with self.inference_lock:
+            return self.model.predict(*args, **kwargs)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.model, name)
 
 
 def canonical_identity_backend(value: str | None) -> str:
@@ -168,7 +199,9 @@ def _selection(prompt: dict[str, Any]) -> dict[str, Any]:
     return selection
 
 
-def _normalized_box_to_pixels(box: dict[str, Any], width: int, height: int) -> tuple[int, int, int, int] | None:
+def _normalized_box_to_pixels(
+    box: dict[str, Any], width: int, height: int
+) -> tuple[int, int, int, int] | None:
     x = _clamp(float(box.get("x") or 0.0), 0.0, 1.0) * width
     y = _clamp(float(box.get("y") or 0.0), 0.0, 1.0) * height
     w = _clamp(float(box.get("width") or 0.0), 0.0, 1.0) * width
@@ -178,7 +211,9 @@ def _normalized_box_to_pixels(box: dict[str, Any], width: int, height: int) -> t
     return _clip_box((x, y, w, h), width, height)
 
 
-def prompt_initial_box(prompt: dict[str, Any], width: int, height: int) -> tuple[int, int, int, int]:
+def prompt_initial_box(
+    prompt: dict[str, Any], width: int, height: int
+) -> tuple[int, int, int, int]:
     selection = _selection(prompt)
     box = selection.get("box")
     if isinstance(box, dict):
@@ -272,14 +307,18 @@ def result_to_person_detections(result: Any, person_class_id: int = 0) -> np.nda
     if xyxy.size == 0:
         return np.empty((0, 6), dtype=np.float32)
     xyxy = xyxy.reshape((-1, 4))
-    confidence = _as_numpy(getattr(boxes, "conf", None)).astype(np.float32, copy=False).reshape((-1,))
+    confidence = (
+        _as_numpy(getattr(boxes, "conf", None)).astype(np.float32, copy=False).reshape((-1,))
+    )
     classes = _as_numpy(getattr(boxes, "cls", None)).astype(np.float32, copy=False).reshape((-1,))
     if confidence.shape[0] != xyxy.shape[0]:
         confidence = np.ones((xyxy.shape[0],), dtype=np.float32)
     if classes.shape[0] != xyxy.shape[0]:
         classes = np.zeros((xyxy.shape[0],), dtype=np.float32)
     detections = np.concatenate([xyxy, confidence[:, None], classes[:, None]], axis=1)
-    return detections[detections[:, 5].astype(int) == int(person_class_id)].astype(np.float32, copy=False)
+    return detections[detections[:, 5].astype(int) == int(person_class_id)].astype(
+        np.float32, copy=False
+    )
 
 
 def _xywh_to_xyxy(box: tuple[int, int, int, int]) -> tuple[float, float, float, float]:
@@ -565,7 +604,9 @@ def _track_direction(
 
     frame_index = start_index + step
     while 0 <= frame_index < len(frames):
-        matched_box, template_score = _match_next_box(previous_gray, gray_frames[frame_index], current_box)
+        matched_box, template_score = _match_next_box(
+            previous_gray, gray_frames[frame_index], current_box
+        )
         embedding = _hist_embedding(_crop(frames[frame_index], matched_box))
         similarity = _cosine_similarity(embedding, memory)
         state, reasons, memory_updated = _state_for_scores(
@@ -615,14 +656,31 @@ def _select_identity_device(device: str | None) -> str:
 
 
 def _load_yolo_model(detector_model: str) -> Any:
-    try:
-        from ultralytics import YOLO
-    except ModuleNotFoundError as exc:
-        raise RuntimeError(
-            f"YOLO person detection import failed; missing Python package: {exc.name}. Install with: "
-            'python -m pip install -e ".[mot]"'
-        ) from exc
-    return YOLO(detector_model)
+    model_value = str(detector_model).strip()
+    cache_key = (
+        model_value
+        if model_value.startswith(("http://", "https://"))
+        else str(Path(model_value).expanduser().resolve(strict=False))
+    )
+    with _YOLO_MODEL_CACHE_LOCK:
+        cached = _YOLO_MODEL_CACHE.get(cache_key)
+        if cached is not None:
+            return cached
+        try:
+            from ultralytics import YOLO
+        except ModuleNotFoundError as exc:
+            raise RuntimeError(
+                f"YOLO person detection import failed; missing Python package: {exc.name}. "
+                "Install with: " + 'python -m pip install -e ".[mot]"'
+            ) from exc
+        model = _LockedYoloModel(YOLO(detector_model))
+        _YOLO_MODEL_CACHE[cache_key] = model
+        return model
+
+
+def clear_yolo_model_cache() -> None:
+    with _YOLO_MODEL_CACHE_LOCK:
+        _YOLO_MODEL_CACHE.clear()
 
 
 def _create_boxmot_tracker(
@@ -673,6 +731,40 @@ def _run_yolo_person_detector(
     return result_to_person_detections(result)
 
 
+def _run_yolo_person_inference(
+    model: Any,
+    frame: np.ndarray,
+    *,
+    device: str,
+    confidence: float,
+    iou: float,
+    imgsz: int,
+    mask_threshold: float,
+    include_masks: bool,
+) -> YoloPersonInference:
+    kwargs: dict[str, Any] = {
+        "classes": [0],
+        "conf": float(confidence),
+        "iou": float(iou),
+        "imgsz": int(imgsz),
+        "verbose": False,
+    }
+    if device:
+        kwargs["device"] = device
+    if include_masks:
+        kwargs["retina_masks"] = True
+    results = model.predict(frame, **kwargs)
+    result = results[0] if isinstance(results, (list, tuple)) else results
+    height, width = frame.shape[:2]
+    return parse_yolo_person_inference(
+        result,
+        frame_height=height,
+        frame_width=width,
+        mask_threshold=mask_threshold,
+        include_masks=include_masks,
+    )
+
+
 def _parse_boxmot_tracks(
     tracks: Any,
     *,
@@ -696,6 +788,7 @@ def _parse_boxmot_tracks(
             continue
         confidence = float(row[5]) if row.shape[0] > 5 else None
         track_id = int(round(float(row[4])))
+        detection_index = int(round(float(row[7]))) if row.shape[0] > 7 else None
         parsed.append(
             {
                 "frame_index": int(frame_index),
@@ -703,6 +796,7 @@ def _parse_boxmot_tracks(
                 "box": box,
                 "box_xyxy": _xywh_to_xyxy(box),
                 "confidence": confidence,
+                "detection_index": detection_index,
             }
         )
     return parsed
@@ -834,7 +928,11 @@ def _normalized_anchor_from_prompt(
     subject_candidate = selection.get("subject_candidate")
     if isinstance(subject_candidate, dict):
         center = subject_candidate.get("center")
-        if isinstance(center, dict) and center.get("x") not in (None, "") and center.get("y") not in (None, ""):
+        if (
+            isinstance(center, dict)
+            and center.get("x") not in (None, "")
+            and center.get("y") not in (None, "")
+        ):
             return (
                 _clamp(float(center["x"]), 0.0, 1.0),
                 _clamp(float(center["y"]), 0.0, 1.0),
@@ -933,13 +1031,12 @@ def _dynamic_candidate_state(
 ) -> tuple[str, list[str], bool]:
     reasons: list[str] = []
     continuity_locked = (
-        same_track
-        and memory_similarity >= 0.74
-        and continuity_iou >= 0.55
-        and center_score >= 0.72
+        same_track and memory_similarity >= 0.74 and continuity_iou >= 0.55 and center_score >= 0.72
     )
-    same_track_recovery = same_track and appearance_similarity >= reid_recover and (
-        continuity_iou >= 0.08 or center_score >= 0.30
+    same_track_recovery = (
+        same_track
+        and appearance_similarity >= reid_recover
+        and (continuity_iou >= 0.08 or center_score >= 0.30)
     )
     handoff_recovery = (
         not same_track
@@ -979,7 +1076,11 @@ def _score_dynamic_candidate(
     prompt_similarity = _cosine_similarity(embedding, prompt_memory)
     memory_similarity = _cosine_similarity(embedding, memory)
     appearance_similarity = (0.72 * prompt_similarity) + (0.28 * memory_similarity)
-    frame_gap = max(1, abs(frame_index - int(previous_frame_index))) if previous_frame_index is not None else 1
+    frame_gap = (
+        max(1, abs(frame_index - int(previous_frame_index)))
+        if previous_frame_index is not None
+        else 1
+    )
     continuity_iou = _xywh_iou(candidate["box"], previous_box)
     center_score = _center_continuity_score(
         candidate_box=candidate["box"],
@@ -1001,14 +1102,14 @@ def _score_dynamic_candidate(
         )
     area_score = _area_similarity(candidate["box"], previous_box)
     confidence_score = _clamp(float(candidate.get("confidence") or 0.0), 0.0, 1.0)
-    same_track = 1.0 if previous_track_id is not None and int(candidate["track_id"]) == previous_track_id else 0.0
+    same_track = (
+        1.0
+        if previous_track_id is not None and int(candidate["track_id"]) == previous_track_id
+        else 0.0
+    )
     impossible_motion = previous_box is not None and (
         (continuity_iou < 0.03 and center_score < 0.25)
-        or (
-            not bool(same_track)
-            and continuity_iou < 0.30
-            and center_distance_ratio > 0.10
-        )
+        or (not bool(same_track) and continuity_iou < 0.30 and center_distance_ratio > 0.10)
     )
     score = (
         0.48 * prompt_similarity
@@ -1119,7 +1220,10 @@ def _select_dynamic_target_candidates(
                     reid_accept=reid_accept,
                     reid_recover=reid_recover,
                 )
-                if incumbent_state == "usable" and float(best["score"]) < float(incumbent["score"]) + 0.16:
+                if (
+                    incumbent_state == "usable"
+                    and float(best["score"]) < float(incumbent["score"]) + 0.16
+                ):
                     best = incumbent
             candidate = best["candidate"]
             state, reasons, memory_updated = _dynamic_candidate_state(
@@ -1161,9 +1265,11 @@ def _select_dynamic_target_candidates(
 def _same_candidate(a: dict[str, Any] | None, b: dict[str, Any]) -> bool:
     if a is None:
         return False
-    return int(a.get("frame_index", -1)) == int(b.get("frame_index", -2)) and int(
-        a.get("track_id", -1)
-    ) == int(b.get("track_id", -2)) and tuple(a.get("box") or ()) == tuple(b.get("box") or ())
+    return (
+        int(a.get("frame_index", -1)) == int(b.get("frame_index", -2))
+        and int(a.get("track_id", -1)) == int(b.get("track_id", -2))
+        and tuple(a.get("box") or ()) == tuple(b.get("box") or ())
+    )
 
 
 def _target_candidate_state(
@@ -1189,11 +1295,21 @@ def _target_candidate_state(
         area_ratio = current_area / previous_area
         if area_ratio > 2.2 or area_ratio < 0.45:
             reasons.append("sudden_area_jump")
-        previous_center = (previous_box[0] + previous_box[2] / 2.0, previous_box[1] + previous_box[3] / 2.0)
+        previous_center = (
+            previous_box[0] + previous_box[2] / 2.0,
+            previous_box[1] + previous_box[3] / 2.0,
+        )
         current_center = (box[0] + box[2] / 2.0, box[1] + box[3] / 2.0)
         frame_gap = max(1, int(candidate["frame_index"]) - int(previous_frame_index))
         max_jump = max(width, height) * 0.18 * frame_gap
-        if float(np.hypot(current_center[0] - previous_center[0], current_center[1] - previous_center[1])) > max_jump:
+        if (
+            float(
+                np.hypot(
+                    current_center[0] - previous_center[0], current_center[1] - previous_center[1]
+                )
+            )
+            > max_jump
+        ):
             reasons.append("sudden_motion_spike")
     state = "usable" if not reasons else "identity_risk"
     return state, reasons, similarity, state == "usable" and similarity >= reid_accept
@@ -1309,7 +1425,39 @@ def update_manifest_after_identity_tracking(
     manifest["updated_at"] = utc_now_iso()
     whole_runner_mask = manifest.get("stages", {}).get("whole_runner_mask", {})
     whole_runner_mask_values: dict[str, Any] = {"identity_gate": "detector_tracker"}
-    if whole_runner_mask.get("status") in (None, "", "pending_prompt", "pending_tracker"):
+    inline_mask = result.get("inline_mask")
+    if isinstance(inline_mask, dict) and inline_mask.get("status") == "complete":
+        for key, value in {
+            "runner_mask": inline_mask.get("runner_mask"),
+            "masked_runner": inline_mask.get("masked_runner"),
+            "qa_overlay": inline_mask.get("qa_overlay"),
+            "runner_mask_metadata": inline_mask.get("metadata"),
+            "masks_jsonl": inline_mask.get("masks_jsonl"),
+        }.items():
+            if value:
+                paths.setdefault(key, str(value))
+        manifest["paths"] = paths
+        whole_runner_mask_values.update(
+            {
+                "status": "complete",
+                "backend": inline_mask.get("backend") or INLINE_MASK_BACKEND,
+                "model": inline_mask.get("model"),
+                "output": inline_mask.get("runner_mask"),
+                "masked_runner": inline_mask.get("masked_runner"),
+                "qa_overlay": inline_mask.get("qa_overlay"),
+                "metadata": inline_mask.get("metadata"),
+                "masks_jsonl": inline_mask.get("masks_jsonl"),
+                "mask_summary": inline_mask.get("summary"),
+                "completed_at": completed_at,
+            }
+        )
+        deferred_browser_encoding = inline_mask.get("deferred_browser_encoding")
+        if (
+            isinstance(deferred_browser_encoding, dict)
+            and deferred_browser_encoding.get("required") is True
+        ):
+            whole_runner_mask_values["deferred_browser_encoding"] = deferred_browser_encoding
+    elif whole_runner_mask.get("status") in (None, "", "pending_prompt", "pending_tracker"):
         whole_runner_mask_values["status"] = "pending_run"
     clip_run.update_stages(
         {
@@ -1358,6 +1506,11 @@ def run_boxmot_identity_tracking(
     detector_confidence: float = 0.25,
     detector_iou: float = 0.7,
     detector_imgsz: int = 960,
+    inline_segmentation: bool = False,
+    inline_mask_dilation_pixels: int = 5,
+    inline_mask_fallback_to_track_box: bool = True,
+    inline_mask_defer_browser_encoding: bool = False,
+    inline_mask_temporal_reset_gap_frames: int = 3,
     progress_callback: IdentityProgressCallback | None = None,
 ) -> dict[str, Any]:
     backend = canonical_identity_backend(backend)
@@ -1376,6 +1529,19 @@ def run_boxmot_identity_tracking(
     tracklets_jsonl_path = clip_run.artifact_path("tracklets_jsonl", manifest)
     reid_jsonl_path = clip_run.artifact_path("reid_jsonl", manifest)
     qc_metrics_path = clip_run.artifact_path("qc_metrics", manifest)
+    runner_mask_path = clip_run.artifact_path("runner_mask", manifest)
+    masked_runner_path = clip_run.artifact_path("masked_runner", manifest)
+    qa_overlay_path = clip_run.artifact_path("qa_overlay", manifest)
+    masks_jsonl_path = clip_run.artifact_path("masks_jsonl", manifest)
+    mask_metadata_path = clip_run.artifact_path("runner_mask_metadata", manifest)
+    inline_mask_config = InlineMaskConfig(
+        dilation_pixels=max(0, int(inline_mask_dilation_pixels)),
+        fallback_to_track_box=bool(inline_mask_fallback_to_track_box),
+        temporal_reset_gap_frames=max(
+            0,
+            int(inline_mask_temporal_reset_gap_frames),
+        ),
+    )
 
     try:
         if progress_callback:
@@ -1419,6 +1585,16 @@ def run_boxmot_identity_tracking(
                 )
             )
         detector = _load_yolo_model(detector_model)
+        detector_task = str(getattr(detector, "task", "") or "").strip().lower()
+        if (
+            inline_segmentation
+            and detector_task
+            and detector_task not in {"segment", "segmentation"}
+        ):
+            raise RuntimeError(
+                f"Inline segmentation requires a segmentation model, but {detector_model} "
+                f"reports task={detector_task!r}."
+            )
         tracker = _create_boxmot_tracker(
             backend,
             reid_weights=reid_weights,
@@ -1436,22 +1612,34 @@ def run_boxmot_identity_tracking(
             )
 
         candidates_by_frame: dict[int, list[dict[str, Any]]] = {}
+        segmentation_output_frames = 0
         for frame_index, frame in enumerate(frames.frames):
-            detections = _run_yolo_person_detector(
+            inference = _run_yolo_person_inference(
                 detector,
                 frame,
                 device=selected_device,
                 confidence=detector_confidence,
                 iou=detector_iou,
                 imgsz=detector_imgsz,
+                mask_threshold=inline_mask_config.mask_threshold,
+                include_masks=inline_segmentation,
             )
-            tracked = tracker.update(detections, frame)
-            candidates_by_frame[frame_index] = _parse_boxmot_tracks(
+            if inference.has_masks:
+                segmentation_output_frames += 1
+            tracked = tracker.update(inference.detections, frame)
+            candidates = _parse_boxmot_tracks(
                 tracked,
                 frame_index=frame_index,
                 width=frames.width,
                 height=frames.height,
             )
+            if inline_segmentation:
+                attach_segmentation_evidence(
+                    candidates,
+                    inference,
+                    minimum_track_box_iou=inline_mask_config.minimum_track_box_iou,
+                )
+            candidates_by_frame[frame_index] = candidates
             if progress_callback:
                 progress_callback(
                     build_identity_progress(
@@ -1461,6 +1649,13 @@ def run_boxmot_identity_tracking(
                         elapsed_seconds=time.monotonic() - started_at,
                     )
                 )
+
+        if inline_segmentation and segmentation_output_frames == 0:
+            raise RuntimeError(
+                f"Inline segmentation model {detector_model} did not produce any person "
+                "segmentation masks. Use a YOLO segmentation checkpoint such as "
+                "yolo26n-seg.pt, or disable inline segmentation."
+            )
 
         if progress_callback:
             progress_callback(
@@ -1613,7 +1808,9 @@ def run_boxmot_identity_tracking(
         ]
         target_track_ids = list(dict.fromkeys(usable_track_ids))
         target_track_switches = sum(
-            1 for previous, current in zip(usable_track_ids, usable_track_ids[1:]) if previous != current
+            1
+            for previous, current in zip(usable_track_ids, usable_track_ids[1:])
+            if previous != current
         )
         prompt_box = _box_payload(initial_box, frames.width, frames.height)
         metrics.update(
@@ -1647,6 +1844,41 @@ def run_boxmot_identity_tracking(
         _write_parquet(reid_path, reid_rows)
         _write_jsonl(tracklets_jsonl_path, track_rows)
         _write_jsonl(reid_jsonl_path, reid_rows)
+
+        inline_mask_result: dict[str, Any] | None = None
+        if inline_segmentation:
+            inline_progress_callback: Callable[[str, int, int], None] | None = None
+            if progress_callback:
+
+                def inline_progress_callback(
+                    phase: str,
+                    processed_frames: int,
+                    total_frames: int,
+                ) -> None:
+                    progress_callback(
+                        build_identity_progress(
+                            phase=phase,
+                            processed_frames=processed_frames,
+                            total_frames=total_frames,
+                            elapsed_seconds=time.monotonic() - started_at,
+                        )
+                    )
+
+            inline_mask_result = write_selected_runner_mask_artifacts(
+                frames=frames.frames,
+                fps=frames.fps,
+                target_candidates=target_candidates,
+                runner_mask_path=runner_mask_path,
+                masked_runner_path=masked_runner_path,
+                qa_overlay_path=qa_overlay_path,
+                metadata_path=mask_metadata_path,
+                masks_jsonl_path=masks_jsonl_path,
+                model=detector_model,
+                config=inline_mask_config,
+                browser_playable=not bool(inline_mask_defer_browser_encoding),
+                progress_callback=inline_progress_callback,
+            )
+            metrics["inline_mask"] = inline_mask_result["summary"]
 
         qc_metrics = {
             "version": 1,
@@ -1692,6 +1924,17 @@ def run_boxmot_identity_tracking(
                     "reid": str(reid_path),
                     "reid_jsonl": str(reid_jsonl_path),
                     "qc_metrics": str(qc_metrics_path),
+                    **(
+                        {
+                            "runner_mask": str(runner_mask_path),
+                            "masked_runner": str(masked_runner_path),
+                            "qa_overlay": str(qa_overlay_path),
+                            "runner_mask_metadata": str(mask_metadata_path),
+                            "masks_jsonl": str(masks_jsonl_path),
+                        }
+                        if inline_mask_result is not None
+                        else {}
+                    ),
                 },
                 "metrics": metrics,
                 "updated_at": utc_now_iso(),
@@ -1712,6 +1955,7 @@ def run_boxmot_identity_tracking(
             "reid_jsonl_path": str(reid_jsonl_path),
             "qc_metrics_path": str(qc_metrics_path),
             "metrics": metrics,
+            "inline_mask": inline_mask_result,
         }
         update_manifest_after_identity_tracking(
             manifest_path,
@@ -1748,9 +1992,19 @@ def run_identity_tracking(
     detector_confidence: float = 0.25,
     detector_iou: float = 0.7,
     detector_imgsz: int = 960,
+    inline_segmentation: bool = False,
+    inline_mask_dilation_pixels: int = 5,
+    inline_mask_fallback_to_track_box: bool = True,
+    inline_mask_defer_browser_encoding: bool = False,
+    inline_mask_temporal_reset_gap_frames: int = 3,
     progress_callback: IdentityProgressCallback | None = None,
 ) -> dict[str, Any]:
     backend = canonical_identity_backend(backend)
+    if inline_segmentation and backend not in BOXMOT_BACKENDS:
+        raise ValueError(
+            "Inline YOLO segmentation requires a BoxMOT identity backend so each person mask "
+            "can be associated with the selected runner track."
+        )
     if backend == TEMPLATE_IDENTITY_BACKEND:
         return run_template_identity_tracking(
             run_dir=run_dir,
@@ -1766,6 +2020,11 @@ def run_identity_tracking(
         detector_confidence=detector_confidence,
         detector_iou=detector_iou,
         detector_imgsz=detector_imgsz,
+        inline_segmentation=inline_segmentation,
+        inline_mask_dilation_pixels=inline_mask_dilation_pixels,
+        inline_mask_fallback_to_track_box=inline_mask_fallback_to_track_box,
+        inline_mask_defer_browser_encoding=inline_mask_defer_browser_encoding,
+        inline_mask_temporal_reset_gap_frames=inline_mask_temporal_reset_gap_frames,
         progress_callback=progress_callback,
     )
 

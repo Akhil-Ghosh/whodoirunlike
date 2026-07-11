@@ -396,11 +396,16 @@ def test_upload_artifacts_emits_result_ready_only_after_fused_overlay_put(
     run_dir.mkdir()
     fused_overlay = run_dir / "fused_overlay.mp4"
     fused_overlay.write_bytes(b"viewable fused overlay")
+    secondary_artifact = run_dir / "features.json"
+    secondary_artifact.write_text("{}", encoding="utf-8")
     (run_dir / "cv_run_manifest.json").write_text(
         json.dumps(
             {
                 "version": 1,
-                "paths": {"fused_overlay": str(fused_overlay)},
+                "paths": {
+                    "fused_overlay": str(fused_overlay),
+                    "features": str(secondary_artifact),
+                },
                 "stages": {},
             }
         ),
@@ -445,13 +450,252 @@ def test_upload_artifacts_emits_result_ready_only_after_fused_overlay_put(
         if event["event_type"] == "span_completed"
         and event["measurements"].get("artifact_type") == "fused_overlay"
     )
-    assert uploaded == ["cv_run_manifest.json", "fused_overlay.mp4"]
+    first_secondary_publish_index = next(
+        index
+        for index, event in enumerate(events)
+        if event["event_type"] == "span_started"
+        and event["measurements"].get("artifact_type") != "fused_overlay"
+    )
+    assert uploaded == [
+        "fused_overlay.mp4",
+        "cv_run_manifest.json",
+        "features.json",
+    ]
     assert uploaded_by_put == uploaded
     assert result_ready_index > fused_publish_complete_index
+    assert result_ready_index < first_secondary_publish_index
     assert events[result_ready_index]["measurements"]["bytes"] == len(
         b"viewable fused overlay"
     )
     assert events[0]["sequence"] == 100
+
+
+def test_upload_artifacts_encodes_deferred_inline_masks_after_result_ready(
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    from whodoirunlike import hosted_processor
+    from whodoirunlike.processing_telemetry import ProcessingTelemetry
+
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    paths = {
+        name: run_dir / filename
+        for name, filename in {
+            "runner_mask": "runner_mask.mp4",
+            "masked_runner": "masked_runner.mp4",
+            "qa_overlay": "qa_overlay.mp4",
+            "fused_overlay": "fused_overlay.mp4",
+            "hosted_pipeline_result": "hosted_pipeline_result.json",
+        }.items()
+    }
+    for name, path in paths.items():
+        if name == "hosted_pipeline_result":
+            continue
+        path.write_bytes(b"raw-video")
+    deferred_encoding = {
+        "required": True,
+        "paths": [
+            str(paths["runner_mask"]),
+            str(paths["masked_runner"]),
+            str(paths["qa_overlay"]),
+        ],
+    }
+    paths["hosted_pipeline_result"].write_text(
+        json.dumps(
+            {
+                "steps": [
+                    {
+                        "stage": "identity",
+                        "result": {
+                            "inline_mask": {
+                                "deferred_browser_encoding": deferred_encoding,
+                            }
+                        },
+                    },
+                    {
+                        "stage": "mask",
+                        "result": {
+                            "deferred_browser_encoding": deferred_encoding,
+                        },
+                    },
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    manifest_path = run_dir / "cv_run_manifest.json"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "paths": {name: str(path) for name, path in paths.items()},
+                "stages": {
+                    "whole_runner_mask": {
+                        "status": "complete",
+                        "backend": "yolo26n_seg_inline",
+                        "deferred_browser_encoding": deferred_encoding,
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    payload = hosted_processor.WorkerJobRequest(
+        run_id="12345678-1234-4234-9234-123456789abc",
+        attempt_id="11111111-1111-4111-8111-111111111111",
+        callback_base_url="https://api.whodoirunlike.com",
+        source={
+            "url": "https://api.whodoirunlike.com/v1/jobs/source",
+            "key": "uploads/source.mp4",
+            "content_type": "video/mp4",
+            "size_bytes": 123,
+        },
+    )
+    trace: list[str] = []
+    uploaded_manifest: dict[str, Any] = {}
+    uploaded_result: dict[str, Any] = {}
+
+    def encode(path: Path) -> None:
+        trace.append(f"encode:{path.name}")
+        path.write_bytes(b"h264-video")
+
+    def put(**kwargs: Any) -> None:
+        name = kwargs["name"]
+        trace.append(f"put:{name}")
+        if name == "cv_run_manifest.json":
+            uploaded_manifest.update(json.loads(kwargs["path"].read_text(encoding="utf-8")))
+        if name == "hosted_pipeline_result.json":
+            uploaded_result.update(json.loads(kwargs["path"].read_text(encoding="utf-8")))
+
+    monkeypatch.setattr(hosted_processor, "make_browser_playable_mp4", encode)
+    monkeypatch.setattr(hosted_processor, "_put_worker_artifact", put)
+    telemetry = ProcessingTelemetry(
+        run_id=payload.run_id,
+        attempt_id=payload.attempt_id,
+        local_path=tmp_path / "events.jsonl",
+        resource_sampler=lambda: {},
+        asynchronous_delivery=False,
+    )
+
+    uploaded = hosted_processor._upload_artifacts(payload, run_dir, telemetry=telemetry)
+
+    assert uploaded[0] == "fused_overlay.mp4"
+    assert trace[0] == "put:fused_overlay.mp4"
+    assert "encode:runner_mask.mp4" in trace
+    assert "encode:masked_runner.mp4" in trace
+    assert "encode:qa_overlay.mp4" not in trace
+    assert trace.index("encode:runner_mask.mp4") > trace.index("put:fused_overlay.mp4")
+    assert trace.index("put:cv_run_manifest.json") > trace.index("encode:masked_runner.mp4")
+    deferred = uploaded_manifest["stages"]["whole_runner_mask"][
+        "deferred_browser_encoding"
+    ]
+    assert deferred["required"] is False
+    assert deferred["paths"] == []
+    assert trace.index("put:hosted_pipeline_result.json") > trace.index(
+        "encode:masked_runner.mp4"
+    )
+    result_deferred = [
+        uploaded_result["steps"][0]["result"]["inline_mask"][
+            "deferred_browser_encoding"
+        ],
+        uploaded_result["steps"][1]["result"]["deferred_browser_encoding"],
+    ]
+    assert all(item["required"] is False for item in result_deferred)
+    assert all(item["paths"] == [] for item in result_deferred)
+    assert all(item["completed_at"] == deferred["completed_at"] for item in result_deferred)
+    events = [json.loads(line) for line in telemetry.local_path.read_text().splitlines()]
+    assert any(
+        event["event_type"] == "span_completed"
+        and event["stage"] == "artifact_publish"
+        and event["span"] == "encode"
+        for event in events
+    )
+
+
+def test_upload_artifacts_does_not_publish_stale_state_when_result_finalization_fails(
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    from whodoirunlike import hosted_processor
+
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    runner_mask = run_dir / "runner_mask.mp4"
+    masked_runner = run_dir / "masked_runner.mp4"
+    fused_overlay = run_dir / "fused_overlay.mp4"
+    result_path = run_dir / "hosted_pipeline_result.json"
+    for path in (runner_mask, masked_runner, fused_overlay):
+        path.write_bytes(b"video")
+    deferred_encoding = {
+        "required": True,
+        "paths": [str(runner_mask), str(masked_runner)],
+    }
+    original_result = {
+        "steps": [
+            {
+                "stage": "mask",
+                "result": {"deferred_browser_encoding": deferred_encoding},
+            }
+        ]
+    }
+    result_path.write_text(json.dumps(original_result), encoding="utf-8")
+    manifest_path = run_dir / "cv_run_manifest.json"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "paths": {
+                    "runner_mask": str(runner_mask),
+                    "masked_runner": str(masked_runner),
+                    "fused_overlay": str(fused_overlay),
+                    "hosted_pipeline_result": str(result_path),
+                },
+                "stages": {
+                    "whole_runner_mask": {
+                        "status": "complete",
+                        "backend": "yolo26n_seg_inline",
+                        "deferred_browser_encoding": deferred_encoding,
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    payload = hosted_processor.WorkerJobRequest(
+        run_id="12345678-1234-4234-9234-123456789abc",
+        attempt_id="11111111-1111-4111-8111-111111111111",
+        callback_base_url="https://api.whodoirunlike.com",
+        source={
+            "url": "https://api.whodoirunlike.com/v1/jobs/source",
+            "key": "uploads/source.mp4",
+            "content_type": "video/mp4",
+            "size_bytes": 123,
+        },
+    )
+    uploaded: list[str] = []
+    monkeypatch.setattr(hosted_processor, "make_browser_playable_mp4", lambda _path: None)
+    monkeypatch.setattr(
+        hosted_processor,
+        "_put_worker_artifact",
+        lambda **kwargs: uploaded.append(kwargs["name"]),
+    )
+    monkeypatch.setattr(
+        hosted_processor.os,
+        "replace",
+        lambda *_args: (_ for _ in ()).throw(OSError("atomic replace failed")),
+    )
+
+    with pytest.raises(OSError, match="atomic replace failed"):
+        hosted_processor._upload_artifacts(payload, run_dir)
+
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert manifest["stages"]["whole_runner_mask"]["deferred_browser_encoding"] == (
+        deferred_encoding
+    )
+    assert json.loads(result_path.read_text(encoding="utf-8")) == original_result
+    assert uploaded == ["fused_overlay.mp4", "runner_mask.mp4"]
+    assert list(run_dir.glob(".hosted_pipeline_result.json.*.tmp")) == []
 
 
 def test_upload_artifacts_does_not_emit_result_ready_when_fused_put_fails(
@@ -674,7 +918,19 @@ def test_processor_health_reports_full_pipeline_readiness(monkeypatch: Any, tmp_
     from whodoirunlike import api as api_module
     from whodoirunlike import hosted_processor
 
+    detector_model = tmp_path / "runner-seg.engine"
+    detector_model.write_bytes(b"scratch-engine-placeholder")
     monkeypatch.setenv("WHODOIRUNLIKE_PROCESSOR_SHARED_SECRET", "secret")
+    monkeypatch.setenv("WHODOIRUNLIKE_PARALLEL_POSE_DENSEPOSE", "true")
+    monkeypatch.setenv("WHODOIRUNLIKE_PARALLEL_POST_FUSION", "true")
+    monkeypatch.setenv("WHODOIRUNLIKE_MASK_BACKEND", "yolo26n_seg_inline")
+    monkeypatch.setenv("WHODOIRUNLIKE_IDENTITY_DETECTOR_MODEL", str(detector_model))
+    monkeypatch.setenv("WHODOIRUNLIKE_INLINE_MASK_DILATION_PIXELS", "7")
+    monkeypatch.setenv("WHODOIRUNLIKE_INLINE_MASK_TEMPORAL_RESET_GAP_FRAMES", "9")
+    monkeypatch.setenv("WHODOIRUNLIKE_INLINE_MASK_FALLBACK_TO_TRACK_BOX", "false")
+    monkeypatch.setenv("WHODOIRUNLIKE_INLINE_MASK_DEFER_BROWSER_ENCODING", "true")
+    monkeypatch.setenv("WHODOIRUNLIKE_INLINE_MASK_SAM_FALLBACK", "false")
+    monkeypatch.setenv("WHODOIRUNLIKE_INLINE_MASK_FALLBACK_BACKEND", "sam31_mlx")
     monkeypatch.setattr(hosted_processor, "DEFAULT_HOSTED_RUN_ROOT", tmp_path / "hosted_runs")
     monkeypatch.setattr(
         hosted_processor,
@@ -704,7 +960,274 @@ def test_processor_health_reports_full_pipeline_readiness(monkeypatch: Any, tmp_
     payload = response.json()
     assert payload["has_processor_secret"] is True
     assert payload["readiness"]["ready_for_full_pipeline"] is True
-    assert payload["readiness"]["checks"]["mask"]["backend"] == "sam31_gpu"
+    assert payload["readiness"]["checks"]["mask"]["backend"] == "yolo26n_seg_inline"
+    assert payload["readiness"]["parallel_pose_densepose"] is True
+    assert payload["readiness"]["parallel_post_fusion"] is True
+    assert payload["readiness"]["inline_mask"] == {
+        "identity_detector_model": str(detector_model),
+        "inline_mask_dilation_pixels": 7,
+        "inline_mask_temporal_reset_gap_frames": 9,
+        "inline_mask_fallback_to_track_box": False,
+        "inline_mask_defer_browser_encoding": True,
+        "inline_mask_sam_fallback": False,
+        "inline_mask_fallback_backend": "sam31_mlx",
+    }
+
+
+def test_max_safe_speed_profile_rejects_missing_experimental_switches(
+    monkeypatch: Any,
+) -> None:
+    from whodoirunlike import hosted_processor
+
+    monkeypatch.setenv("WHODOIRUNLIKE_PROCESSOR_SHARED_SECRET", "secret")
+    monkeypatch.setenv("WHODOIRUNLIKE_ENVIRONMENT", "scratch")
+    monkeypatch.setenv("WHODOIRUNLIKE_SPEED_PROFILE", "max_safe")
+    for name in (
+        "WHODOIRUNLIKE_MASK_BACKEND",
+        "WHODOIRUNLIKE_PARALLEL_POSE_DENSEPOSE",
+        "WHODOIRUNLIKE_PARALLEL_POST_FUSION",
+        "WHODOIRUNLIKE_POSE_BACKEND",
+        "MMPOSE_DEVICE",
+        "MMPOSE_USE_DETECTOR",
+        "RTMW_RUNTIME_BACKEND",
+        "WHODOIRUNLIKE_SKIP_DENSEPOSE",
+        "DENSEPOSE_DEVICE",
+        "DENSEPOSE_TARGET_CROP_ENABLED",
+        "DENSEPOSE_INPUT_MIN_SIZE_TEST",
+        "DENSEPOSE_INPUT_MAX_SIZE_TEST",
+        "WHODOIRUNLIKE_INLINE_MASK_DEFER_BROWSER_ENCODING",
+        "WHODOIRUNLIKE_INLINE_MASK_SAM_FALLBACK",
+        "WHODOIRUNLIKE_INLINE_MASK_FALLBACK_BACKEND",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(
+        hosted_processor,
+        "identity_setup_status",
+        lambda backend=None: {"ready": True, "reasons": [], "backend": backend},
+    )
+    monkeypatch.setattr(
+        hosted_processor,
+        "sam31_gpu_setup_status",
+        lambda: {"ready": True, "reasons": [], "backend": "sam31_gpu"},
+    )
+    monkeypatch.setattr(
+        hosted_processor,
+        "pose_setup_status",
+        lambda backend: {"ready": True, "reasons": [], "backend": backend},
+    )
+    monkeypatch.setattr(
+        hosted_processor,
+        "densepose_setup_status",
+        lambda: {"ready": True, "reasons": [], "backend": "densepose"},
+    )
+
+    readiness = hosted_processor.processor_readiness()
+
+    assert readiness["speed_profile"] == "max_safe"
+    assert readiness["ready_for_full_pipeline"] is False
+    profile_check = readiness["checks"]["speed_profile"]
+    assert profile_check["ready"] is False
+    reasons = "\n".join(profile_check["reasons"])
+    for name in (
+        "WHODOIRUNLIKE_MASK_BACKEND",
+        "WHODOIRUNLIKE_PARALLEL_POSE_DENSEPOSE",
+        "WHODOIRUNLIKE_PARALLEL_POST_FUSION",
+        "WHODOIRUNLIKE_POSE_BACKEND",
+        "MMPOSE_DEVICE",
+        "MMPOSE_USE_DETECTOR",
+        "RTMW_RUNTIME_BACKEND",
+        "WHODOIRUNLIKE_SKIP_DENSEPOSE",
+        "DENSEPOSE_DEVICE",
+        "DENSEPOSE_TARGET_CROP_ENABLED",
+        "DENSEPOSE_INPUT_MIN_SIZE_TEST",
+        "DENSEPOSE_INPUT_MAX_SIZE_TEST",
+        "WHODOIRUNLIKE_INLINE_MASK_DEFER_BROWSER_ENCODING",
+        "WHODOIRUNLIKE_INLINE_MASK_SAM_FALLBACK",
+        "WHODOIRUNLIKE_INLINE_MASK_FALLBACK_BACKEND",
+    ):
+        assert name in reasons
+
+
+def test_max_safe_speed_profile_accepts_complete_scratch_configuration(
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    from whodoirunlike import hosted_processor
+
+    detector_model = tmp_path / "yolo26n-seg.engine"
+    detector_model.write_bytes(b"scratch-engine-placeholder")
+    settings = {
+        "WHODOIRUNLIKE_PROCESSOR_SHARED_SECRET": "secret",
+        "WHODOIRUNLIKE_ENVIRONMENT": "scratch",
+        "WHODOIRUNLIKE_SPEED_PROFILE": "max_safe",
+        "WHODOIRUNLIKE_IDENTITY_BACKEND": "boxmot_bytetrack",
+        "WHODOIRUNLIKE_IDENTITY_DETECTOR_MODEL": str(detector_model),
+        "WHODOIRUNLIKE_MASK_BACKEND": "yolo26n_seg_inline",
+        "WHODOIRUNLIKE_PARALLEL_POSE_DENSEPOSE": "true",
+        "WHODOIRUNLIKE_PARALLEL_POST_FUSION": "true",
+        "WHODOIRUNLIKE_POSE_BACKEND": "mmpose_rtmpose_l_384",
+        "MMPOSE_DEVICE": "cuda:0",
+        "MMPOSE_USE_DETECTOR": "false",
+        "RTMW_RUNTIME_BACKEND": "onnxruntime",
+        "WHODOIRUNLIKE_SKIP_DENSEPOSE": "false",
+        "DENSEPOSE_DEVICE": "cuda",
+        "DENSEPOSE_TARGET_CROP_ENABLED": "true",
+        "DENSEPOSE_INPUT_MIN_SIZE_TEST": "512",
+        "DENSEPOSE_INPUT_MAX_SIZE_TEST": "960",
+        "WHODOIRUNLIKE_INLINE_MASK_DEFER_BROWSER_ENCODING": "true",
+        "WHODOIRUNLIKE_INLINE_MASK_SAM_FALLBACK": "true",
+        "WHODOIRUNLIKE_INLINE_MASK_FALLBACK_BACKEND": "sam31_gpu",
+    }
+    for name, value in settings.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.setattr(
+        hosted_processor,
+        "identity_setup_status",
+        lambda backend=None: {
+            "ready": True,
+            "reasons": [],
+            "backend": "boxmot_bytetrack",
+        },
+    )
+    monkeypatch.setattr(
+        hosted_processor,
+        "pose_setup_status",
+        lambda backend: {"ready": True, "reasons": [], "backend": backend},
+    )
+    monkeypatch.setattr(
+        hosted_processor,
+        "densepose_setup_status",
+        lambda: {"ready": True, "reasons": [], "backend": "densepose"},
+    )
+
+    readiness = hosted_processor.processor_readiness()
+
+    assert readiness["ready_for_full_pipeline"] is True
+    assert readiness["speed_profile"] == "max_safe"
+    assert readiness["checks"]["speed_profile"] == {
+        "ready": True,
+        "reasons": [],
+        "profile": "max_safe",
+        "active": True,
+    }
+
+
+@pytest.mark.parametrize(
+    ("name", "invalid_value"),
+    [
+        ("WHODOIRUNLIKE_ENVIRONMENT", "production"),
+        ("WHODOIRUNLIKE_MASK_BACKEND", "sam31_gpu"),
+        ("WHODOIRUNLIKE_PARALLEL_POSE_DENSEPOSE", "false"),
+        ("WHODOIRUNLIKE_PARALLEL_POST_FUSION", "false"),
+        ("WHODOIRUNLIKE_POSE_BACKEND", "mediapipe"),
+        ("MMPOSE_DEVICE", "cpu"),
+        ("MMPOSE_DEVICE", "cuda-fast"),
+        ("MMPOSE_USE_DETECTOR", "true"),
+        ("RTMW_RUNTIME_BACKEND", "openvino"),
+        ("WHODOIRUNLIKE_SKIP_DENSEPOSE", "true"),
+        ("DENSEPOSE_DEVICE", "cpu"),
+        ("DENSEPOSE_DEVICE", "cuda-fast"),
+        ("DENSEPOSE_TARGET_CROP_ENABLED", "false"),
+        ("DENSEPOSE_INPUT_MIN_SIZE_TEST", "511"),
+        ("DENSEPOSE_INPUT_MAX_SIZE_TEST", "959"),
+        ("WHODOIRUNLIKE_INLINE_MASK_DEFER_BROWSER_ENCODING", "false"),
+        ("WHODOIRUNLIKE_INLINE_MASK_SAM_FALLBACK", "false"),
+        ("WHODOIRUNLIKE_INLINE_MASK_FALLBACK_BACKEND", "sam31_mlx"),
+    ],
+)
+def test_max_safe_speed_profile_rejects_mismatched_switches(
+    monkeypatch: Any,
+    name: str,
+    invalid_value: str,
+) -> None:
+    from whodoirunlike import hosted_processor
+
+    settings = {
+        "WHODOIRUNLIKE_PROCESSOR_SHARED_SECRET": "secret",
+        "WHODOIRUNLIKE_ENVIRONMENT": "scratch",
+        "WHODOIRUNLIKE_SPEED_PROFILE": "max_safe",
+        "WHODOIRUNLIKE_MASK_BACKEND": "yolo26n_seg_inline",
+        "WHODOIRUNLIKE_PARALLEL_POSE_DENSEPOSE": "true",
+        "WHODOIRUNLIKE_PARALLEL_POST_FUSION": "true",
+        "WHODOIRUNLIKE_POSE_BACKEND": "mmpose_rtmpose_l_384",
+        "MMPOSE_DEVICE": "cuda:0",
+        "MMPOSE_USE_DETECTOR": "false",
+        "RTMW_RUNTIME_BACKEND": "onnxruntime",
+        "WHODOIRUNLIKE_SKIP_DENSEPOSE": "false",
+        "DENSEPOSE_DEVICE": "cuda",
+        "DENSEPOSE_TARGET_CROP_ENABLED": "true",
+        "DENSEPOSE_INPUT_MIN_SIZE_TEST": "512",
+        "DENSEPOSE_INPUT_MAX_SIZE_TEST": "960",
+        "WHODOIRUNLIKE_INLINE_MASK_DEFER_BROWSER_ENCODING": "true",
+        "WHODOIRUNLIKE_INLINE_MASK_SAM_FALLBACK": "true",
+        "WHODOIRUNLIKE_INLINE_MASK_FALLBACK_BACKEND": "sam31_gpu",
+    }
+    settings[name] = invalid_value
+    for env_name, value in settings.items():
+        monkeypatch.setenv(env_name, value)
+    monkeypatch.setattr(
+        hosted_processor,
+        "identity_setup_status",
+        lambda backend=None: {"ready": True, "reasons": [], "backend": backend},
+    )
+    monkeypatch.setattr(
+        hosted_processor,
+        "mask_setup_status",
+        lambda backend: {"ready": True, "reasons": [], "backend": backend},
+    )
+    monkeypatch.setattr(
+        hosted_processor,
+        "pose_setup_status",
+        lambda backend: {"ready": True, "reasons": [], "backend": backend},
+    )
+    monkeypatch.setattr(
+        hosted_processor,
+        "densepose_setup_status",
+        lambda: {"ready": True, "reasons": [], "backend": "densepose"},
+    )
+
+    readiness = hosted_processor.processor_readiness()
+
+    assert readiness["ready_for_full_pipeline"] is False
+    assert readiness["checks"]["speed_profile"]["ready"] is False
+    assert name in "\n".join(readiness["checks"]["speed_profile"]["reasons"])
+
+
+def test_no_speed_profile_preserves_production_safe_readiness(
+    monkeypatch: Any,
+) -> None:
+    from whodoirunlike import hosted_processor
+
+    monkeypatch.delenv("WHODOIRUNLIKE_SPEED_PROFILE", raising=False)
+    monkeypatch.setenv("WHODOIRUNLIKE_ENVIRONMENT", "production")
+    monkeypatch.setenv("WHODOIRUNLIKE_PROCESSOR_SHARED_SECRET", "secret")
+    monkeypatch.setenv("WHODOIRUNLIKE_SKIP_DENSEPOSE", "true")
+    monkeypatch.setattr(
+        hosted_processor,
+        "identity_setup_status",
+        lambda backend=None: {"ready": True, "reasons": [], "backend": backend},
+    )
+    monkeypatch.setattr(
+        hosted_processor,
+        "sam31_gpu_setup_status",
+        lambda: {"ready": True, "reasons": [], "backend": "sam31_gpu"},
+    )
+    monkeypatch.setattr(
+        hosted_processor,
+        "pose_setup_status",
+        lambda backend: {"ready": True, "reasons": [], "backend": backend},
+    )
+
+    readiness = hosted_processor.processor_readiness()
+
+    assert readiness["ready_for_full_pipeline"] is True
+    assert readiness["speed_profile"] is None
+    assert readiness["checks"]["speed_profile"] == {
+        "ready": True,
+        "reasons": [],
+        "profile": None,
+        "active": False,
+    }
 
 
 def test_processor_readiness_respects_densepose_skip(monkeypatch: Any) -> None:
@@ -737,6 +1260,196 @@ def test_processor_readiness_respects_densepose_skip(monkeypatch: Any) -> None:
 
     assert readiness["ready_for_full_pipeline"] is True
     assert readiness["checks"]["densepose"]["skipped"] is True
+
+
+def test_processor_readiness_rejects_parallel_non_mmpose_policy(monkeypatch: Any) -> None:
+    from whodoirunlike import hosted_processor
+
+    monkeypatch.setenv("WHODOIRUNLIKE_PROCESSOR_SHARED_SECRET", "secret")
+    monkeypatch.setenv("WHODOIRUNLIKE_POSE_BACKEND", "mediapipe")
+    monkeypatch.setenv("WHODOIRUNLIKE_PARALLEL_POSE_DENSEPOSE", "true")
+    monkeypatch.setenv("WHODOIRUNLIKE_SKIP_DENSEPOSE", "false")
+    monkeypatch.setattr(
+        hosted_processor,
+        "identity_setup_status",
+        lambda backend=None: {"ready": True, "reasons": [], "backend": backend},
+    )
+    monkeypatch.setattr(
+        hosted_processor,
+        "sam31_gpu_setup_status",
+        lambda: {"ready": True, "reasons": [], "backend": "sam31_gpu"},
+    )
+    monkeypatch.setattr(
+        hosted_processor,
+        "pose_setup_status",
+        lambda backend: {"ready": True, "reasons": [], "backend": backend},
+    )
+    monkeypatch.setattr(
+        hosted_processor,
+        "densepose_setup_status",
+        lambda: {"ready": True, "reasons": [], "backend": "densepose"},
+    )
+
+    readiness = hosted_processor.processor_readiness()
+
+    assert readiness["ready_for_full_pipeline"] is False
+    assert readiness["checks"]["execution_policy"]["ready"] is False
+    assert "mmpose" in readiness["checks"]["execution_policy"]["reasons"][0]
+
+
+def test_inline_yolo_mask_readiness_reuses_identity_dependency_check(
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    from whodoirunlike import hosted_processor
+
+    checked_backends: list[str | None] = []
+    detector_model = tmp_path / "custom-runner-seg.pt"
+    detector_model.write_bytes(b"segmentation-model-placeholder")
+    monkeypatch.setenv("WHODOIRUNLIKE_IDENTITY_BACKEND", "boxmot_botsort")
+    monkeypatch.setenv("WHODOIRUNLIKE_IDENTITY_DETECTOR_MODEL", str(detector_model))
+
+    def ready_identity(backend: str | None = None) -> dict[str, Any]:
+        checked_backends.append(backend)
+        return {
+            "ready": True,
+            "reasons": [],
+            "backend": "boxmot_botsort",
+            "dependencies": {"ultralytics": True},
+        }
+
+    monkeypatch.setattr(hosted_processor, "identity_setup_status", ready_identity)
+
+    status = hosted_processor.mask_setup_status("yolo26n_seg_inline")
+
+    assert checked_backends == ["boxmot_botsort"]
+    assert status["ready"] is True
+    assert status["backend"] == "yolo26n_seg_inline"
+    assert status["model"] == str(detector_model)
+    assert status["identity"]["dependencies"]["ultralytics"] is True
+
+
+def test_inline_yolo_mask_readiness_requires_boxmot_identity(
+    monkeypatch: Any,
+) -> None:
+    from whodoirunlike import hosted_processor
+
+    monkeypatch.setenv("WHODOIRUNLIKE_IDENTITY_BACKEND", "prompt_template_tracker_v1")
+    monkeypatch.setattr(
+        hosted_processor,
+        "identity_setup_status",
+        lambda backend=None: {
+            "ready": True,
+            "reasons": [],
+            "backend": "prompt_template_tracker_v1",
+        },
+    )
+
+    status = hosted_processor.mask_setup_status("yolo26n_seg_inline")
+
+    assert status["ready"] is False
+    assert any("BoxMOT identity backend" in reason for reason in status["reasons"])
+
+
+def test_inline_yolo_mask_readiness_rejects_missing_configured_local_model(
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    from whodoirunlike import hosted_processor
+
+    missing_model = tmp_path / "yolo26n-seg.engine"
+    monkeypatch.setenv("WHODOIRUNLIKE_IDENTITY_BACKEND", "boxmot_bytetrack")
+    monkeypatch.setenv("WHODOIRUNLIKE_IDENTITY_DETECTOR_MODEL", str(missing_model))
+    monkeypatch.setattr(
+        hosted_processor,
+        "identity_setup_status",
+        lambda backend=None: {
+            "ready": True,
+            "reasons": [],
+            "backend": "boxmot_bytetrack",
+        },
+    )
+
+    status = hosted_processor.mask_setup_status("yolo26n_seg_inline")
+
+    assert status["ready"] is False
+    assert status["model"] == str(missing_model)
+    assert any("does not exist" in reason for reason in status["reasons"])
+
+
+def test_inline_yolo_mask_readiness_rejects_known_detection_only_model(
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    from whodoirunlike import hosted_processor
+
+    detection_model = tmp_path / "yolo26n.engine"
+    detection_model.write_bytes(b"detection-only-placeholder")
+    monkeypatch.setenv("WHODOIRUNLIKE_IDENTITY_BACKEND", "boxmot_bytetrack")
+    monkeypatch.setenv("WHODOIRUNLIKE_IDENTITY_DETECTOR_MODEL", str(detection_model))
+    monkeypatch.setattr(
+        hosted_processor,
+        "identity_setup_status",
+        lambda backend=None: {
+            "ready": True,
+            "reasons": [],
+            "backend": "boxmot_bytetrack",
+        },
+    )
+
+    status = hosted_processor.mask_setup_status("yolo26n_seg_inline")
+
+    assert status["ready"] is False
+    assert any("segmentation model" in reason for reason in status["reasons"])
+
+
+def test_inline_mask_settings_keep_safe_defaults(monkeypatch: Any) -> None:
+    from whodoirunlike import hosted_processor
+
+    for name in (
+        "WHODOIRUNLIKE_IDENTITY_DETECTOR_MODEL",
+        "WHODOIRUNLIKE_INLINE_MASK_DILATION_PIXELS",
+        "WHODOIRUNLIKE_INLINE_MASK_TEMPORAL_RESET_GAP_FRAMES",
+        "WHODOIRUNLIKE_INLINE_MASK_FALLBACK_TO_TRACK_BOX",
+        "WHODOIRUNLIKE_INLINE_MASK_DEFER_BROWSER_ENCODING",
+        "WHODOIRUNLIKE_INLINE_MASK_SAM_FALLBACK",
+        "WHODOIRUNLIKE_INLINE_MASK_FALLBACK_BACKEND",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    assert hosted_processor._inline_mask_settings() == {
+        "identity_detector_model": None,
+        "inline_mask_dilation_pixels": 5,
+        "inline_mask_temporal_reset_gap_frames": 3,
+        "inline_mask_fallback_to_track_box": True,
+        "inline_mask_defer_browser_encoding": True,
+        "inline_mask_sam_fallback": True,
+        "inline_mask_fallback_backend": "sam31_gpu",
+    }
+
+
+@pytest.mark.parametrize(
+    ("configured", "expected"),
+    [("8", 8), ("-4", 0), ("invalid", 3)],
+)
+def test_inline_mask_temporal_reset_gap_frames_are_bounded(
+    monkeypatch: Any,
+    configured: str,
+    expected: int,
+) -> None:
+    from whodoirunlike import hosted_processor
+
+    monkeypatch.setenv(
+        "WHODOIRUNLIKE_INLINE_MASK_TEMPORAL_RESET_GAP_FRAMES",
+        configured,
+    )
+
+    assert (
+        hosted_processor._inline_mask_settings()[
+            "inline_mask_temporal_reset_gap_frames"
+        ]
+        == expected
+    )
 
 
 def test_processor_readiness_reports_check_exceptions(monkeypatch: Any) -> None:
@@ -789,6 +1502,91 @@ def test_densepose_setup_status_reports_missing_default_files(monkeypatch: Any, 
     assert any("DensePose dependencies" in reason for reason in status["reasons"])
 
 
+def test_process_hosted_job_fails_before_download_when_speed_profile_is_invalid(
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    from whodoirunlike import hosted_processor
+
+    calls: list[str] = []
+    reports: list[dict[str, Any]] = []
+
+    class Boundary:
+        def __enter__(self) -> "Boundary":
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def add_measurements(self, _values: dict[str, Any]) -> None:
+            return None
+
+    class Telemetry:
+        def stage(self, *_args: object, **_kwargs: object) -> Boundary:
+            return Boundary()
+
+        def span(self, *_args: object, **_kwargs: object) -> Boundary:
+            return Boundary()
+
+        def flush_delivery(self, **_kwargs: object) -> bool:
+            return True
+
+        def attempt_failed(self, *_args: object, **_kwargs: object) -> None:
+            return None
+
+        def delivery_measurements(self) -> dict[str, Any]:
+            return {}
+
+        def close(self, **_kwargs: object) -> bool:
+            return True
+
+    monkeypatch.setattr(hosted_processor, "DEFAULT_HOSTED_RUN_ROOT", tmp_path / "runs")
+    monkeypatch.setenv("WHODOIRUNLIKE_PROCESSOR_SHARED_SECRET", "secret")
+    monkeypatch.setenv("WHODOIRUNLIKE_ENVIRONMENT", "scratch")
+    monkeypatch.setenv("WHODOIRUNLIKE_SPEED_PROFILE", "max_safe")
+    monkeypatch.delenv("WHODOIRUNLIKE_MASK_BACKEND", raising=False)
+    monkeypatch.setattr(
+        hosted_processor,
+        "create_hosted_telemetry",
+        lambda **_kwargs: Telemetry(),
+    )
+    monkeypatch.setattr(
+        hosted_processor,
+        "_post_worker_report_best_effort",
+        lambda **kwargs: reports.append(kwargs["payload"]) or True,
+    )
+
+    def download(*_args: object, **_kwargs: object) -> None:
+        calls.append("download")
+        raise AssertionError("source download must not start")
+
+    def run_pipeline(**_kwargs: object) -> dict[str, Any]:
+        calls.append("pipeline")
+        return {"steps": []}
+
+    monkeypatch.setattr(hosted_processor, "_download_source", download)
+    monkeypatch.setattr(hosted_processor, "run_full_cv_pipeline", run_pipeline)
+    payload = hosted_processor.WorkerJobRequest(
+        run_id="12345678-1234-4234-9234-123456789abc",
+        attempt_id="11111111-1111-4111-8111-111111111111",
+        callback_base_url="https://api.whodoirunlike.com",
+        source={
+            "url": "https://api.whodoirunlike.com/v1/jobs/12345678-1234-4234-9234-123456789abc/source",
+            "key": "uploads/source.mp4",
+            "content_type": "video/mp4",
+            "size_bytes": 123,
+        },
+    )
+
+    result = hosted_processor.process_hosted_job(payload)
+
+    assert result["status"] == "failed"
+    assert "speed profile" in result["error"].lower()
+    assert "WHODOIRUNLIKE_MASK_BACKEND" in result["error"]
+    assert calls == []
+    assert [report["status"] for report in reports] == ["failed"]
+
+
 def test_process_hosted_job_emits_complete_lifecycle_with_worker_attempt_id(
     monkeypatch: Any,
     tmp_path: Path,
@@ -803,6 +1601,16 @@ def test_process_hosted_job_emits_complete_lifecycle_with_worker_attempt_id(
     created_telemetry: list[ProcessingTelemetry] = []
     monkeypatch.setattr(hosted_processor, "DEFAULT_HOSTED_RUN_ROOT", run_root)
     monkeypatch.setenv("WHODOIRUNLIKE_PROCESSOR_SHARED_SECRET", "secret")
+    monkeypatch.setenv("WHODOIRUNLIKE_PARALLEL_POSE_DENSEPOSE", "true")
+    monkeypatch.setenv("WHODOIRUNLIKE_PARALLEL_POST_FUSION", "true")
+    monkeypatch.setenv("WHODOIRUNLIKE_MASK_BACKEND", "yolo26n_seg_inline")
+    monkeypatch.setenv("WHODOIRUNLIKE_IDENTITY_DETECTOR_MODEL", "runner-seg.engine")
+    monkeypatch.setenv("WHODOIRUNLIKE_INLINE_MASK_DILATION_PIXELS", "7")
+    monkeypatch.setenv("WHODOIRUNLIKE_INLINE_MASK_TEMPORAL_RESET_GAP_FRAMES", "11")
+    monkeypatch.setenv("WHODOIRUNLIKE_INLINE_MASK_FALLBACK_TO_TRACK_BOX", "false")
+    monkeypatch.setenv("WHODOIRUNLIKE_INLINE_MASK_DEFER_BROWSER_ENCODING", "true")
+    monkeypatch.setenv("WHODOIRUNLIKE_INLINE_MASK_SAM_FALLBACK", "false")
+    monkeypatch.setenv("WHODOIRUNLIKE_INLINE_MASK_FALLBACK_BACKEND", "sam31_mlx")
 
     def make_telemetry(**kwargs: Any) -> ProcessingTelemetry:
         telemetry = ProcessingTelemetry(
@@ -837,6 +1645,15 @@ def test_process_hosted_job_emits_complete_lifecycle_with_worker_attempt_id(
 
     def run_pipeline(**kwargs: Any) -> dict[str, Any]:
         assert kwargs["telemetry"] is created_telemetry[0]
+        assert kwargs["parallel_pose_densepose"] is True
+        assert kwargs["parallel_post_fusion"] is True
+        assert kwargs["identity_detector_model"] == "runner-seg.engine"
+        assert kwargs["inline_mask_dilation_pixels"] == 7
+        assert kwargs["inline_mask_temporal_reset_gap_frames"] == 11
+        assert kwargs["inline_mask_fallback_to_track_box"] is False
+        assert kwargs["inline_mask_defer_browser_encoding"] is True
+        assert kwargs["inline_mask_sam_fallback"] is False
+        assert kwargs["inline_mask_fallback_backend"] == "sam31_mlx"
         return {"steps": [{"stage": "identity", "result": {"status": "complete"}}]}
 
     def upload(_: Any, __: Path, *, telemetry: ProcessingTelemetry) -> list[str]:
@@ -903,6 +1720,14 @@ def test_process_hosted_job_emits_complete_lifecycle_with_worker_attempt_id(
     assert events[0]["runtime"]["runpod_job_id"] == "runpod-job-99"
     assert events[0]["runtime"]["environment"] == "production"
     assert events[0]["runtime"]["processor_version"]
+    assert events[0]["runtime"]["parallel_pose_densepose"] is True
+    assert events[0]["runtime"]["parallel_post_fusion"] is True
+    assert events[0]["runtime"]["identity_detector_model"] == "runner-seg.engine"
+    assert events[0]["runtime"]["inline_mask_dilation_pixels"] == 7
+    assert events[0]["runtime"]["inline_mask_temporal_reset_gap_frames"] == 11
+    assert events[0]["runtime"]["inline_mask_fallback_to_track_box"] is False
+    assert events[0]["runtime"]["inline_mask_sam_fallback"] is False
+    assert events[0]["runtime"]["inline_mask_fallback_backend"] == "sam31_mlx"
     assert next(
         event
         for event in events

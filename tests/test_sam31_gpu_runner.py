@@ -113,6 +113,12 @@ def test_sam31_session_autocast_is_entered_per_use(monkeypatch) -> None:
     assert events == ["enter", "session-1", "exit", "enter", "session-2", "exit"]
 
 
+def test_reclaim_gpu_memory_is_safe_without_torch(monkeypatch) -> None:
+    monkeypatch.setitem(sys.modules, "torch", None)
+
+    sam31_gpu_runner._reclaim_sam31_gpu_memory()
+
+
 def test_predictor_cache_is_invalidated_after_session_error(monkeypatch) -> None:
     class Predictor:
         _whodoirunlike_autocast_unwound = True

@@ -87,7 +87,7 @@ def _reclaim_sam31_gpu_memory() -> None:
 
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-    except (AttributeError, RuntimeError):
+    except (ImportError, AttributeError, RuntimeError):
         return
 
 

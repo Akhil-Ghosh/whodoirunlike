@@ -247,6 +247,27 @@ describe("processing attempt boundaries", () => {
 });
 
 describe("telemetry ordering and recovery", () => {
+  it("accepts the processor runtime envelope used by observed stages", async () => {
+    const job = await uploadClip();
+    const event = telemetryEvent(job, 100, "stage_started", "target_tracking");
+    event.runtime = Object.fromEntries(
+      Array.from({ length: 34 }, (_, index) => [`runtime_field_${index}`, index]),
+    );
+
+    const response = await postEvent(job.run_id, event);
+
+    expect(response.status).toBe(202);
+    expect(await waitForStoredSequence(job, 100)).toHaveLength(1);
+
+    const oversized = telemetryEvent(job, 101, "stage_started", "target_tracking");
+    oversized.runtime = Object.fromEntries(
+      Array.from({ length: 65 }, (_, index) => [`runtime_field_${index}`, index]),
+    );
+    const rejected = await postEvent(job.run_id, oversized);
+    expect(rejected.status).toBe(400);
+    expect(await waitForStoredSequence(job, 101)).toHaveLength(0);
+  });
+
   it("records direct queue completion from the first running report exactly once", async () => {
     const job = await uploadClip();
     const queueStartedAt = new Date(Date.now() - 1500).toISOString();

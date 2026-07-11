@@ -280,6 +280,69 @@ def _synchronize_cuda(torch_module: Any) -> None:
         synchronize()
 
 
+def _scaffold_sam31_output_cache(
+    *,
+    predictor: Any,
+    session_id: str,
+    frame_count: int,
+    active_obj_id: int,
+) -> dict[str, Any]:
+    """Work around SAM 3.1 multiplex dropping fresh masks on uncached frames.
+
+    The pinned multiplex implementation returns early when a frame has no prior
+    cached output, even when it just computed a refined runner mask. Creating an
+    empty entry preserves the model's existing refined-mask overlay semantics.
+    This is deliberately opt-in for the isolated speed benchmark.
+    """
+    sessions = getattr(predictor, "_all_inference_states", None)
+    if not isinstance(sessions, dict) or session_id not in sessions:
+        raise RuntimeError("SAM 3.1 benchmark could not access the active session state.")
+    state = sessions[session_id].get("state")
+    if not isinstance(state, dict):
+        raise RuntimeError("SAM 3.1 benchmark session state is unavailable.")
+    cache = state.get("cached_frame_outputs")
+    if not isinstance(cache, dict):
+        raise RuntimeError("SAM 3.1 benchmark output cache is unavailable.")
+    state_frame_count = state.get("num_frames")
+    if state_frame_count is not None and int(state_frame_count) != frame_count:
+        raise RuntimeError("SAM 3.1 benchmark frame count does not match the active session.")
+
+    entries_before = len(cache)
+    active_entries_before = sum(
+        int(isinstance(value, dict) and active_obj_id in value) for value in cache.values()
+    )
+    for frame_index in range(frame_count):
+        cache.setdefault(frame_index, {})
+    return {
+        "applied": True,
+        "entries_before": entries_before,
+        "entries_after": len(cache),
+        "active_object_entries_before": active_entries_before,
+    }
+
+
+def _sam31_output_cache_summary(
+    *,
+    predictor: Any,
+    session_id: str,
+    active_obj_id: int,
+) -> dict[str, Any]:
+    sessions = getattr(predictor, "_all_inference_states", None)
+    session = sessions.get(session_id) if isinstance(sessions, dict) else None
+    state = session.get("state") if isinstance(session, dict) else None
+    cache = state.get("cached_frame_outputs") if isinstance(state, dict) else None
+    if not isinstance(cache, dict):
+        return {"available": False}
+    return {
+        "available": True,
+        "entries": len(cache),
+        "nonempty_entries": sum(int(bool(value)) for value in cache.values()),
+        "active_object_entries": sum(
+            int(isinstance(value, dict) and active_obj_id in value) for value in cache.values()
+        ),
+    }
+
+
 def _first_nonempty_output_object_id(outputs: dict[str, Any]) -> int | None:
     obj_ids = outputs.get("out_obj_ids")
     masks = outputs.get("out_binary_masks")
@@ -466,6 +529,7 @@ def _collect_sam31_masks(
     offload_state_to_cpu: bool = False,
     strict_obj_id: bool = False,
     probe_frame_count: int | None = None,
+    scaffold_uncached_frame_outputs: bool = False,
 ) -> tuple[dict[int, np.ndarray], dict[str, Any]]:
     import torch
 
@@ -508,6 +572,7 @@ def _collect_sam31_masks(
         },
         "strict_obj_id": strict_obj_id,
         "probe_frame_count": probe_frame_count,
+        "scaffold_uncached_frame_outputs": scaffold_uncached_frame_outputs,
     }
     try:
         prompt_frame = max(0, min(int(prompt["frame_index"]), max(frame_count - 1, 0)))
@@ -656,6 +721,16 @@ def _collect_sam31_masks(
                     6,
                 )
 
+            if scaffold_uncached_frame_outputs:
+                diagnostics["output_cache_scaffold"] = _scaffold_sam31_output_cache(
+                    predictor=predictor,
+                    session_id=session_id,
+                    frame_count=frame_count,
+                    active_obj_id=active_obj_id,
+                )
+            else:
+                diagnostics["output_cache_scaffold"] = {"applied": False}
+
             diagnostics["propagation"].extend(
                 _propagate_from_seed_frame(
                     predictor=predictor,
@@ -741,6 +816,11 @@ def _collect_sam31_masks(
                     )
             else:
                 diagnostics["anchor_refinement_frames"] = []
+            diagnostics["output_cache_after_propagation"] = _sam31_output_cache_summary(
+                predictor=predictor,
+                session_id=session_id,
+                active_obj_id=active_obj_id,
+            )
     finally:
         _synchronize_cuda(torch)
         cleanup_started_at = time.perf_counter()

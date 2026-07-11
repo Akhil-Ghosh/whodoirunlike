@@ -128,7 +128,9 @@ def write_run(run_dir: Path, *, embedding: list[float] | None = None) -> None:
 
 def test_mask_video_exports_uncompressed_rle(tmp_path: Path) -> None:
     mask = np.array([[0, 1], [1, 1]], dtype=np.uint8)
-    assert encode_uncompressed_rle(mask)["size"] == [2, 2]
+    assert encode_uncompressed_rle(mask) == {"size": [2, 2], "counts": [1, 3]}
+    assert encode_uncompressed_rle(np.zeros((2, 2), dtype=np.uint8))["counts"] == [4]
+    assert encode_uncompressed_rle(np.ones((2, 2), dtype=np.uint8))["counts"] == [0, 4]
     mask_video = tmp_path / "mask.mp4"
     write_mask_video(mask_video)
 

@@ -11,19 +11,19 @@ import numpy as np
 def encode_uncompressed_rle(mask: np.ndarray) -> dict[str, Any]:
     binary = (mask > 0).astype("uint8")
     height, width = binary.shape[:2]
-    pixels = binary.flatten(order="F")
-    counts: list[int] = []
-    current = 0
-    run_length = 0
-    for value in pixels:
-        value = int(value)
-        if value == current:
-            run_length += 1
-        else:
-            counts.append(run_length)
-            run_length = 1
-            current = value
-    counts.append(run_length)
+    pixels = binary.ravel(order="F")
+    transitions = np.flatnonzero(pixels[1:] != pixels[:-1]) + 1
+    counts = np.diff(
+        np.concatenate(
+            (
+                np.array([0], dtype=np.int64),
+                transitions,
+                np.array([pixels.size], dtype=np.int64),
+            )
+        )
+    ).tolist()
+    if pixels.size and int(pixels[0]) == 1:
+        counts.insert(0, 0)
     return {"size": [height, width], "counts": counts}
 
 

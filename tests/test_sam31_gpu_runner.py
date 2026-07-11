@@ -18,6 +18,8 @@ from whodoirunlike.sam31_gpu_runner import (
     _patch_multiplex_init_state_kwargs,
     _prompt_points_with_box_support,
     _seed_points_for_frame,
+    _sam31_output_cache_summary,
+    _scaffold_sam31_output_cache,
     _strict_mask_from_outputs,
     _support_points_from_box,
     _track_prompt_anchors,
@@ -62,6 +64,51 @@ def test_strict_mask_from_outputs_does_not_fall_back_to_another_object() -> None
     }
 
     assert _strict_mask_from_outputs(outputs, obj_id=1) is None
+
+
+def test_scaffold_sam31_output_cache_preserves_prompt_outputs() -> None:
+    prompt_mask = np.array([[1, 0], [0, 0]], dtype=np.uint8)
+
+    class Predictor:
+        _all_inference_states = {
+            "session-1": {
+                "state": {
+                    "cached_frame_outputs": {
+                        0: {1: prompt_mask},
+                        3: {1: prompt_mask},
+                    }
+                }
+            }
+        }
+
+    predictor = Predictor()
+    result = _scaffold_sam31_output_cache(
+        predictor=predictor,
+        session_id="session-1",
+        frame_count=5,
+        active_obj_id=1,
+    )
+
+    cache = predictor._all_inference_states["session-1"]["state"]["cached_frame_outputs"]
+    assert result == {
+        "applied": True,
+        "entries_before": 2,
+        "entries_after": 5,
+        "active_object_entries_before": 2,
+    }
+    assert sorted(cache) == [0, 1, 2, 3, 4]
+    assert cache[0][1] is prompt_mask
+    assert cache[1] == {}
+    assert _sam31_output_cache_summary(
+        predictor=predictor,
+        session_id="session-1",
+        active_obj_id=1,
+    ) == {
+        "available": True,
+        "entries": 5,
+        "nonempty_entries": 2,
+        "active_object_entries": 2,
+    }
 
 
 def test_first_nonempty_output_object_id_uses_mask_content() -> None:

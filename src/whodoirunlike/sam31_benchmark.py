@@ -82,6 +82,7 @@ class VariantConfig:
     warm_up: bool = False
     render_outputs: bool = True
     probe_frame_count: int | None = None
+    scaffold_uncached_frame_outputs: bool = False
 
 
 VARIANTS = {
@@ -114,6 +115,25 @@ VARIANTS = {
     "probe_then_anchor_64": VariantConfig(
         strategy=SAM31_GPU_STRATEGY_PROBE_THEN_ANCHOR,
         probe_frame_count=64,
+    ),
+    "seed_single_pass_cache_scaffold": VariantConfig(
+        strategy=SAM31_GPU_STRATEGY_PRODUCTION_CONTROL,
+        scaffold_uncached_frame_outputs=True,
+    ),
+    "preseed_single_pass_cache_scaffold": VariantConfig(
+        strategy=SAM31_GPU_STRATEGY_PRESEED_SINGLE_PASS,
+        scaffold_uncached_frame_outputs=True,
+    ),
+    "preseed_single_pass_cache_scaffold_frame_dir": VariantConfig(
+        strategy=SAM31_GPU_STRATEGY_PRESEED_SINGLE_PASS,
+        resource="frame_dir",
+        scaffold_uncached_frame_outputs=True,
+    ),
+    "preseed_single_pass_cache_scaffold_frame_dir_offload": VariantConfig(
+        strategy=SAM31_GPU_STRATEGY_PRESEED_SINGLE_PASS,
+        resource="frame_dir",
+        offload_video_to_cpu=True,
+        scaffold_uncached_frame_outputs=True,
     ),
 }
 
@@ -674,6 +694,7 @@ def _run_benchmark_locked(payload: dict[str, Any]) -> dict[str, Any]:
                 offload_video_to_cpu=config.offload_video_to_cpu,
                 strict_obj_id=True,
                 probe_frame_count=config.probe_frame_count,
+                scaffold_uncached_frame_outputs=config.scaffold_uncached_frame_outputs,
             )
             timings["sam_session_and_propagation"] = _round(
                 time.perf_counter() - inference_started_at
@@ -790,6 +811,7 @@ def _run_benchmark_locked(payload: dict[str, Any]) -> dict[str, Any]:
                     "strict_object_id": True,
                     "render_outputs": config.render_outputs,
                     "probe_frame_count": config.probe_frame_count,
+                    "scaffold_uncached_frame_outputs": config.scaffold_uncached_frame_outputs,
                 },
                 "runtime": runtime,
                 "timings_seconds": timings,

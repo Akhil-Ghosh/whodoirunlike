@@ -56,6 +56,40 @@ const EMPTY_DATA: DashboardData = {
   warmStages: [],
 };
 
+const CACHE_PREFIX = "wdirl.analytics.v1:";
+const CACHE_MAX_AGE_MS = 24 * 60 * 60 * 1_000;
+
+type AppProps = {
+  demoMode?: boolean;
+  dataLoader?: typeof loadDashboardData;
+  attemptLoader?: typeof loadAttemptDetail;
+  storage?: Pick<Storage, "getItem" | "setItem">;
+};
+
+function cacheKey(filters: DashboardFilters): string {
+  return `${CACHE_PREFIX}${JSON.stringify(filters)}`;
+}
+
+function cachedData(filters: DashboardFilters, storage?: Pick<Storage, "getItem">): DashboardData | null {
+  try {
+    const value = storage?.getItem(cacheKey(filters));
+    if (!value) return null;
+    const parsed = JSON.parse(value) as { savedAt?: number; data?: DashboardData };
+    if (!parsed.savedAt || !parsed.data || Date.now() - parsed.savedAt > CACHE_MAX_AGE_MS) return null;
+    return parsed.data;
+  } catch {
+    return null;
+  }
+}
+
+function storeCachedData(filters: DashboardFilters, data: DashboardData, storage?: Pick<Storage, "setItem">): void {
+  try {
+    storage?.setItem(cacheKey(filters), JSON.stringify({ savedAt: Date.now(), data }));
+  } catch {
+    // A private browser or full storage must not break the operator dashboard.
+  }
+}
+
 const NAVIGATION: Array<{ view: View; label: string; icon: typeof SquaresFour }> = [
   { view: "overview", label: "Overview", icon: SquaresFour },
   { view: "attempts", label: "Attempts", icon: ListMagnifyingGlass },
@@ -231,11 +265,15 @@ function Overview({
   );
 }
 
-export function App() {
-  const demoMode = import.meta.env.DEV;
+export function App({
+  demoMode = import.meta.env.DEV,
+  dataLoader = loadDashboardData,
+  attemptLoader = loadAttemptDetail,
+  storage = window.localStorage,
+}: AppProps = {}) {
   const [view, setView] = useState<View>("overview");
   const [filters, setFilters] = useState<DashboardFilters>(INITIAL_FILTERS);
-  const [data, setData] = useState<DashboardData>(demoMode ? mockData : EMPTY_DATA);
+  const [data, setData] = useState<DashboardData>(() => demoMode ? mockData : cachedData(INITIAL_FILTERS, storage) ?? EMPTY_DATA);
   const [loading, setLoading] = useState(!demoMode);
   const [error, setError] = useState<string | null>(null);
   const [refreshKey, setRefreshKey] = useState(0);
@@ -248,18 +286,15 @@ export function App() {
     const controller = new AbortController();
     setLoading(true);
     setError(null);
-    loadDashboardData(filters, controller.signal)
+    dataLoader(filters, controller.signal)
       .then((result) => {
         setData(result);
+        storeCachedData(filters, result, storage);
         setSelectedStage((current) => current ?? result.overview?.bottleneck_stage ?? result.stages[0]?.stage ?? null);
         setSelectedAttemptId((current) => current && result.attempts.some((attempt) => attempt.attempt_id === current) ? current : result.attempts[0]?.attempt_id ?? null);
       })
       .catch((reason: unknown) => {
         if (!controller.signal.aborted) {
-          setData(EMPTY_DATA);
-          setSelectedStage(null);
-          setSelectedAttemptId(null);
-          setAttemptEvents([]);
           setError(reason instanceof Error ? reason.message : "Analytics could not be loaded.");
         }
       })
@@ -267,7 +302,7 @@ export function App() {
         if (!controller.signal.aborted) setLoading(false);
       });
     return () => controller.abort();
-  }, [demoMode, filters, refreshKey]);
+  }, [dataLoader, demoMode, filters, refreshKey, storage]);
 
   const selectedAttempt = useMemo(
     () => data.attempts.find((attempt) => attempt.attempt_id === selectedAttemptId) ?? data.attempts[0] ?? null,
@@ -278,13 +313,13 @@ export function App() {
     if (demoMode || !selectedAttempt) return;
     const controller = new AbortController();
     setAttemptEvents([]);
-    loadAttemptDetail(selectedAttempt.attempt_id, controller.signal)
+    attemptLoader(selectedAttempt.attempt_id, controller.signal)
       .then(setAttemptEvents)
       .catch((reason: unknown) => {
         if (!controller.signal.aborted) setError(reason instanceof Error ? reason.message : "Attempt detail could not be loaded.");
       });
     return () => controller.abort();
-  }, [demoMode, selectedAttempt]);
+  }, [attemptLoader, demoMode, selectedAttempt?.attempt_id]);
 
   const gpuOptions = useMemo(() => [...new Set(data.attempts.map((attempt) => attempt.gpu_type).filter(Boolean) as string[])], [data.attempts]);
   const backendOptions = useMemo(() => [...new Set(data.attempts.map((attempt) => attempt.backend).filter(Boolean) as string[])], [data.attempts]);

@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import sys
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 
 
@@ -53,13 +54,16 @@ class DashboardQueryContractTests(unittest.TestCase):
         query = dashboard_queries.build_query(
             "stage_latency",
             {"range_days": 14, "cold_start": True, "backend": "runpod"},
+            as_of=datetime(2026, 7, 11, 18, 42, tzinfo=timezone.utc),
         )
         self.assertTrue(query.sql.startswith("-- dashboard-query:stage_latency"))
         self.assertIn("interval '14' day", query.sql)
         self.assertIn(
-            "from_iso8601_timestamp(event_time) >= current_timestamp - interval '14' day",
+            "from_iso8601_timestamp(event_time) >= from_iso8601_timestamp('2026-07-11T18:40:00Z') - interval '14' day",
             query.sql,
         )
+        self.assertNotIn("current_timestamp", query.sql)
+        self.assertNotIn("current_date", query.sql)
         self.assertIn("a.cold_start = true", query.sql)
         self.assertIn("a.backend = 'runpod'", query.sql)
         self.assertIn("THEN 'low' ELSE 'stable' END AS confidence", query.sql)
@@ -132,6 +136,16 @@ class DashboardQueryContractTests(unittest.TestCase):
         self.assertEqual(dashboard_queries.query_id_from_sql(query.sql), "freshness")
         self.assertIsNone(dashboard_queries.query_id_from_sql("SELECT 1"))
         self.assertIsNone(dashboard_queries.query_id_from_sql("-- dashboard-query:admin\nSELECT 1"))
+
+    def test_queries_are_stable_within_a_five_minute_cache_window(self) -> None:
+        first = dashboard_queries.build_query(
+            "freshness", as_of=datetime(2026, 7, 11, 18, 41, 2, tzinfo=timezone.utc)
+        )
+        second = dashboard_queries.build_query(
+            "freshness", as_of=datetime(2026, 7, 11, 18, 44, 59, tzinfo=timezone.utc)
+        )
+        self.assertEqual(first.sql, second.sql)
+        self.assertIn("from_iso8601_timestamp('2026-07-11T18:40:00Z')", first.sql)
 
 
 if __name__ == "__main__":

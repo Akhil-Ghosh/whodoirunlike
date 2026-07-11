@@ -264,7 +264,7 @@ test("gives the dashboard query Lambda only fixed table and result-prefix access
         ATHENA_DATABASE: "whodoirunlike_analytics",
         ATHENA_TABLE: "processing_events",
         ATHENA_WORKGROUP: "whodoirunlike-dashboard",
-        ATHENA_RESULT_REUSE_MINUTES: "1",
+        ATHENA_RESULT_REUSE_MINUTES: "5",
       }),
     },
   });

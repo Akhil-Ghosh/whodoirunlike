@@ -402,7 +402,7 @@ export class ProcessingAnalyticsStack extends cdk.Stack {
         ATHENA_DATABASE: databaseName,
         ATHENA_TABLE: tableName,
         ATHENA_WORKGROUP: dashboardWorkGroup.name,
-        ATHENA_RESULT_REUSE_MINUTES: "1",
+        ATHENA_RESULT_REUSE_MINUTES: "5",
         DASHBOARD_SECRET_ARN: dashboardSecret.secretArn,
         MAX_CLOCK_SKEW_SECONDS: "300",
       },

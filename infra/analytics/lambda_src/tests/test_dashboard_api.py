@@ -31,7 +31,7 @@ class DashboardApiTests(unittest.TestCase):
                 "ATHENA_DATABASE": "analytics",
                 "ATHENA_TABLE": "processing_events",
                 "ATHENA_WORKGROUP": "dashboard-workgroup",
-                "ATHENA_RESULT_REUSE_MINUTES": "1",
+                "ATHENA_RESULT_REUSE_MINUTES": "5",
             }
         )
 
@@ -99,7 +99,7 @@ class DashboardApiTests(unittest.TestCase):
         self.assertTrue(call["QueryString"].startswith("-- dashboard-query:overview"))
         self.assertEqual(
             call["ResultReuseConfiguration"]["ResultReuseByAgeConfiguration"],
-            {"Enabled": True, "MaxAgeInMinutes": 1},
+            {"Enabled": True, "MaxAgeInMinutes": 5},
         )
         self.assertEqual(len(call["ClientRequestToken"]), 64)
 

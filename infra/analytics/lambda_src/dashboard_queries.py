@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import re
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any, Callable, Mapping
 
 
@@ -470,10 +471,32 @@ BUILDERS: dict[str, Callable[[Any], DashboardQuery]] = {
 }
 
 
-def build_query(query_id: Any, parameters: Any = None) -> DashboardQuery:
+def _cache_window(as_of: datetime | None) -> datetime:
+    current = as_of or datetime.now(timezone.utc)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=timezone.utc)
+    current = current.astimezone(timezone.utc)
+    return current.replace(minute=current.minute - current.minute % 5, second=0, microsecond=0)
+
+
+def _freeze_relative_time(query: DashboardQuery, as_of: datetime | None) -> DashboardQuery:
+    frozen = _cache_window(as_of)
+    timestamp = frozen.strftime("%Y-%m-%dT%H:%M:%SZ")
+    date = frozen.strftime("%Y-%m-%d")
+    sql = query.sql.replace("current_timestamp", f"from_iso8601_timestamp('{timestamp}')")
+    sql = sql.replace("current_date", f"DATE '{date}'")
+    return DashboardQuery(query.query_id, sql, query.max_rows)
+
+
+def build_query(
+    query_id: Any,
+    parameters: Any = None,
+    *,
+    as_of: datetime | None = None,
+) -> DashboardQuery:
     if not isinstance(query_id, str) or query_id not in BUILDERS:
         raise QueryContractError("query is not allowlisted")
-    return BUILDERS[query_id](parameters)
+    return _freeze_relative_time(BUILDERS[query_id](parameters), as_of)
 
 
 def query_id_from_sql(sql: Any) -> str | None:

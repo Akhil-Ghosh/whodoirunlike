@@ -532,3 +532,90 @@ def test_collect_sam31_masks_preseeds_track_anchors_before_single_propagation(
     assert diagnostics["anchor_refinement_triggered"] is False
     assert len(diagnostics["propagation"]) == 1
     assert sorted(masks) == list(range(6))
+
+
+def test_collect_sam31_masks_probes_before_anchor_refinement(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    class FakeInferenceMode:
+        def __enter__(self) -> None:
+            return None
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+    fake_torch = types.SimpleNamespace(
+        float32="float32",
+        int32="int32",
+        tensor=lambda data, **_kwargs: np.asarray(data),
+        inference_mode=lambda: FakeInferenceMode(),
+    )
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+
+    class FakePredictor:
+        def __init__(self) -> None:
+            self.stream_requests: list[dict[str, object]] = []
+
+        def handle_request(self, *, request: dict[str, object]) -> dict[str, object]:
+            if request["type"] == "start_session":
+                return {"session_id": "session-1"}
+            if request["type"] == "close_session":
+                return {}
+            if request["type"] == "add_prompt":
+                return {
+                    "outputs": {
+                        "out_obj_ids": np.array([1]),
+                        "out_binary_masks": np.array([[[1, 0], [0, 0]]], dtype=np.uint8),
+                    }
+                }
+            raise AssertionError(f"unexpected request: {request['type']}")
+
+        def handle_stream_request(self, *, request: dict[str, object]) -> list[dict[str, object]]:
+            self.stream_requests.append(request)
+            frame_indices = [0] if len(self.stream_requests) == 1 else list(range(6))
+            return [
+                {
+                    "frame_index": frame_index,
+                    "outputs": {
+                        "out_obj_ids": np.array([1]),
+                        "out_binary_masks": np.array([[[1, 1], [0, 0]]], dtype=np.uint8),
+                    },
+                }
+                for frame_index in frame_indices
+            ]
+
+    predictor = FakePredictor()
+    masks, diagnostics = _collect_sam31_masks(
+        predictor=predictor,
+        video_path=tmp_path / "clip.mp4",
+        prompt={
+            "frame_index": 0,
+            "box": np.array([0, 0, 2, 2], dtype=np.float32),
+            "points": np.array([[1, 1]], dtype=np.float32),
+            "labels": np.array([1], dtype=np.int32),
+        },
+        width=2,
+        height=2,
+        frame_count=6,
+        obj_id=1,
+        track_boxes={
+            frame_index: np.array([0, 0, 2, 2], dtype=np.float32)
+            for frame_index in range(6)
+        },
+        strategy="probe_then_anchor",
+        probe_frame_count=2,
+        max_anchors=3,
+        strict_obj_id=True,
+    )
+
+    assert len(predictor.stream_requests) == 2
+    assert predictor.stream_requests[0]["max_frame_num_to_track"] == 2
+    assert "max_frame_num_to_track" not in predictor.stream_requests[1]
+    assert diagnostics["anchor_refinement_triggered"] is True
+    assert diagnostics["anchor_refinement_frames"] == [0, 2, 4]
+    assert [item["pass"] for item in diagnostics["propagation"]] == [
+        "primary_prompt",
+        "anchor_refinement",
+    ]
+    assert sorted(masks) == list(range(6))

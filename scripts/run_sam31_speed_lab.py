@@ -41,6 +41,10 @@ VARIANT_IDS = (
     "preseed_single_pass_frame_dir",
     "preseed_single_pass_offload_video_cpu",
     "preseed_single_pass_max_objects_1",
+    "probe_then_anchor_1",
+    "probe_then_anchor_8",
+    "probe_then_anchor_24",
+    "probe_then_anchor_64",
 )
 
 

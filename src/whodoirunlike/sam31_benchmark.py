@@ -27,6 +27,7 @@ from whodoirunlike.sam2_runner import (
 from whodoirunlike.sam31_gpu_runner import (
     DEFAULT_SAM31_GPU_OBJ_ID,
     SAM31_GPU_STRATEGY_PRESEED_SINGLE_PASS,
+    SAM31_GPU_STRATEGY_PROBE_THEN_ANCHOR,
     SAM31_GPU_STRATEGY_PRODUCTION_CONTROL,
     _collect_sam31_masks,
     _configure_interactive_tracker_for_user_prompt,
@@ -80,6 +81,7 @@ class VariantConfig:
     compile: bool = False
     warm_up: bool = False
     render_outputs: bool = True
+    probe_frame_count: int | None = None
 
 
 VARIANTS = {
@@ -96,6 +98,22 @@ VARIANTS = {
     "preseed_single_pass_max_objects_1": VariantConfig(
         strategy=SAM31_GPU_STRATEGY_PRESEED_SINGLE_PASS,
         max_num_objects=1,
+    ),
+    "probe_then_anchor_1": VariantConfig(
+        strategy=SAM31_GPU_STRATEGY_PROBE_THEN_ANCHOR,
+        probe_frame_count=1,
+    ),
+    "probe_then_anchor_8": VariantConfig(
+        strategy=SAM31_GPU_STRATEGY_PROBE_THEN_ANCHOR,
+        probe_frame_count=8,
+    ),
+    "probe_then_anchor_24": VariantConfig(
+        strategy=SAM31_GPU_STRATEGY_PROBE_THEN_ANCHOR,
+        probe_frame_count=24,
+    ),
+    "probe_then_anchor_64": VariantConfig(
+        strategy=SAM31_GPU_STRATEGY_PROBE_THEN_ANCHOR,
+        probe_frame_count=64,
     ),
 }
 
@@ -636,6 +654,8 @@ def _run_benchmark_locked(payload: dict[str, Any]) -> dict[str, Any]:
             timings["model_build"] = predictor_info["model_build"]
             diagnostics["predictor_cache_hit"] = predictor_info["cache_hit"]
             diagnostics["tracker_config"] = predictor_info["tracker_config"]
+            if predictor_info["cache_hit"]:
+                torch.cuda.reset_peak_memory_stats()
             memory["after_model_load"] = _cuda_memory(torch)
 
             torch.cuda.reset_peak_memory_stats()
@@ -653,6 +673,7 @@ def _run_benchmark_locked(payload: dict[str, Any]) -> dict[str, Any]:
                 strategy=config.strategy,
                 offload_video_to_cpu=config.offload_video_to_cpu,
                 strict_obj_id=True,
+                probe_frame_count=config.probe_frame_count,
             )
             timings["sam_session_and_propagation"] = _round(
                 time.perf_counter() - inference_started_at
@@ -768,6 +789,7 @@ def _run_benchmark_locked(payload: dict[str, Any]) -> dict[str, Any]:
                     "use_fa3": False,
                     "strict_object_id": True,
                     "render_outputs": config.render_outputs,
+                    "probe_frame_count": config.probe_frame_count,
                 },
                 "runtime": runtime,
                 "timings_seconds": timings,

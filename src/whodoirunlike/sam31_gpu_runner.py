@@ -24,6 +24,7 @@ DEFAULT_SAM31_GPU_TRACK_PROMPT_ANCHORS = 6
 DEFAULT_SAM31_GPU_DISABLE_DEMO_SUPPRESSION = True
 SAM31_GPU_STRATEGY_PRODUCTION_CONTROL = "production_control"
 SAM31_GPU_STRATEGY_PRESEED_SINGLE_PASS = "preseed_single_pass"
+SAM31_GPU_STRATEGY_PROBE_THEN_ANCHOR = "probe_then_anchor"
 Sam31GpuProgressCallback = Callable[[dict[str, Any]], None]
 
 
@@ -349,6 +350,7 @@ def _collect_stream_masks(
     direction: str,
     progress_callback: Callable[[int, int, str], None] | None = None,
     strict_obj_id: bool = False,
+    max_frame_num_to_track: int | None = None,
 ) -> dict[str, Any]:
     import torch
 
@@ -358,14 +360,15 @@ def _collect_stream_masks(
     _synchronize_cuda(torch)
     started_at = time.perf_counter()
     try:
-        for stream_response in predictor.handle_stream_request(
-            request={
-                "type": "propagate_in_video",
-                "session_id": session_id,
-                "propagation_direction": direction,
-                "start_frame_index": start_frame_index,
-            }
-        ):
+        request: dict[str, Any] = {
+            "type": "propagate_in_video",
+            "session_id": session_id,
+            "propagation_direction": direction,
+            "start_frame_index": start_frame_index,
+        }
+        if max_frame_num_to_track is not None:
+            request["max_frame_num_to_track"] = max_frame_num_to_track
+        for stream_response in predictor.handle_stream_request(request=request):
             responses += 1
             frame_index = int(stream_response["frame_index"])
             outputs = stream_response.get("outputs") or {}
@@ -389,6 +392,7 @@ def _collect_stream_masks(
             "responses": responses,
             "masks": masks,
             "object_id_mismatches": object_id_mismatches,
+            "max_frame_num_to_track": max_frame_num_to_track,
             "elapsed_seconds": round(time.perf_counter() - started_at, 6),
             "warning": str(exc),
         }
@@ -399,6 +403,7 @@ def _collect_stream_masks(
         "responses": responses,
         "masks": masks,
         "object_id_mismatches": object_id_mismatches,
+        "max_frame_num_to_track": max_frame_num_to_track,
         "elapsed_seconds": round(time.perf_counter() - started_at, 6),
     }
 
@@ -414,6 +419,7 @@ def _propagate_from_seed_frame(
     directions: tuple[str, ...] = ("forward", "backward"),
     progress_callback: Callable[[int, int, str], None] | None = None,
     strict_obj_id: bool = False,
+    max_frame_num_to_track: int | None = None,
 ) -> list[dict[str, Any]]:
     diagnostics = []
     for direction in directions:
@@ -426,6 +432,7 @@ def _propagate_from_seed_frame(
             direction=direction,
             progress_callback=progress_callback,
             strict_obj_id=strict_obj_id,
+            max_frame_num_to_track=max_frame_num_to_track,
         )
         result["pass"] = label
         diagnostics.append(result)
@@ -448,15 +455,21 @@ def _collect_sam31_masks(
     offload_video_to_cpu: bool = False,
     offload_state_to_cpu: bool = False,
     strict_obj_id: bool = False,
+    probe_frame_count: int | None = None,
 ) -> tuple[dict[int, np.ndarray], dict[str, Any]]:
     import torch
 
     valid_strategies = {
         SAM31_GPU_STRATEGY_PRODUCTION_CONTROL,
         SAM31_GPU_STRATEGY_PRESEED_SINGLE_PASS,
+        SAM31_GPU_STRATEGY_PROBE_THEN_ANCHOR,
     }
     if strategy not in valid_strategies:
         raise ValueError(f"Unsupported SAM 3.1 propagation strategy: {strategy}")
+    if strategy == SAM31_GPU_STRATEGY_PROBE_THEN_ANCHOR and (
+        probe_frame_count is None or probe_frame_count <= 0
+    ):
+        raise ValueError("probe_then_anchor requires a positive probe_frame_count")
 
     start_session_request: dict[str, Any] = {
         "type": "start_session",
@@ -484,6 +497,7 @@ def _collect_sam31_masks(
             "start_session": round(time.perf_counter() - start_session_started_at, 6),
         },
         "strict_obj_id": strict_obj_id,
+        "probe_frame_count": probe_frame_count,
     }
     try:
         prompt_frame = max(0, min(int(prompt["frame_index"]), max(frame_count - 1, 0)))
@@ -643,13 +657,22 @@ def _collect_sam31_masks(
                     directions=("forward",) if seed_frame == 0 else ("forward", "backward"),
                     progress_callback=progress_callback,
                     strict_obj_id=strict_obj_id,
+                    max_frame_num_to_track=(
+                        probe_frame_count
+                        if strategy == SAM31_GPU_STRATEGY_PROBE_THEN_ANCHOR
+                        else None
+                    ),
                 )
             )
 
             track_frame_target = len(track_boxes or {}) or frame_count
             anchor_refine_threshold = max(12, int(track_frame_target * 0.65))
             needs_anchor_refinement = (
-                strategy == SAM31_GPU_STRATEGY_PRODUCTION_CONTROL
+                strategy
+                in {
+                    SAM31_GPU_STRATEGY_PRODUCTION_CONTROL,
+                    SAM31_GPU_STRATEGY_PROBE_THEN_ANCHOR,
+                }
                 and len(masks_by_frame) < anchor_refine_threshold
             )
             diagnostics["anchor_refinement_threshold"] = anchor_refine_threshold

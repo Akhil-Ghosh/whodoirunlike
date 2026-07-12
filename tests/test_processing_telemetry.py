@@ -161,6 +161,109 @@ def test_progress_reporter_throttles_to_five_seconds_and_tracks_phase_spans(
     ]
 
 
+def test_heartbeat_reports_each_parallel_active_stage_without_misattribution(
+    tmp_path: Path,
+) -> None:
+    delivered: list[dict[str, Any]] = []
+    telemetry = processing_telemetry.ProcessingTelemetry(
+        run_id="12345678-1234-4234-9234-123456789abc",
+        attempt_id=ATTEMPT_ID,
+        local_path=tmp_path / "events.jsonl",
+        progress_interval_seconds=0.01,
+        event_sender=delivered.append,
+        asynchronous_delivery=False,
+        resource_sampler=lambda: {},
+        start_heartbeat=True,
+    )
+    entered = threading.Barrier(3)
+    release = threading.Event()
+
+    def hold_stage(stage: str) -> None:
+        with telemetry.stage(stage):
+            telemetry.sample_progress(
+                stage=stage,
+                span=None,
+                progress={"phase": f"{stage}_work"},
+                force=True,
+            )
+            entered.wait()
+            assert release.wait(timeout=1.0)
+
+    pose_thread = threading.Thread(target=hold_stage, args=("pose_sequence",))
+    densepose_thread = threading.Thread(target=hold_stage, args=("densepose_body_map",))
+    pose_thread.start()
+    densepose_thread.start()
+    entered.wait()
+
+    deadline = time.monotonic() + 0.5
+    heartbeat_stages: set[str] = set()
+    while time.monotonic() < deadline:
+        heartbeat_stages = {
+            str(event["stage"])
+            for event in delivered
+            if event["event_type"] == "progress_sampled"
+            and event.get("progress", {}).get("heartbeat") is True
+        }
+        if heartbeat_stages == {"pose_sequence", "densepose_body_map"}:
+            break
+        time.sleep(0.01)
+
+    release.set()
+    pose_thread.join(timeout=1.0)
+    densepose_thread.join(timeout=1.0)
+    telemetry.close()
+
+    assert heartbeat_stages == {"pose_sequence", "densepose_body_map"}
+    heartbeat_phases = {
+        str(event["stage"]): event["progress"]["phase"]
+        for event in delivered
+        if event["event_type"] == "progress_sampled"
+        and event.get("progress", {}).get("heartbeat") is True
+    }
+    assert heartbeat_phases == {
+        "pose_sequence": "pose_sequence_work",
+        "densepose_body_map": "densepose_body_map_work",
+    }
+
+
+def test_heartbeat_preserves_serial_leaf_span_behavior(tmp_path: Path) -> None:
+    delivered: list[dict[str, Any]] = []
+    telemetry = processing_telemetry.ProcessingTelemetry(
+        run_id="12345678-1234-4234-9234-123456789abc",
+        attempt_id=ATTEMPT_ID,
+        local_path=tmp_path / "events.jsonl",
+        progress_interval_seconds=0.01,
+        event_sender=delivered.append,
+        asynchronous_delivery=False,
+        resource_sampler=lambda: {},
+        start_heartbeat=True,
+    )
+
+    with telemetry.stage("pose_sequence"):
+        with telemetry.span("pose_sequence", "inference"):
+            deadline = time.monotonic() + 0.5
+            while time.monotonic() < deadline:
+                if any(
+                    event["event_type"] == "progress_sampled"
+                    and event.get("progress", {}).get("heartbeat") is True
+                    for event in delivered
+                ):
+                    break
+                time.sleep(0.01)
+            heartbeats = [
+                event
+                for event in delivered
+                if event["event_type"] == "progress_sampled"
+                and event.get("progress", {}).get("heartbeat") is True
+            ]
+    telemetry.close()
+
+    assert heartbeats
+    assert {(event["stage"], event["span"]) for event in heartbeats} == {
+        ("pose_sequence", "inference")
+    }
+
+
 def test_failed_boundary_emits_sanitized_classified_error(tmp_path: Path) -> None:
     clock = FakeClock()
     telemetry = _telemetry(tmp_path, clock)
@@ -400,7 +503,7 @@ def test_async_sender_keeps_delivery_off_caller_thread(tmp_path: Path) -> None:
     assert all(not thread.is_alive() for thread in telemetry._async_sender._threads)
 
 
-def test_async_sender_delivers_two_hundred_slow_events_with_bounded_wall_time(
+def test_async_sender_delivers_two_hundred_events_with_worker_concurrency(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -408,13 +511,17 @@ def test_async_sender_delivers_two_hundred_slow_events_with_bounded_wall_time(
     delivery_lock = threading.Lock()
     active_senders = 0
     peak_active_senders = 0
+    concurrent_senders_started = threading.Event()
+    release_senders = threading.Event()
 
     def slow_sender(event: dict[str, Any]) -> None:
         nonlocal active_senders, peak_active_senders
         with delivery_lock:
             active_senders += 1
             peak_active_senders = max(peak_active_senders, active_senders)
-        time.sleep(0.015)
+            if active_senders >= 4:
+                concurrent_senders_started.set()
+        assert release_senders.wait(timeout=2.0)
         with delivery_lock:
             delivered.append(event)
             active_senders -= 1
@@ -439,6 +546,8 @@ def test_async_sender_delivers_two_hundred_slow_events_with_bounded_wall_time(
             status="running",
         )
     telemetry.attempt_completed()
+    assert concurrent_senders_started.wait(timeout=2.0)
+    release_senders.set()
     assert telemetry.close(timeout=3.0) is True
     elapsed = time.monotonic() - started
 
@@ -449,7 +558,7 @@ def test_async_sender_delivers_two_hundred_slow_events_with_bounded_wall_time(
     terminal = next(event for event in delivered if event["event_type"] == "attempt_completed")
     assert terminal["sequence"] == 200
     assert peak_active_senders >= 4
-    assert elapsed < 1.5
+    assert elapsed < 3.0
     assert telemetry.delivery_measurements() == {
         "telemetry_delivery_pending": 0,
         "telemetry_delivery_failures": 0,
@@ -459,6 +568,7 @@ def test_async_sender_delivers_two_hundred_slow_events_with_bounded_wall_time(
     assert telemetry._async_sender is not None
     assert len(telemetry._async_sender._threads) == 6
     assert all(not thread.is_alive() for thread in telemetry._async_sender._threads)
+    assert telemetry._local_output is None
 
 
 def test_async_sender_mixed_concurrent_outcomes_do_not_open_circuit_or_drop_queue(

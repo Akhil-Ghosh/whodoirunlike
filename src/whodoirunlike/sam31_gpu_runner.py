@@ -16,7 +16,9 @@ from whodoirunlike.sam2_runner import (
     extract_video_frames,
     inspect_video,
     load_prompt,
+    write_mask_presentation_outputs,
     write_mask_outputs,
+    write_runner_mask_data_outputs,
 )
 
 
@@ -1005,6 +1007,8 @@ def run_sam31_gpu_mask(
     force_frames: bool = False,
     obj_id: int = DEFAULT_SAM31_GPU_OBJ_ID,
     progress_callback: Sam31GpuProgressCallback | None = None,
+    runner_mask_ready_callback: Callable[[], None] | None = None,
+    render_qa_overlay: bool = True,
 ) -> dict[str, Any]:
     try:
         from sam3.model_builder import build_sam3_multiplex_video_predictor
@@ -1130,21 +1134,40 @@ def run_sam31_gpu_mask(
     masks_by_frame, identity_filter = _filter_masks_to_track_boxes(masks_by_frame, track_boxes)
     prompt_summary["identity_filter"] = identity_filter
 
-    emit_progress("rendering", len(masks_by_frame), total_frames=len(frame_paths))
-    write_mask_outputs(
-        frame_paths=frame_paths,
-        masks_by_frame=masks_by_frame,
-        fps=video_meta["fps"],
-        runner_mask_path=runner_mask_path,
-        masked_runner_path=masked_runner_path,
-        qa_overlay_path=qa_overlay_path,
-        metadata_path=metadata_path,
-        phase_callback=lambda phase: emit_progress(
-            phase,
-            len(masks_by_frame),
-            total_frames=len(frame_paths),
-        ),
-    )
+    split_presentation = runner_mask_ready_callback is not None or not render_qa_overlay
+
+    def write_current_mask_data() -> None:
+        emit_progress("rendering", len(masks_by_frame), total_frames=len(frame_paths))
+        if split_presentation:
+            write_runner_mask_data_outputs(
+                frame_paths=frame_paths,
+                masks_by_frame=masks_by_frame,
+                fps=video_meta["fps"],
+                runner_mask_path=runner_mask_path,
+                metadata_path=metadata_path,
+                phase_callback=lambda phase: emit_progress(
+                    phase,
+                    len(masks_by_frame),
+                    total_frames=len(frame_paths),
+                ),
+            )
+            return
+        write_mask_outputs(
+            frame_paths=frame_paths,
+            masks_by_frame=masks_by_frame,
+            fps=video_meta["fps"],
+            runner_mask_path=runner_mask_path,
+            masked_runner_path=masked_runner_path,
+            qa_overlay_path=qa_overlay_path,
+            metadata_path=metadata_path,
+            phase_callback=lambda phase: emit_progress(
+                phase,
+                len(masks_by_frame),
+                total_frames=len(frame_paths),
+            ),
+        )
+
+    write_current_mask_data()
     mask_summary = write_masks_jsonl_from_video(runner_mask_path, masks_jsonl_path)
     fallback: dict[str, Any] | None = None
     nonempty_frames = int(mask_summary.get("nonempty_frames") or 0)
@@ -1170,25 +1193,30 @@ def run_sam31_gpu_mask(
             combined_masks = dict(fallback_masks)
             combined_masks.update(masks_by_frame)
             masks_by_frame = combined_masks
-            emit_progress("rendering", len(masks_by_frame), total_frames=len(frame_paths))
-            write_mask_outputs(
-                frame_paths=frame_paths,
-                masks_by_frame=masks_by_frame,
-                fps=video_meta["fps"],
-                runner_mask_path=runner_mask_path,
-                masked_runner_path=masked_runner_path,
-                qa_overlay_path=qa_overlay_path,
-                metadata_path=metadata_path,
-                phase_callback=lambda phase: emit_progress(
-                    phase,
-                    len(masks_by_frame),
-                    total_frames=len(frame_paths),
-                ),
-            )
+            write_current_mask_data()
             mask_summary = write_masks_jsonl_from_video(runner_mask_path, masks_jsonl_path)
             fallback["nonempty_frames_after_fallback"] = int(mask_summary.get("nonempty_frames") or 0)
         else:
             fallback["nonempty_frames_after_fallback"] = 0
+    data_ready_seconds = time.perf_counter() - start
+    emit_progress("analytical_mask_ready", len(frame_paths), total_frames=len(frame_paths))
+    if split_presentation:
+        if runner_mask_ready_callback is not None:
+            runner_mask_ready_callback()
+        emit_progress("rendering", len(masks_by_frame), total_frames=len(frame_paths))
+        write_mask_presentation_outputs(
+            frame_paths=frame_paths,
+            masks_by_frame=masks_by_frame,
+            fps=video_meta["fps"],
+            masked_runner_path=masked_runner_path,
+            qa_overlay_path=qa_overlay_path,
+            render_qa_overlay=render_qa_overlay,
+            phase_callback=lambda phase: emit_progress(
+                phase,
+                len(masks_by_frame),
+                total_frames=len(frame_paths),
+            ),
+        )
     elapsed_seconds = time.perf_counter() - start
     emit_progress("completed", len(frame_paths), total_frames=len(frame_paths))
     update_manifest_after_sam31_gpu(
@@ -1215,6 +1243,7 @@ def run_sam31_gpu_mask(
         "predictor_lock_wait_seconds": float(predictor_cache["lock_wait_seconds"]),
         "prompting": prompt_summary,
         "fallback": fallback,
+        "data_ready_seconds": round(data_ready_seconds, 3),
         "elapsed_seconds": round(elapsed_seconds, 3),
         "runner_mask": str(runner_mask_path),
         "masked_runner": str(masked_runner_path),

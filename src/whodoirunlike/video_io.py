@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 import subprocess
 import tempfile
 from pathlib import Path
@@ -54,5 +55,19 @@ def make_browser_playable_mp4(path: Path, *, crf: int = 20) -> None:
 
 
 def make_browser_playable_mp4s(paths: Iterable[Path], *, crf: int = 20) -> None:
-    for path in paths:
-        make_browser_playable_mp4(path, crf=crf)
+    queued_paths = list(paths)
+    if len(queued_paths) < 2:
+        for path in queued_paths:
+            make_browser_playable_mp4(path, crf=crf)
+        return
+
+    with ThreadPoolExecutor(
+        max_workers=min(3, len(queued_paths)),
+        thread_name_prefix="video-encode",
+    ) as executor:
+        futures = [
+            executor.submit(make_browser_playable_mp4, path, crf=crf)
+            for path in queued_paths
+        ]
+        for future in futures:
+            future.result()

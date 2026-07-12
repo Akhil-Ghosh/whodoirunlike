@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+import threading
+import weakref
 from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import Any
@@ -32,6 +34,7 @@ CANONICAL_ARTIFACT_FILENAMES: Mapping[str, str] = {
     "fused_form_parquet": "fused_form.parquet",
     "skeleton_render": "skeleton_render.mp4",
     "masked_runner": "masked_runner.mp4",
+    "pose_qa_overlay": "pose_qa_overlay.mp4",
     "qa_overlay": "qa_overlay.mp4",
     "fused_overlay": "fused_overlay.mp4",
     "qc_metrics": "qc_metrics.json",
@@ -54,6 +57,20 @@ MANIFEST_ARTIFACT_KEYS = tuple(
 
 _ARTIFACT_ALIASES = {"target_prompt": "person_prompt"}
 _MISSING = object()
+_MANIFEST_LOCKS_GUARD = threading.Lock()
+_MANIFEST_LOCKS: weakref.WeakValueDictionary[Path, threading.RLock] = (
+    weakref.WeakValueDictionary()
+)
+
+
+def _manifest_lock(path: Path) -> threading.RLock:
+    key = path.resolve(strict=False)
+    with _MANIFEST_LOCKS_GUARD:
+        lock = _MANIFEST_LOCKS.get(key)
+        if lock is None:
+            lock = threading.RLock()
+            _MANIFEST_LOCKS[key] = lock
+        return lock
 
 
 def _manifest_copy(manifest: Mapping[str, Any]) -> dict[str, Any]:
@@ -87,6 +104,7 @@ class RunningClipRun:
 
     def __init__(self, run_dir: Path) -> None:
         self.run_dir = Path(run_dir)
+        self._lock = _manifest_lock(self.manifest_path)
 
     @property
     def manifest_path(self) -> Path:
@@ -97,33 +115,35 @@ class RunningClipRun:
         return {key: str(self.run_dir / CANONICAL_ARTIFACT_FILENAMES[key]) for key in selected_keys}
 
     def read_manifest(self) -> dict[str, Any]:
-        payload = json.loads(self.manifest_path.read_text(encoding="utf-8"))
-        return _manifest_copy(payload)
+        with self._lock:
+            payload = json.loads(self.manifest_path.read_text(encoding="utf-8"))
+            return _manifest_copy(payload)
 
     def write_manifest(self, manifest: Mapping[str, Any]) -> Path:
-        payload = _manifest_copy(manifest)
-        self.run_dir.mkdir(parents=True, exist_ok=True)
+        with self._lock:
+            payload = _manifest_copy(manifest)
+            self.run_dir.mkdir(parents=True, exist_ok=True)
 
-        temporary_path: Path | None = None
-        try:
-            with tempfile.NamedTemporaryFile(
-                "w",
-                delete=False,
-                dir=self.run_dir,
-                encoding="utf-8",
-                prefix=f".{MANIFEST_FILENAME}.",
-                suffix=".tmp",
-            ) as temporary_file:
-                temporary_path = Path(temporary_file.name)
-                json.dump(payload, temporary_file, indent=2)
-                temporary_file.write("\n")
-                temporary_file.flush()
-                os.fsync(temporary_file.fileno())
-            os.replace(temporary_path, self.manifest_path)
-        except Exception:
-            if temporary_path is not None:
-                temporary_path.unlink(missing_ok=True)
-            raise
+            temporary_path: Path | None = None
+            try:
+                with tempfile.NamedTemporaryFile(
+                    "w",
+                    delete=False,
+                    dir=self.run_dir,
+                    encoding="utf-8",
+                    prefix=f".{MANIFEST_FILENAME}.",
+                    suffix=".tmp",
+                ) as temporary_file:
+                    temporary_path = Path(temporary_file.name)
+                    json.dump(payload, temporary_file, indent=2)
+                    temporary_file.write("\n")
+                    temporary_file.flush()
+                    os.fsync(temporary_file.fileno())
+                os.replace(temporary_path, self.manifest_path)
+            except Exception:
+                if temporary_path is not None:
+                    temporary_path.unlink(missing_ok=True)
+                raise
 
         return self.manifest_path
 
@@ -184,22 +204,44 @@ class RunningClipRun:
         if not isinstance(updates, Mapping):
             raise ValueError("Running Clip Run stage updates must be an object")
 
-        updated = self.read_manifest() if manifest is None else _manifest_copy(manifest)
-        stages = dict(updated.get("stages", {}))
-        for stage, values in updates.items():
-            if not isinstance(values, Mapping):
-                raise ValueError("Running Clip Run stage values must be an object")
-            existing_stage = stages.get(stage, {})
-            if not isinstance(existing_stage, Mapping):
-                raise ValueError(f"Running Clip Run stage '{stage}' must be an object")
+        with self._lock:
+            supplied = _manifest_copy(manifest) if manifest is not None else None
+            if self.manifest_path.is_file():
+                updated = self.read_manifest()
+                if supplied is not None:
+                    for key, value in supplied.items():
+                        if key not in {"paths", "stages"}:
+                            if (
+                                key == "updated_at"
+                                and isinstance(value, str)
+                                and isinstance(updated.get(key), str)
+                                and updated[key] > value
+                            ):
+                                continue
+                            updated[key] = value
+                    supplied_paths = supplied.get("paths", {})
+                    paths = dict(updated.get("paths", {}))
+                    paths.update(supplied_paths)
+                    updated["paths"] = paths
+            else:
+                updated = supplied or {}
 
-            merged_stage = dict(existing_stage)
-            merged_stage.update(values)
-            stages[stage] = merged_stage
+            stages = dict(updated.get("stages", {}))
+            supplied_stages = dict(supplied.get("stages", {})) if supplied is not None else {}
+            for stage, values in updates.items():
+                if not isinstance(values, Mapping):
+                    raise ValueError("Running Clip Run stage values must be an object")
+                existing_stage = supplied_stages.get(stage, stages.get(stage, {}))
+                if not isinstance(existing_stage, Mapping):
+                    raise ValueError(f"Running Clip Run stage '{stage}' must be an object")
 
-        updated["stages"] = stages
-        self.write_manifest(updated)
-        return updated
+                merged_stage = dict(existing_stage)
+                merged_stage.update(values)
+                stages[stage] = merged_stage
+
+            updated["stages"] = stages
+            self.write_manifest(updated)
+            return updated
 
     def existing_artifacts(
         self,

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -31,6 +32,7 @@ LEGACY_CANONICAL_FILENAMES = {
     "fused_form_parquet": "fused_form.parquet",
     "skeleton_render": "skeleton_render.mp4",
     "masked_runner": "masked_runner.mp4",
+    "pose_qa_overlay": "pose_qa_overlay.mp4",
     "qa_overlay": "qa_overlay.mp4",
     "fused_overlay": "fused_overlay.mp4",
     "qc_metrics": "qc_metrics.json",
@@ -180,6 +182,112 @@ def test_update_stage_merges_only_selected_stage_and_writes_manifest(tmp_path: P
         "output": "pose.jsonl",
     }
     assert run.read_manifest() == updated
+
+
+def test_concurrent_stage_updates_from_stale_snapshots_preserve_both_results(
+    tmp_path: Path,
+) -> None:
+    run = RunningClipRun(tmp_path / "run")
+    run.write_manifest(
+        {
+            "version": 1,
+            "paths": {},
+            "stages": {
+                "pose": {"status": "pending"},
+                "densepose": {"status": "pending"},
+            },
+        }
+    )
+    pose_snapshot = run.read_manifest()
+    densepose_snapshot = run.read_manifest()
+    pose_snapshot["paths"]["pose_qa_overlay"] = "pose_qa_overlay.mp4"
+    densepose_snapshot["paths"]["qa_overlay"] = "qa_overlay.mp4"
+    start = threading.Barrier(3)
+
+    def update_pose() -> None:
+        start.wait()
+        RunningClipRun(run.run_dir).update_stage(
+            "pose",
+            {"status": "complete", "output": "pose.jsonl"},
+            pose_snapshot,
+        )
+
+    def update_densepose() -> None:
+        start.wait()
+        RunningClipRun(run.run_dir).update_stage(
+            "densepose",
+            {"status": "complete", "output": "densepose.jsonl"},
+            densepose_snapshot,
+        )
+
+    pose_thread = threading.Thread(target=update_pose)
+    densepose_thread = threading.Thread(target=update_densepose)
+    pose_thread.start()
+    densepose_thread.start()
+    start.wait()
+    pose_thread.join(timeout=2.0)
+    densepose_thread.join(timeout=2.0)
+
+    assert not pose_thread.is_alive()
+    assert not densepose_thread.is_alive()
+    manifest = run.read_manifest()
+    assert manifest["stages"]["pose"] == {
+        "status": "complete",
+        "output": "pose.jsonl",
+    }
+    assert manifest["stages"]["densepose"] == {
+        "status": "complete",
+        "output": "densepose.jsonl",
+    }
+    assert manifest["paths"] == {
+        "pose_qa_overlay": "pose_qa_overlay.mp4",
+        "qa_overlay": "qa_overlay.mp4",
+    }
+
+
+def test_stale_stage_snapshot_cannot_move_updated_at_backward(tmp_path: Path) -> None:
+    run = RunningClipRun(tmp_path / "run")
+    run.write_manifest(
+        {
+            "version": 1,
+            "updated_at": "2026-07-11T18:05:00+00:00",
+            "paths": {},
+            "stages": {"pose": {"status": "pending"}},
+        }
+    )
+    stale_snapshot = run.read_manifest()
+    stale_snapshot["updated_at"] = "2026-07-11T18:04:00+00:00"
+
+    run.update_stage("pose", {"status": "complete"}, stale_snapshot)
+
+    assert run.read_manifest()["updated_at"] == "2026-07-11T18:05:00+00:00"
+
+
+def test_stage_owner_can_clear_stale_error_without_replacing_other_stages(
+    tmp_path: Path,
+) -> None:
+    run = RunningClipRun(tmp_path / "run")
+    run.write_manifest(
+        {
+            "version": 1,
+            "paths": {},
+            "stages": {
+                "pose": {"status": "failed", "error": "old failure"},
+                "densepose": {"status": "complete", "usable_frames": 8},
+            },
+        }
+    )
+    pose_snapshot = run.read_manifest()
+    pose_snapshot["stages"]["pose"].pop("error")
+
+    run.update_stage("pose", {"status": "complete"}, pose_snapshot)
+
+    manifest = run.read_manifest()
+    assert manifest["stages"]["pose"] == {"status": "complete"}
+    assert manifest["stages"]["densepose"] == {
+        "status": "complete",
+        "usable_frames": 8,
+    }
 
 
 @pytest.mark.parametrize(

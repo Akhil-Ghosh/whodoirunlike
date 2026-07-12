@@ -1,16 +1,25 @@
 from __future__ import annotations
 
 import json
+import sys
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from types import ModuleType, SimpleNamespace
 from typing import Any
 
 import cv2
 import numpy as np
 
+from whodoirunlike import densepose_runner
 from whodoirunlike.densepose_runner import (
     DensePoseBackend,
     DensePoseSetupError,
     _summarize_chart_result,
+    apply_densepose_to_frame,
+    clear_densepose_backend_cache,
+    load_densepose_backend,
     run_densepose,
 )
 from whodoirunlike.sam2_runner import write_json
@@ -108,6 +117,156 @@ def test_summarize_chart_result_keeps_compact_part_and_uv_stats() -> None:
     assert summary["densepose_shape"] == [3, 2]
     assert summary["densepose_coverage"] == 0.6667
     assert summary["uv_mean"] == [0.5, 0.4]
+
+
+def test_densepose_backend_serializes_shared_cached_predictor_inference() -> None:
+    state_lock = threading.Lock()
+    active = 0
+    peak = 0
+
+    def predict(_frame: np.ndarray) -> dict[str, Any]:
+        nonlocal active, peak
+        with state_lock:
+            active += 1
+            peak = max(peak, active)
+        time.sleep(0.02)
+        with state_lock:
+            active -= 1
+        return {"instances": []}
+
+    backend = DensePoseBackend(predictor=predict)
+    frame = np.full((32, 48, 3), 120, dtype=np.uint8)
+    mask = np.ones((32, 48), dtype=np.uint8) * 255
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        outputs = list(
+            executor.map(
+                lambda frame_index: apply_densepose_to_frame(
+                    frame,
+                    mask,
+                    backend,
+                    frame_index=frame_index,
+                ),
+                range(2),
+            )
+        )
+
+    assert all(output.row["usable"] is False for output in outputs)
+    assert peak == 1
+
+
+def test_densepose_backend_cache_reuses_only_matching_effective_config(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    built: list[tuple[str, str, float]] = []
+
+    class FakeConfig:
+        def __init__(self) -> None:
+            self.MODEL = SimpleNamespace(
+                WEIGHTS="",
+                DEVICE="",
+                ROI_HEADS=SimpleNamespace(SCORE_THRESH_TEST=0.0),
+            )
+        def merge_from_file(self, path: str) -> None:
+            self.path = path
+
+        def freeze(self) -> None:
+            return None
+
+    detectron2_module = ModuleType("detectron2")
+    detectron2_module.__path__ = []  # type: ignore[attr-defined]
+    config_module = ModuleType("detectron2.config")
+    config_module.get_cfg = FakeConfig  # type: ignore[attr-defined]
+    engine_module = ModuleType("detectron2.engine")
+
+    def predictor(config: FakeConfig) -> object:
+        built.append(
+            (
+                config.MODEL.WEIGHTS,
+                config.MODEL.DEVICE,
+                config.MODEL.ROI_HEADS.SCORE_THRESH_TEST,
+            )
+        )
+        return object()
+
+    engine_module.DefaultPredictor = predictor  # type: ignore[attr-defined]
+    densepose_module = ModuleType("densepose")
+    densepose_module.add_densepose_config = lambda _config: None  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "detectron2", detectron2_module)
+    monkeypatch.setitem(sys.modules, "detectron2.config", config_module)
+    monkeypatch.setitem(sys.modules, "detectron2.engine", engine_module)
+    monkeypatch.setitem(sys.modules, "densepose", densepose_module)
+
+    config_path = tmp_path / "densepose.yaml"
+    clear_densepose_backend_cache()
+    try:
+        first = load_densepose_backend(
+            config_path=config_path,
+            weights_path="model.pkl",
+            confidence_threshold=0.7,
+            device="cuda",
+        )
+        second = load_densepose_backend(
+            config_path=config_path,
+            weights_path="model.pkl",
+            confidence_threshold=0.7,
+            device="cuda",
+        )
+        third = load_densepose_backend(
+            config_path=config_path,
+            weights_path="model.pkl",
+            confidence_threshold=0.8,
+            device="cuda",
+        )
+    finally:
+        clear_densepose_backend_cache()
+
+    assert first is second
+    assert third is not first
+    assert built == [
+        ("model.pkl", "cuda", 0.7),
+        ("model.pkl", "cuda", 0.8),
+    ]
+
+
+def test_apply_densepose_infers_on_full_masked_frame() -> None:
+    observed_inputs: list[np.ndarray] = []
+
+    class FakeArray:
+        def __init__(self, value: np.ndarray) -> None:
+            self.value = value
+
+        def numpy(self) -> np.ndarray:
+            return self.value
+
+    class FakeInstances:
+        pred_boxes = SimpleNamespace(
+            tensor=FakeArray(np.asarray([[10, 8, 30, 28]], dtype=np.float32))
+        )
+        scores = FakeArray(np.asarray([0.9], dtype=np.float32))
+
+        def __len__(self) -> int:
+            return 1
+
+    def predict(image: np.ndarray) -> dict[str, Any]:
+        observed_inputs.append(image.copy())
+        return {"instances": FakeInstances()}
+
+    frame = np.full((40, 60, 3), 100, dtype=np.uint8)
+    mask = np.zeros((40, 60), dtype=np.uint8)
+    mask[5:35, 5:35] = 255
+
+    output = densepose_runner.apply_densepose_to_frame(
+        frame,
+        mask,
+        DensePoseBackend(predictor=predict),
+        frame_index=0,
+    )
+
+    assert observed_inputs[0].shape == frame.shape
+    assert np.all(observed_inputs[0][0, 0] == 0)
+    assert np.all(observed_inputs[0][10, 10] == 100)
+    assert output.row["bbox"] == [10, 8, 20, 20]
 
 
 def test_run_densepose_writes_compact_rows_and_updates_manifest(tmp_path: Path, monkeypatch: Any) -> None:

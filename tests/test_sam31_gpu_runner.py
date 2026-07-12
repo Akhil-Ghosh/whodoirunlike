@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import contextmanager, nullcontext
 import json
 from pathlib import Path
 import sys
@@ -117,6 +118,161 @@ def test_reclaim_gpu_memory_is_safe_without_torch(monkeypatch) -> None:
     monkeypatch.setitem(sys.modules, "torch", None)
 
     sam31_gpu_runner._reclaim_sam31_gpu_memory()
+
+
+def test_runner_mask_readiness_fires_after_fallback_and_before_presentation(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    paths = {
+        "source_segment": str(tmp_path / "source_segment.mp4"),
+        "person_prompt": str(tmp_path / "person_prompt.json"),
+        "runner_mask": str(tmp_path / "runner_mask.mp4"),
+        "masked_runner": str(tmp_path / "masked_runner.mp4"),
+        "qa_overlay": str(tmp_path / "qa_overlay.mp4"),
+        "runner_mask_metadata": str(tmp_path / "runner_mask_metadata.jsonl"),
+        "masks_jsonl": str(tmp_path / "masks.jsonl"),
+        "tracklets_jsonl": str(tmp_path / "tracklets.jsonl"),
+        "tracklets": str(tmp_path / "tracklets.json"),
+    }
+    (tmp_path / "cv_run_manifest.json").write_text(
+        json.dumps({"candidate_id": "candidate-1", "paths": paths, "stages": {}}),
+        encoding="utf-8",
+    )
+    for name in ("source_segment", "person_prompt", "tracklets_jsonl", "tracklets"):
+        Path(paths[name]).touch()
+    frame_paths = [tmp_path / "00000.jpg", tmp_path / "00001.jpg"]
+    for frame_path in frame_paths:
+        frame_path.touch()
+
+    sam3_package = types.ModuleType("sam3")
+    model_builder = types.ModuleType("sam3.model_builder")
+    model_builder.build_sam3_multiplex_video_predictor = lambda **_: object()
+    sam3_package.model_builder = model_builder
+    monkeypatch.setitem(sys.modules, "sam3", sam3_package)
+    monkeypatch.setitem(sys.modules, "sam3.model_builder", model_builder)
+
+    predictor = object()
+
+    @contextmanager
+    def borrow_predictor(**_kwargs: object):
+        yield predictor, {
+            "hit": True,
+            "model_build_seconds": 0.0,
+            "lock_wait_seconds": 0.0,
+        }
+
+    monkeypatch.setattr(sam31_gpu_runner, "_borrow_sam31_gpu_predictor", borrow_predictor)
+    monkeypatch.setattr(sam31_gpu_runner, "_sam31_gpu_session_autocast", nullcontext)
+    monkeypatch.setattr(
+        sam31_gpu_runner,
+        "inspect_video",
+        lambda _path: {"width": 10, "height": 8, "fps": 30.0},
+    )
+    monkeypatch.setattr(
+        sam31_gpu_runner,
+        "extract_video_frames",
+        lambda *_args, **_kwargs: frame_paths,
+    )
+    monkeypatch.setattr(
+        sam31_gpu_runner,
+        "load_prompt",
+        lambda *_args, **_kwargs: {
+            "frame_index": 0,
+            "box_source": "test",
+            "positive_points": [],
+        },
+    )
+    track_boxes = {0: (1, 1, 8, 7), 1: (1, 1, 8, 7)}
+    monkeypatch.setattr(
+        sam31_gpu_runner,
+        "_load_identity_track_boxes",
+        lambda **_kwargs: track_boxes,
+    )
+    monkeypatch.setattr(sam31_gpu_runner, "_track_prompt_anchors", lambda **_kwargs: [0])
+    monkeypatch.setattr(
+        sam31_gpu_runner,
+        "_configure_interactive_tracker_for_user_prompt",
+        lambda _predictor: {"applied": True},
+    )
+    initial_masks = {0: np.ones((8, 10), dtype=np.uint8)}
+    monkeypatch.setattr(
+        sam31_gpu_runner,
+        "_collect_sam31_masks",
+        lambda **_kwargs: (initial_masks, {"active_obj_id": 1}),
+    )
+    monkeypatch.setattr(
+        sam31_gpu_runner,
+        "_filter_masks_to_track_boxes",
+        lambda masks, _boxes: (masks, {"enabled": True}),
+    )
+
+    events: list[str] = []
+
+    def write_data(**_kwargs: object) -> None:
+        events.append("data")
+        Path(paths["runner_mask"]).touch()
+        Path(paths["runner_mask_metadata"]).touch()
+
+    summaries = iter(({"nonempty_frames": 0}, {"nonempty_frames": 2}))
+
+    def write_masks(_mask_path: Path, output_path: Path) -> dict[str, int]:
+        events.append("summary")
+        output_path.touch()
+        return next(summaries)
+
+    fallback_masks = {
+        0: np.ones((8, 10), dtype=np.uint8),
+        1: np.ones((8, 10), dtype=np.uint8),
+    }
+
+    def build_fallback(**_kwargs: object):
+        events.append("fallback")
+        return fallback_masks, {"method": "track_box"}
+
+    progress_phases: list[str] = []
+
+    def ready() -> None:
+        assert progress_phases[-1] == "analytical_mask_ready"
+        events.append("ready")
+
+    def write_presentation(**kwargs: object) -> None:
+        assert kwargs["render_qa_overlay"] is False
+        events.append("presentation")
+
+    monkeypatch.setattr(sam31_gpu_runner, "write_runner_mask_data_outputs", write_data)
+    monkeypatch.setattr(sam31_gpu_runner, "write_masks_jsonl_from_video", write_masks)
+    monkeypatch.setattr(
+        sam31_gpu_runner,
+        "_identity_track_box_fallback_masks",
+        build_fallback,
+    )
+    monkeypatch.setattr(
+        sam31_gpu_runner,
+        "write_mask_presentation_outputs",
+        write_presentation,
+    )
+    monkeypatch.setattr(sam31_gpu_runner, "update_manifest_after_sam31_gpu", lambda *_a, **_k: None)
+
+    result = sam31_gpu_runner.run_sam31_gpu_mask(
+        run_dir=tmp_path,
+        progress_callback=lambda payload: progress_phases.append(str(payload["phase"])),
+        runner_mask_ready_callback=ready,
+        render_qa_overlay=False,
+    )
+
+    assert events == [
+        "data",
+        "summary",
+        "fallback",
+        "data",
+        "summary",
+        "ready",
+        "presentation",
+    ]
+    assert result["fallback"]["reason"] == "sam31_gpu_empty_mask"
+    assert result["mask_summary"]["nonempty_frames"] == 2
+    assert result["data_ready_seconds"] <= result["elapsed_seconds"]
 
 
 def test_predictor_cache_is_invalidated_after_session_error(monkeypatch) -> None:

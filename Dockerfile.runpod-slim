@@ -1,0 +1,100 @@
+# syntax=docker/dockerfile:1
+
+# PROTOTYPE ONLY: preserve the exact validated candidate runtime while removing
+# build-only CUDA/cuDNN headers, compilers, and source-control metadata.
+ARG CANDIDATE_IMAGE=ghcr.io/akhil-ghosh/whodoirunlike-runpod-processor@sha256:52392c71b9a44d804f0ba7fcd894247988319dbe98e6160cb05d70a13894714a
+FROM --platform=linux/amd64 ${CANDIDATE_IMAGE} AS candidate-runtime
+
+RUN mkdir -p /opt/whodoirunlike-provenance \
+    && printf '%s\n' '02b5c4e295e990042a714712c21dc79b731e8833' \
+        > /opt/whodoirunlike-provenance/detectron2.revision \
+    && printf '%s\n' '5dd401d1c5c1d5c3eedff06d41b77af824517619' \
+        > /opt/whodoirunlike-provenance/sam3.revision \
+    && rm -rf /opt/detectron2/.git /opt/sam3/.git
+
+FROM --platform=linux/amd64 nvidia/cuda:12.8.1-cudnn-runtime-ubuntu24.04@sha256:9175fa92f96de35a8cfb9493f0dfcf9435c7a597e9d95ad41d2cae382a95e3f9 AS runtime
+
+ARG WHODOIRUNLIKE_PROCESSOR_VERSION=657d36588f3ca073554bfd40071ff747e0e750bb
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    HF_HOME=/runpod-volume/huggingface \
+    TORCH_HOME=/opt/rtmlib-cache \
+    WHODOIRUNLIKE_HOSTED_RUN_ROOT=/runpod-volume/whodoirunlike/runs \
+    WHODOIRUNLIKE_IDENTITY_BACKEND=boxmot_bytetrack \
+    WHODOIRUNLIKE_POSE_BACKEND=mmpose_rtmpose_l_384 \
+    WHODOIRUNLIKE_MASK_BACKEND=sam31_gpu \
+    WHODOIRUNLIKE_SAM31_GPU_USE_FA3=false \
+    WHODOIRUNLIKE_SAM31_GPU_CACHE_PREDICTOR=true \
+    WHODOIRUNLIKE_SAM31_GPU_PRESEED_ANCHORS=true \
+    WHODOIRUNLIKE_SKIP_DENSEPOSE=false \
+    WHODOIRUNLIKE_PROCESSOR_VERSION=${WHODOIRUNLIKE_PROCESSOR_VERSION} \
+    MMPOSE_DEVICE=cuda \
+    RTMW_RUNTIME_BACKEND=onnxruntime \
+    DENSEPOSE_CONFIG=/opt/detectron2/projects/DensePose/configs/densepose_rcnn_R_50_FPN_s1x.yaml \
+    DENSEPOSE_WEIGHTS=https://dl.fbaipublicfiles.com/densepose/densepose_rcnn_R_50_FPN_s1x/165712039/model_final_162be9.pkl \
+    DENSEPOSE_DEVICE=cuda
+
+WORKDIR /app
+
+RUN export DEBIAN_FRONTEND=noninteractive \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        ffmpeg \
+        libgl1 \
+        libglib2.0-0 \
+        libgomp1 \
+        python3.12 \
+    && rm -rf /var/lib/apt/lists/* \
+    && mkdir -p /usr/local/lib/python3.12/dist-packages
+
+# Python packages are copied byte-for-byte from the immutable candidate. The
+# distro Python 3.12 interpreter provides the same CPython ABI without carrying
+# the candidate's CUDA devel toolchain into the final image.
+COPY --from=candidate-runtime /usr/local/bin/ /usr/local/bin/
+
+# Keep each compressed layer bounded. A single 9 GB COPY requires enough
+# scratch space for the entire uncompressed tree plus its compressed diff.
+COPY --from=candidate-runtime /usr/local/lib/python3.12/dist-packages/[0-9A-Fa-f_]* /usr/local/lib/python3.12/dist-packages/
+COPY --from=candidate-runtime /usr/local/lib/python3.12/dist-packages/[G-Mg-m]* /usr/local/lib/python3.12/dist-packages/
+COPY --from=candidate-runtime /usr/local/lib/python3.12/dist-packages/[Nn][^Vv]* /usr/local/lib/python3.12/dist-packages/
+COPY --from=candidate-runtime /usr/local/lib/python3.12/dist-packages/[Oo]* /usr/local/lib/python3.12/dist-packages/
+COPY --from=candidate-runtime /usr/local/lib/python3.12/dist-packages/[P-Sp-s]* /usr/local/lib/python3.12/dist-packages/
+COPY --from=candidate-runtime /usr/local/lib/python3.12/dist-packages/torch* /usr/local/lib/python3.12/dist-packages/
+COPY --from=candidate-runtime /usr/local/lib/python3.12/dist-packages/triton* /usr/local/lib/python3.12/dist-packages/
+COPY --from=candidate-runtime /usr/local/lib/python3.12/dist-packages/[Tt][^OoRr]* /usr/local/lib/python3.12/dist-packages/
+COPY --from=candidate-runtime /usr/local/lib/python3.12/dist-packages/[Tt][Oo]* /usr/local/lib/python3.12/dist-packages/
+COPY --from=candidate-runtime /usr/local/lib/python3.12/dist-packages/[Tt][Rr][^Ii]* /usr/local/lib/python3.12/dist-packages/
+COPY --from=candidate-runtime /usr/local/lib/python3.12/dist-packages/[U-Zu-z]* /usr/local/lib/python3.12/dist-packages/
+
+COPY --from=candidate-runtime /usr/local/lib/python3.12/dist-packages/nvidia/__init__.py /usr/local/lib/python3.12/dist-packages/nvidia/__init__.py
+COPY --from=candidate-runtime /usr/local/lib/python3.12/dist-packages/nvidia/cublas/ /usr/local/lib/python3.12/dist-packages/nvidia/cublas/
+COPY --from=candidate-runtime /usr/local/lib/python3.12/dist-packages/nvidia/cuda_cupti/ /usr/local/lib/python3.12/dist-packages/nvidia/cuda_cupti/
+COPY --from=candidate-runtime /usr/local/lib/python3.12/dist-packages/nvidia/cuda_nvrtc/ /usr/local/lib/python3.12/dist-packages/nvidia/cuda_nvrtc/
+COPY --from=candidate-runtime /usr/local/lib/python3.12/dist-packages/nvidia/cuda_runtime/ /usr/local/lib/python3.12/dist-packages/nvidia/cuda_runtime/
+COPY --from=candidate-runtime /usr/local/lib/python3.12/dist-packages/nvidia/cudnn/ /usr/local/lib/python3.12/dist-packages/nvidia/cudnn/
+COPY --from=candidate-runtime /usr/local/lib/python3.12/dist-packages/nvidia/cufft/ /usr/local/lib/python3.12/dist-packages/nvidia/cufft/
+COPY --from=candidate-runtime /usr/local/lib/python3.12/dist-packages/nvidia/cufile/ /usr/local/lib/python3.12/dist-packages/nvidia/cufile/
+COPY --from=candidate-runtime /usr/local/lib/python3.12/dist-packages/nvidia/curand/ /usr/local/lib/python3.12/dist-packages/nvidia/curand/
+COPY --from=candidate-runtime /usr/local/lib/python3.12/dist-packages/nvidia/cusolver/ /usr/local/lib/python3.12/dist-packages/nvidia/cusolver/
+COPY --from=candidate-runtime /usr/local/lib/python3.12/dist-packages/nvidia/cusparse/ /usr/local/lib/python3.12/dist-packages/nvidia/cusparse/
+COPY --from=candidate-runtime /usr/local/lib/python3.12/dist-packages/nvidia/cusparselt/ /usr/local/lib/python3.12/dist-packages/nvidia/cusparselt/
+COPY --from=candidate-runtime /usr/local/lib/python3.12/dist-packages/nvidia/nccl/ /usr/local/lib/python3.12/dist-packages/nvidia/nccl/
+COPY --from=candidate-runtime /usr/local/lib/python3.12/dist-packages/nvidia/nvjitlink/ /usr/local/lib/python3.12/dist-packages/nvidia/nvjitlink/
+COPY --from=candidate-runtime /usr/local/lib/python3.12/dist-packages/nvidia/nvshmem/ /usr/local/lib/python3.12/dist-packages/nvidia/nvshmem/
+COPY --from=candidate-runtime /usr/local/lib/python3.12/dist-packages/nvidia/nvtx/ /usr/local/lib/python3.12/dist-packages/nvidia/nvtx/
+COPY --from=candidate-runtime /usr/local/lib/python3.12/dist-packages/nvidia_*.dist-info /usr/local/lib/python3.12/dist-packages/
+
+COPY --from=candidate-runtime /app/ /app/
+COPY --from=candidate-runtime /opt/detectron2/ /opt/detectron2/
+COPY --from=candidate-runtime /opt/sam3/ /opt/sam3/
+COPY --from=candidate-runtime /opt/rtmlib-cache/ /opt/rtmlib-cache/
+COPY --from=candidate-runtime /opt/whodoirunlike-provenance/ /opt/whodoirunlike-provenance/
+COPY scripts/runpod_runtime_contract.py /opt/whodoirunlike/runtime-contract.py
+
+RUN python /opt/whodoirunlike/runtime-contract.py \
+    --verify \
+    --output /opt/whodoirunlike/runtime-contract.json
+
+CMD ["python", "-m", "whodoirunlike.runpod_serverless"]

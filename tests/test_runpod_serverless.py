@@ -9,13 +9,41 @@ def test_runpod_handler_health(monkeypatch: Any) -> None:
     monkeypatch.setenv("WHODOIRUNLIKE_PROCESSOR_SHARED_SECRET", "secret")
     monkeypatch.setenv("HF_TOKEN", "token")
     monkeypatch.setenv("WHODOIRUNLIKE_MASK_BACKEND", "sam31_gpu")
+    monkeypatch.setenv("WHODOIRUNLIKE_SAM31_GPU_EXACT_CV2_LOADER", "true")
+    monkeypatch.setenv("WHODOIRUNLIKE_SAM31_GPU_EXACT_CV2_CHUNK_FRAMES", "4")
 
     response = runpod_serverless.handler({"input": {"type": "health"}})
 
     assert response["status"] == "ok"
+    assert response["health"]["ready_for_invocation"] is True
     assert response["health"]["has_processor_secret"] is True
     assert response["health"]["has_hf_token"] is True
     assert response["health"]["mask_backend"] == "sam31_gpu"
+    assert response["health"]["sam31_input_loader"] == {
+        "mode": "exact_cv2",
+        "enabled": True,
+        "chunk_frames": 4,
+        "max_frames": 600,
+        "max_destination_bytes": 8 * 1024**3,
+        "required_concurrency": 1,
+        "configured_concurrency": 1,
+        "concurrency_ready": True,
+    }
+
+
+def test_runpod_shallow_health_rejects_exact_loader_concurrency_above_one(
+    monkeypatch: Any,
+) -> None:
+    from whodoirunlike import runpod_serverless
+
+    monkeypatch.setenv("WHODOIRUNLIKE_SAM31_GPU_EXACT_CV2_LOADER", "true")
+    monkeypatch.setenv("WHODOIRUNLIKE_PROCESSOR_CONCURRENCY", "2")
+
+    response = runpod_serverless.handler({"input": {"type": "health"}})
+
+    assert response["status"] == "ok"
+    assert response["health"]["ready_for_invocation"] is False
+    assert response["health"]["sam31_input_loader"]["concurrency_ready"] is False
 
 
 def test_runpod_handler_deep_health(monkeypatch: Any) -> None:

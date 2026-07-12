@@ -73,3 +73,13 @@ def test_runpod_image_preserves_live_rtmlib_cpu_numerics() -> None:
     assert "onnxruntime-gpu" not in requirements
     assert "CPUExecutionProvider" in dockerfile
     assert "CUDAExecutionProvider" not in dockerfile
+
+
+def test_exact_cv2_loader_remains_opt_in_in_the_full_image() -> None:
+    dockerfile = (ROOT / "Dockerfile.runpod").read_text(encoding="utf-8")
+    config = (ROOT / "src/whodoirunlike/sam31_loader_config.py").read_text(
+        encoding="utf-8"
+    )
+
+    assert "WHODOIRUNLIKE_SAM31_GPU_EXACT_CV2_LOADER=" not in dockerfile
+    assert "SAM31_EXACT_CV2_LOADER_ENV, False" in config

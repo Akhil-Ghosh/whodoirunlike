@@ -3,10 +3,20 @@ from __future__ import annotations
 import os
 from typing import Any
 
+from whodoirunlike.sam31_loader_config import sam31_exact_cv2_loader_settings
+
+
+def _sam31_input_loader_health() -> dict[str, Any]:
+    return sam31_exact_cv2_loader_settings().to_dict()
+
 
 def _shallow_health() -> dict[str, Any]:
+    sam31_input_loader = _sam31_input_loader_health()
     return {
-        "ready_for_invocation": True,
+        "ready_for_invocation": bool(
+            not sam31_input_loader["enabled"]
+            or sam31_input_loader["concurrency_ready"]
+        ),
         "has_processor_secret": bool(os.getenv("WHODOIRUNLIKE_PROCESSOR_SHARED_SECRET", "").strip()),
         "has_hf_token": bool(
             os.getenv("HF_TOKEN", "").strip() or os.getenv("HUGGING_FACE_HUB_TOKEN", "").strip()
@@ -15,6 +25,7 @@ def _shallow_health() -> dict[str, Any]:
         "pose_backend": os.getenv("WHODOIRUNLIKE_POSE_BACKEND", ""),
         "mask_backend": os.getenv("WHODOIRUNLIKE_MASK_BACKEND", ""),
         "skip_densepose": os.getenv("WHODOIRUNLIKE_SKIP_DENSEPOSE", ""),
+        "sam31_input_loader": sam31_input_loader,
     }
 
 

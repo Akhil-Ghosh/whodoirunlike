@@ -14,6 +14,10 @@ from whodoirunlike.identity_runner import DEFAULT_IDENTITY_BACKEND, run_identity
 from whodoirunlike.processing_telemetry import ProcessingTelemetry
 from whodoirunlike.qc import run_qc_metrics
 from whodoirunlike.running_clip_run import RunningClipRun
+from whodoirunlike.sam31_loader_config import (
+    REQUIRED_SAM31_EXACT_CV2_CONCURRENCY,
+    sam31_exact_cv2_loader_settings,
+)
 from whodoirunlike.sam31_mlx_runner import run_sam31_mlx_mask
 from whodoirunlike.video_io import make_browser_playable_mp4
 
@@ -278,17 +282,36 @@ def run_full_cv_pipeline(
     )
     result["steps"].append({"stage": "identity", "result": identity})
 
+    mask_runtime: dict[str, Any] = {
+        "backend": mask_backend,
+        "quality_mode": mask_quality_mode,
+        "parallel_presentation": parallel_mask_presentation,
+    }
+    if mask_backend.strip().lower() in _SAM31_GPU_BACKENDS:
+        exact_cv2_loader = sam31_exact_cv2_loader_settings()
+        mask_runtime.update(
+            {
+                "input_loader_mode": exact_cv2_loader.mode,
+                "exact_cv2_loader_enabled": exact_cv2_loader.enabled,
+                "exact_cv2_chunk_frames": exact_cv2_loader.chunk_frames,
+                "exact_cv2_max_frames": exact_cv2_loader.max_frames,
+                "exact_cv2_max_destination_bytes": (
+                    exact_cv2_loader.max_destination_bytes
+                ),
+                "exact_cv2_required_concurrency": REQUIRED_SAM31_EXACT_CV2_CONCURRENCY,
+                "exact_cv2_configured_concurrency": (
+                    exact_cv2_loader.configured_concurrency
+                ),
+                "exact_cv2_concurrency_ready": exact_cv2_loader.concurrency_ready,
+            }
+        )
     runner_mask_ready = threading.Event() if parallel_mask_presentation else None
 
     def run_observed_mask_stage() -> dict[str, Any]:
         return _run_observed_stage(
             telemetry=telemetry,
             stage="runner_mask",
-            runtime={
-                "backend": mask_backend,
-                "quality_mode": mask_quality_mode,
-                "parallel_presentation": parallel_mask_presentation,
-            },
+            runtime=mask_runtime,
             phase_spans=_MASK_PHASE_SPANS,
             action=lambda progress: _run_mask_stage(
                 run_dir=run_dir,

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 import os
+import sys
 import threading
 import time
 from pathlib import Path
@@ -12,6 +13,14 @@ import numpy as np
 from whodoirunlike.cv_flow import utc_now_iso
 from whodoirunlike.mask_artifacts import write_masks_jsonl_from_video
 from whodoirunlike.running_clip_run import RunningClipRun
+from whodoirunlike.sam31_cv2_loader import scoped_sam31_exact_cv2_loader
+from whodoirunlike.sam31_loader_config import (
+    DEFAULT_SAM31_EXACT_CV2_CHUNK_FRAMES,
+    DEFAULT_SAM31_EXACT_CV2_MAX_DESTINATION_BYTES,
+    DEFAULT_SAM31_EXACT_CV2_MAX_FRAMES,
+    REQUIRED_SAM31_EXACT_CV2_CONCURRENCY,
+    sam31_exact_cv2_loader_settings,
+)
 from whodoirunlike.sam2_runner import (
     extract_video_frames,
     inspect_video,
@@ -526,15 +535,43 @@ def _collect_sam31_masks(
     track_boxes: dict[int, np.ndarray] | None = None,
     progress_callback: Callable[[int, int, str], None] | None = None,
     preseed_track_anchors: bool = True,
+    exact_cv2_loader_enabled: bool = False,
+    exact_cv2_chunk_frames: int = DEFAULT_SAM31_EXACT_CV2_CHUNK_FRAMES,
+    exact_cv2_max_frames: int = DEFAULT_SAM31_EXACT_CV2_MAX_FRAMES,
+    exact_cv2_max_destination_bytes: int = DEFAULT_SAM31_EXACT_CV2_MAX_DESTINATION_BYTES,
 ) -> tuple[dict[int, np.ndarray], dict[str, Any]]:
     import torch
 
-    response = predictor.handle_request(
-        request={
-            "type": "start_session",
-            "resource_path": str(video_path),
-        }
+    phase_timings = {
+        "start_session_seconds": 0.0,
+        "box_prompt_seconds": 0.0,
+        "point_prompt_seconds": 0.0,
+        "initial_prompt_seconds": 0.0,
+        "preseed_anchors_seconds": 0.0,
+        "propagation_seconds": 0.0,
+        "close_session_seconds": 0.0,
+    }
+    tracking_model = getattr(predictor, "model", None)
+    tracking_module = (
+        sys.modules.get(type(tracking_model).__module__)
+        if tracking_model is not None
+        else None
     )
+    phase_started_at = time.perf_counter()
+    with scoped_sam31_exact_cv2_loader(
+        tracking_module=tracking_module,
+        enabled=exact_cv2_loader_enabled,
+        chunk_frames=exact_cv2_chunk_frames,
+        max_frames=exact_cv2_max_frames,
+        max_destination_bytes=exact_cv2_max_destination_bytes,
+    ) as loader_probe:
+        response = predictor.handle_request(
+            request={
+                "type": "start_session",
+                "resource_path": str(video_path),
+            }
+        )
+    phase_timings["start_session_seconds"] = time.perf_counter() - phase_started_at
     session_id = response["session_id"]
     masks_by_frame: dict[int, np.ndarray] = {}
     diagnostics: dict[str, Any] = {
@@ -543,6 +580,21 @@ def _collect_sam31_masks(
         "visual_box_prompt": False,
         "propagation": [],
         "preseed_track_anchors": preseed_track_anchors,
+        "input_loader": {
+            "mode": "exact_cv2" if exact_cv2_loader_enabled else "upstream",
+            "enabled": bool(exact_cv2_loader_enabled),
+            "attempted": bool(loader_probe.attempted),
+            "used": bool(loader_probe.used),
+            "chunk_frames": max(1, int(exact_cv2_chunk_frames)),
+            "max_frames": max(1, int(exact_cv2_max_frames)),
+            "max_destination_bytes": max(1, int(exact_cv2_max_destination_bytes)),
+            "fallback_reason": loader_probe.fallback_reason,
+            "diagnostics": (
+                loader_probe.diagnostics.to_dict()
+                if loader_probe.diagnostics is not None
+                else None
+            ),
+        },
     }
     try:
         prompt_frame = max(0, min(int(prompt["frame_index"]), max(frame_count - 1, 0)))
@@ -584,6 +636,7 @@ def _collect_sam31_masks(
             active_obj_id = obj_id
             if visual_box is not None:
                 diagnostics["visual_box_prompt"] = True
+                phase_started_at = time.perf_counter()
                 box_response = predictor.handle_request(
                     request={
                         "type": "add_prompt",
@@ -596,6 +649,7 @@ def _collect_sam31_masks(
                         ),
                     }
                 )
+                phase_timings["box_prompt_seconds"] = time.perf_counter() - phase_started_at
                 box_outputs = box_response.get("outputs") or {}
                 box_obj_id = _first_nonempty_output_object_id(box_outputs)
                 if box_obj_id is not None:
@@ -615,6 +669,7 @@ def _collect_sam31_masks(
                 )
             else:
                 prompt_inputs = _relative_prompt_tensors(prompt=prompt, width=width, height=height)
+            phase_started_at = time.perf_counter()
             prompt_response = predictor.handle_request(
                 request={
                     "type": "add_prompt",
@@ -623,6 +678,10 @@ def _collect_sam31_masks(
                     "obj_id": active_obj_id,
                     **prompt_inputs,
                 }
+            )
+            phase_timings["point_prompt_seconds"] = time.perf_counter() - phase_started_at
+            phase_timings["initial_prompt_seconds"] = (
+                phase_timings["box_prompt_seconds"] + phase_timings["point_prompt_seconds"]
             )
             prompt_outputs = prompt_response.get("outputs") or {}
             prompt_obj_id = _first_nonempty_output_object_id(prompt_outputs)
@@ -649,6 +708,7 @@ def _collect_sam31_masks(
                 else []
             )
             diagnostics["preseed_anchor_frames"] = preseed_anchor_frames
+            phase_started_at = time.perf_counter()
             for anchor_frame in preseed_anchor_frames:
                 if anchor_frame == seed_frame:
                     continue
@@ -674,7 +734,9 @@ def _collect_sam31_masks(
                 )
                 if anchor_mask is not None:
                     masks_by_frame[anchor_frame] = anchor_mask
+            phase_timings["preseed_anchors_seconds"] = time.perf_counter() - phase_started_at
 
+            phase_started_at = time.perf_counter()
             diagnostics["propagation"].extend(
                 _propagate_from_seed_frame(
                     predictor=predictor,
@@ -687,6 +749,7 @@ def _collect_sam31_masks(
                     progress_callback=progress_callback,
                 )
             )
+            phase_timings["propagation_seconds"] += time.perf_counter() - phase_started_at
 
             needs_anchor_refinement = len(masks_by_frame) < anchor_refine_threshold
             diagnostics["anchor_refinement_threshold"] = anchor_refine_threshold
@@ -736,6 +799,7 @@ def _collect_sam31_masks(
                             masks_by_frame[anchor_frame] = anchor_mask
 
                 if needs_anchor_refinement and anchor_frames:
+                    phase_started_at = time.perf_counter()
                     diagnostics["propagation"].extend(
                         _propagate_from_seed_frame(
                             predictor=predictor,
@@ -748,15 +812,24 @@ def _collect_sam31_masks(
                             progress_callback=progress_callback,
                         )
                     )
+                    phase_timings["propagation_seconds"] += (
+                        time.perf_counter() - phase_started_at
+                    )
             else:
                 diagnostics["anchor_refinement_frames"] = []
     finally:
+        phase_started_at = time.perf_counter()
         predictor.handle_request(
             request={
                 "type": "close_session",
                 "session_id": session_id,
             }
         )
+        phase_timings["close_session_seconds"] = time.perf_counter() - phase_started_at
+    diagnostics["timings"] = {
+        key: round(max(0.0, value), 6)
+        for key, value in phase_timings.items()
+    }
     return masks_by_frame, diagnostics
 
 
@@ -1101,6 +1174,7 @@ def run_sam31_gpu_mask(
         "WHODOIRUNLIKE_SAM31_GPU_PRESEED_ANCHORS",
         default=True,
     )
+    exact_cv2_loader = sam31_exact_cv2_loader_settings()
     with _borrow_sam31_gpu_predictor(
         builder=build_sam3_multiplex_video_predictor,
         build_kwargs=predictor_build_kwargs,
@@ -1126,6 +1200,10 @@ def run_sam31_gpu_mask(
                     direction=direction,
                 ),
                 preseed_track_anchors=preseed_track_anchors,
+                exact_cv2_loader_enabled=exact_cv2_loader.enabled,
+                exact_cv2_chunk_frames=exact_cv2_loader.chunk_frames,
+                exact_cv2_max_frames=exact_cv2_loader.max_frames,
+                exact_cv2_max_destination_bytes=exact_cv2_loader.max_destination_bytes,
             )
     prompt_summary["sam31_predictor_cache"] = predictor_cache
     prompt_summary["sam31"] = sam_prompt_diagnostics
@@ -1241,6 +1319,44 @@ def run_sam31_gpu_mask(
         "cache_hit": bool(predictor_cache["hit"]),
         "model_build_seconds": float(predictor_cache["model_build_seconds"]),
         "predictor_lock_wait_seconds": float(predictor_cache["lock_wait_seconds"]),
+        "start_session_seconds": float(
+            sam_prompt_diagnostics.get("timings", {}).get("start_session_seconds", 0.0)
+        ),
+        "initial_prompt_seconds": float(
+            sam_prompt_diagnostics.get("timings", {}).get("initial_prompt_seconds", 0.0)
+        ),
+        "preseed_anchors_seconds": float(
+            sam_prompt_diagnostics.get("timings", {}).get("preseed_anchors_seconds", 0.0)
+        ),
+        "propagation_seconds": float(
+            sam_prompt_diagnostics.get("timings", {}).get("propagation_seconds", 0.0)
+        ),
+        "close_session_seconds": float(
+            sam_prompt_diagnostics.get("timings", {}).get("close_session_seconds", 0.0)
+        ),
+        "exact_cv2_loader_enabled": exact_cv2_loader.enabled,
+        "exact_cv2_loader_attempted": bool(
+            sam_prompt_diagnostics.get("input_loader", {}).get("attempted", False)
+        ),
+        "exact_cv2_loader_used": bool(
+            sam_prompt_diagnostics.get("input_loader", {}).get("used", False)
+        ),
+        "exact_cv2_loader_chunk_frames": exact_cv2_loader.chunk_frames,
+        "exact_cv2_loader_max_frames": exact_cv2_loader.max_frames,
+        "exact_cv2_loader_max_destination_bytes": exact_cv2_loader.max_destination_bytes,
+        "exact_cv2_loader_required_concurrency": REQUIRED_SAM31_EXACT_CV2_CONCURRENCY,
+        "exact_cv2_loader_configured_concurrency": exact_cv2_loader.configured_concurrency,
+        "exact_cv2_loader_concurrency_ready": exact_cv2_loader.concurrency_ready,
+        "exact_cv2_loader_seconds": float(
+            (
+                sam_prompt_diagnostics.get("input_loader", {}).get("diagnostics") or {}
+            ).get("elapsed_seconds", 0.0)
+        ),
+        "exact_cv2_loader_peak_host_staging_bytes": int(
+            (
+                sam_prompt_diagnostics.get("input_loader", {}).get("diagnostics") or {}
+            ).get("peak_host_staging_bytes", 0)
+        ),
         "prompting": prompt_summary,
         "fallback": fallback,
         "data_ready_seconds": round(data_ready_seconds, 3),

@@ -954,25 +954,48 @@ def test_production_profiles_apply_exact_deploy_configs_and_restore_environment(
     assert os.environ["MMPOSE_USE_DETECTOR"] == "outside"
 
 
-def test_artifact_sink_validation_rejects_non_scratch_origins_and_paths() -> None:
+def test_artifact_sink_validation_rejects_non_scratch_origins_and_paths(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scratch_origin = "https://parity-scratch.example.com"
     valid = {
-        "callback_base_url": "https://api.whodoirunlike.com",
+        "callback_base_url": scratch_origin,
         "run_id": "11c51cf1-c4d0-42ef-a2e1-cb9e2605ef1b",
         "attempt_id": "5ec9566e-cda9-4113-9100-9a4b2a248f6f",
     }
 
+    monkeypatch.delenv("WHODOIRUNLIKE_PARITY_SINK_ORIGIN", raising=False)
+    with pytest.raises(RuntimeError, match="must name the exact scratch sink"):
+        pipeline_parity._validate_artifact_sink(valid)
+
+    monkeypatch.setenv("WHODOIRUNLIKE_PARITY_SINK_ORIGIN", scratch_origin)
     assert pipeline_parity._validate_artifact_sink(valid) == valid
-    with pytest.raises(ValueError, match="allowed origin"):
+    with pytest.raises(ValueError, match="production or staging"):
         pipeline_parity._validate_artifact_sink(
-            {**valid, "callback_base_url": "https://example.com"}
+            {**valid, "callback_base_url": "https://api.whodoirunlike.com"}
         )
-    with pytest.raises(ValueError, match="allowed origin"):
+    with pytest.raises(ValueError, match="production or staging"):
+        pipeline_parity._validate_artifact_sink(
+            {**valid, "callback_base_url": "https://staging-api.whodoirunlike.com"}
+        )
+    with pytest.raises(ValueError, match="exact HTTPS origin"):
         pipeline_parity._validate_artifact_sink(
             {
                 **valid,
-                "callback_base_url": "https://api.whodoirunlike.com/private",
+                "callback_base_url": f"{scratch_origin}/private",
             }
         )
+    with pytest.raises(ValueError, match="does not match"):
+        pipeline_parity._validate_artifact_sink(
+            {**valid, "callback_base_url": "https://other-scratch.example.com"}
+        )
+
+    monkeypatch.setenv(
+        "WHODOIRUNLIKE_PARITY_SINK_ORIGIN",
+        "https://api.whodoirunlike.com",
+    )
+    with pytest.raises(RuntimeError, match="production or staging"):
+        pipeline_parity._validate_artifact_sink(valid)
 
 
 def test_r2_handoff_bundle_round_trips_with_provenance_and_file_hashes(
@@ -1039,7 +1062,7 @@ def test_r2_handoff_bundle_round_trips_with_provenance_and_file_hashes(
     monkeypatch.setattr(pipeline_parity, "_download_sink_artifact", fake_download)
     profile_dir, provenance = pipeline_parity._load_control_handoff(
         sink={
-            "callback_base_url": "https://api.whodoirunlike.com",
+            "callback_base_url": "https://parity-scratch.example.com",
             "run_id": "11c51cf1-c4d0-42ef-a2e1-cb9e2605ef1b",
             "attempt_id": "5ec9566e-cda9-4113-9100-9a4b2a248f6f",
         },
@@ -1382,10 +1405,14 @@ def test_candidate_handoff_adds_authoritative_cross_image_gate_without_blobs(
         profile_ids=["production_candidate"],
     )
     payload["artifact_sink"] = {
-        "callback_base_url": "https://api.whodoirunlike.com",
+        "callback_base_url": "https://parity-scratch.example.com",
         "run_id": "11c51cf1-c4d0-42ef-a2e1-cb9e2605ef1b",
         "attempt_id": "5ec9566e-cda9-4113-9100-9a4b2a248f6f",
     }
+    monkeypatch.setenv(
+        "WHODOIRUNLIKE_PARITY_SINK_ORIGIN",
+        "https://parity-scratch.example.com",
+    )
     monkeypatch.setenv("WHODOIRUNLIKE_BENCHMARK_IMAGE_ROLE", "candidate")
     monkeypatch.setenv(
         "WHODOIRUNLIKE_BASE_PROCESSOR_COMMIT",

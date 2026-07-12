@@ -111,7 +111,7 @@ def test_cli_creates_private_reusable_r2_sink_descriptor(
     source.write_bytes(b"video")
     sink_file = tmp_path / "private" / "parity-sink.json"
     expected = {
-        "callback_base_url": "https://api.whodoirunlike.com",
+        "callback_base_url": "https://parity-scratch.example.com",
         "run_id": "11c51cf1-c4d0-42ef-a2e1-cb9e2605ef1b",
         "attempt_id": "5ec9566e-cda9-4113-9100-9a4b2a248f6f",
     }
@@ -139,3 +139,39 @@ def test_cli_creates_private_reusable_r2_sink_descriptor(
     assert calls == [source]
     assert sink_file.stat().st_mode & 0o777 == 0o600
     assert "secret" not in sink_file.read_text(encoding="utf-8").lower()
+
+
+@pytest.mark.parametrize(
+    "origin",
+    (
+        "https://api.whodoirunlike.com",
+        "https://staging-api.whodoirunlike.com",
+    ),
+)
+def test_cli_rejects_production_and_staging_artifact_sinks(origin: str) -> None:
+    script = _load_speed_lab_script()
+
+    with pytest.raises(RuntimeError, match="production or staging"):
+        script._validate_cli_sink_origin(origin)
+
+
+def test_cli_requires_existing_descriptor_to_match_explicit_scratch_origin(
+    tmp_path: Path,
+) -> None:
+    script = _load_speed_lab_script()
+    sink_file = tmp_path / "parity-sink.json"
+    sink_file.write_text(
+        """{
+  "callback_base_url": "https://first-scratch.example.com",
+  "run_id": "11c51cf1-c4d0-42ef-a2e1-cb9e2605ef1b",
+  "attempt_id": "5ec9566e-cda9-4113-9100-9a4b2a248f6f"
+}\n""",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(RuntimeError, match="does not match"):
+        script._load_or_create_artifact_sink(
+            sink_file=sink_file,
+            api_base_url="https://second-scratch.example.com",
+            source_clip=tmp_path / "unused.mp4",
+        )

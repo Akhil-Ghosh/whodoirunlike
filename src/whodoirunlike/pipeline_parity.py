@@ -949,12 +949,8 @@ CandidateMaskStageRunner = Callable[[Path], dict[str, Any]]
 
 _SINK_RUN_ID_PATTERN = re.compile(r"^[a-f0-9-]{32,36}$", re.IGNORECASE)
 _SINK_ATTEMPT_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
-_SINK_ALLOWED_ORIGINS = frozenset(
-    {
-        "https://api.whodoirunlike.com",
-        "https://staging-api.whodoirunlike.com",
-    }
-)
+_FORBIDDEN_PARITY_SINK_HOSTS = frozenset({"api.whodoirunlike.com", "staging-api.whodoirunlike.com"})
+_PARITY_SINK_ORIGIN_ENV = "WHODOIRUNLIKE_PARITY_SINK_ORIGIN"
 _HANDOFF_BUNDLE_MAX_BYTES = 1024 * 1024 * 1024
 _HANDOFF_EXTRACTED_MAX_BYTES = 2 * 1024 * 1024 * 1024
 _HANDOFF_MEMBER_MAX_COUNT = 1000
@@ -969,6 +965,48 @@ def _sha256_path(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _validate_exact_https_origin(value: Any, *, label: str) -> str:
+    origin = str(value or "")
+    parsed = urllib.parse.urlsplit(origin)
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError(f"{label} must be an exact HTTPS origin.") from exc
+    canonical_netloc = str(parsed.hostname or "").lower()
+    if port is not None:
+        canonical_netloc = f"{canonical_netloc}:{port}"
+    canonical_origin = f"https://{canonical_netloc}"
+    if (
+        parsed.scheme != "https"
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path
+        or parsed.query
+        or parsed.fragment
+        or origin != canonical_origin
+    ):
+        raise ValueError(f"{label} must be an exact HTTPS origin.")
+    if parsed.hostname.lower() in _FORBIDDEN_PARITY_SINK_HOSTS:
+        raise ValueError(f"{label} must not target production or staging.")
+    return canonical_origin
+
+
+def _configured_parity_sink_origin() -> str:
+    configured = os.getenv(_PARITY_SINK_ORIGIN_ENV, "")
+    if not configured:
+        raise RuntimeError(
+            f"{_PARITY_SINK_ORIGIN_ENV} must name the exact scratch sink HTTPS origin."
+        )
+    try:
+        return _validate_exact_https_origin(
+            configured,
+            label=_PARITY_SINK_ORIGIN_ENV,
+        )
+    except ValueError as exc:
+        raise RuntimeError(str(exc)) from exc
+
+
 def _validate_artifact_sink(payload: Any) -> dict[str, str] | None:
     if payload is None:
         return None
@@ -978,16 +1016,15 @@ def _validate_artifact_sink(payload: Any) -> dict[str, str] | None:
         "attempt_id",
     }:
         raise ValueError("artifact_sink must contain callback_base_url, run_id, and attempt_id.")
-    callback_base_url = str(payload.get("callback_base_url") or "").rstrip("/")
-    parsed = urllib.parse.urlsplit(callback_base_url)
-    origin = f"{parsed.scheme}://{parsed.netloc}"
-    if (
-        origin not in _SINK_ALLOWED_ORIGINS
-        or callback_base_url != origin
-        or parsed.query
-        or parsed.fragment
-    ):
-        raise ValueError("artifact_sink callback_base_url is not an allowed origin.")
+    callback_base_url = _validate_exact_https_origin(
+        payload.get("callback_base_url"),
+        label="artifact_sink callback_base_url",
+    )
+    configured_origin = _configured_parity_sink_origin()
+    if callback_base_url != configured_origin:
+        raise ValueError(
+            "artifact_sink callback_base_url does not match the configured scratch origin."
+        )
     run_id = str(payload.get("run_id") or "")
     attempt_id = str(payload.get("attempt_id") or "")
     if not _SINK_RUN_ID_PATTERN.fullmatch(run_id):

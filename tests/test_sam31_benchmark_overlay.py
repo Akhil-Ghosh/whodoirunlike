@@ -77,3 +77,13 @@ def test_overlay_uses_only_public_production_entrypoints() -> None:
     ):
         assert private_name not in mask_source
         assert private_name not in pipeline_source
+
+
+def test_parity_handoff_has_no_production_or_staging_sink_default() -> None:
+    pipeline_source = (REPO_ROOT / "src/whodoirunlike/pipeline_parity.py").read_text(
+        encoding="utf-8"
+    )
+    cli_source = (REPO_ROOT / "scripts/run_sam31_speed_lab.py").read_text(encoding="utf-8")
+
+    assert "WHODOIRUNLIKE_PARITY_SINK_ORIGIN" in pipeline_source
+    assert 'default="https://api.whodoirunlike.com"' not in cli_source

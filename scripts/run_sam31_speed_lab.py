@@ -14,6 +14,7 @@ import sys
 import time
 from typing import Any
 from urllib.error import HTTPError, URLError
+from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
 
 from whodoirunlike.sam31_parity import (
@@ -41,6 +42,34 @@ FULL_PROFILE_MATRICES = {
     "authoritative-control": ["production_control"],
     "authoritative-candidate": ["production_candidate"],
 }
+_FORBIDDEN_PARITY_SINK_HOSTS = frozenset({"api.whodoirunlike.com", "staging-api.whodoirunlike.com"})
+
+
+def _validate_cli_sink_origin(value: str | None) -> str:
+    origin = str(value or "")
+    parsed = urlsplit(origin)
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise RuntimeError("The parity sink must be an exact HTTPS origin.") from exc
+    canonical_netloc = str(parsed.hostname or "").lower()
+    if port is not None:
+        canonical_netloc = f"{canonical_netloc}:{port}"
+    canonical_origin = f"https://{canonical_netloc}"
+    if (
+        parsed.scheme != "https"
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path
+        or parsed.query
+        or parsed.fragment
+        or origin != canonical_origin
+    ):
+        raise RuntimeError("The parity sink must be an exact HTTPS origin.")
+    if parsed.hostname.lower() in _FORBIDDEN_PARITY_SINK_HOSTS:
+        raise RuntimeError("The parity sink must not target production or staging.")
+    return canonical_origin
 
 
 def _resolve_full_profile_ids(
@@ -92,6 +121,7 @@ def _create_artifact_sink(
     api_base_url: str,
     source_clip: Path,
 ) -> dict[str, str]:
+    api_base_url = _validate_cli_sink_origin(api_base_url)
     content_type = mimetypes.guess_type(source_clip.name)[0] or "video/mp4"
     body = source_clip.read_bytes()
     request = Request(
@@ -134,15 +164,19 @@ def _load_or_create_artifact_sink(
     api_base_url: str,
     source_clip: Path,
 ) -> dict[str, str]:
+    api_base_url = _validate_cli_sink_origin(api_base_url)
     if sink_file.is_file():
         payload = json.loads(sink_file.read_text(encoding="utf-8"))
         if not isinstance(payload, dict):
             raise RuntimeError("Artifact sink file must contain a JSON object.")
-        required = {"callback_base_url", "run_id", "attempt_id"}
-        if set(payload) != required or not all(
+        required = ("callback_base_url", "run_id", "attempt_id")
+        if set(payload) != set(required) or not all(
             isinstance(payload.get(key), str) and payload[key] for key in required
         ):
             raise RuntimeError("Artifact sink file has an invalid descriptor.")
+        descriptor_origin = _validate_cli_sink_origin(payload["callback_base_url"])
+        if descriptor_origin != api_base_url:
+            raise RuntimeError("Artifact sink descriptor does not match --sink-api-base-url.")
         return {key: str(payload[key]) for key in required}
     if not source_clip.is_file():
         raise RuntimeError(f"Canonical source clip is unavailable: {source_clip}")
@@ -232,7 +266,7 @@ def main() -> int:
     )
     parser.add_argument(
         "--sink-api-base-url",
-        default="https://api.whodoirunlike.com",
+        help="Required exact HTTPS origin for the isolated scratch sink Worker.",
     )
     parser.add_argument(
         "--source-clip",
@@ -274,6 +308,8 @@ def main() -> int:
         args.variant_id = VARIANT_IDS[0]
     if args.artifact_sink_file is not None and args.scope != "full":
         parser.error("--artifact-sink-file requires --scope full")
+    if args.artifact_sink_file is not None and args.sink_api_base_url is None:
+        parser.error("--artifact-sink-file requires --sink-api-base-url")
     try:
         profile_ids = (
             _resolve_full_profile_ids(

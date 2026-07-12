@@ -1218,6 +1218,8 @@ def test_processor_readiness_accepts_sam_mask_presentation_overlap(monkeypatch: 
     monkeypatch.setenv("WHODOIRUNLIKE_POSE_BACKEND", "mmpose_rtmpose_l_384")
     monkeypatch.setenv("WHODOIRUNLIKE_SKIP_DENSEPOSE", "false")
     monkeypatch.setenv("WHODOIRUNLIKE_PARALLEL_MASK_PRESENTATION", "true")
+    monkeypatch.setenv("WHODOIRUNLIKE_SAM31_GPU_EXACT_CV2_LOADER", "true")
+    monkeypatch.setenv("WHODOIRUNLIKE_SAM31_GPU_EXACT_CV2_CHUNK_FRAMES", "3")
     monkeypatch.setattr(
         hosted_processor,
         "identity_setup_status",
@@ -1243,6 +1245,82 @@ def test_processor_readiness_accepts_sam_mask_presentation_overlap(monkeypatch: 
 
     assert readiness["ready_for_full_pipeline"] is True
     assert readiness["parallel_mask_presentation"] is True
+    assert readiness["sam31_input_loader"] == {
+        "mode": "exact_cv2",
+        "enabled": True,
+        "chunk_frames": 3,
+        "max_frames": 600,
+        "max_destination_bytes": 8 * 1024**3,
+        "required_concurrency": 1,
+        "configured_concurrency": 1,
+        "concurrency_ready": True,
+    }
+    assert readiness["checks"]["execution_policy"] == {"ready": True, "reasons": []}
+
+
+def test_processor_readiness_rejects_exact_loader_concurrency_above_one(
+    monkeypatch: Any,
+) -> None:
+    from whodoirunlike import hosted_processor
+
+    monkeypatch.setenv("WHODOIRUNLIKE_PROCESSOR_SHARED_SECRET", "secret")
+    monkeypatch.setenv("WHODOIRUNLIKE_SKIP_DENSEPOSE", "true")
+    monkeypatch.setenv("WHODOIRUNLIKE_SAM31_GPU_EXACT_CV2_LOADER", "true")
+    monkeypatch.setenv("WHODOIRUNLIKE_PROCESSOR_CONCURRENCY", "2")
+    monkeypatch.setattr(
+        hosted_processor,
+        "identity_setup_status",
+        lambda backend=None: {"ready": True, "reasons": [], "backend": backend},
+    )
+    monkeypatch.setattr(
+        hosted_processor,
+        "sam31_gpu_setup_status",
+        lambda: {"ready": True, "reasons": [], "backend": "sam31_gpu"},
+    )
+    monkeypatch.setattr(
+        hosted_processor,
+        "pose_setup_status",
+        lambda backend: {"ready": True, "reasons": [], "backend": backend},
+    )
+
+    readiness = hosted_processor.processor_readiness()
+
+    assert readiness["ready_for_full_pipeline"] is False
+    assert readiness["sam31_input_loader"]["configured_concurrency"] == 2
+    assert readiness["sam31_input_loader"]["concurrency_ready"] is False
+    assert readiness["checks"]["execution_policy"]["ready"] is False
+    assert "CONCURRENCY=1" in readiness["checks"]["execution_policy"]["reasons"][-1]
+
+
+def test_processor_readiness_allows_other_concurrency_when_exact_loader_is_disabled(
+    monkeypatch: Any,
+) -> None:
+    from whodoirunlike import hosted_processor
+
+    monkeypatch.setenv("WHODOIRUNLIKE_PROCESSOR_SHARED_SECRET", "secret")
+    monkeypatch.setenv("WHODOIRUNLIKE_SKIP_DENSEPOSE", "true")
+    monkeypatch.setenv("WHODOIRUNLIKE_SAM31_GPU_EXACT_CV2_LOADER", "false")
+    monkeypatch.setenv("WHODOIRUNLIKE_PROCESSOR_CONCURRENCY", "2")
+    monkeypatch.setattr(
+        hosted_processor,
+        "identity_setup_status",
+        lambda backend=None: {"ready": True, "reasons": [], "backend": backend},
+    )
+    monkeypatch.setattr(
+        hosted_processor,
+        "sam31_gpu_setup_status",
+        lambda: {"ready": True, "reasons": [], "backend": "sam31_gpu"},
+    )
+    monkeypatch.setattr(
+        hosted_processor,
+        "pose_setup_status",
+        lambda backend: {"ready": True, "reasons": [], "backend": backend},
+    )
+
+    readiness = hosted_processor.processor_readiness()
+
+    assert readiness["ready_for_full_pipeline"] is True
+    assert readiness["sam31_input_loader"]["concurrency_ready"] is False
     assert readiness["checks"]["execution_policy"] == {"ready": True, "reasons": []}
 
 def test_processor_readiness_rejects_mask_overlap_without_densepose(monkeypatch: Any) -> None:
@@ -1337,6 +1415,15 @@ def test_process_hosted_job_emits_complete_lifecycle_with_worker_attempt_id(
     created_telemetry: list[ProcessingTelemetry] = []
     monkeypatch.setattr(hosted_processor, "DEFAULT_HOSTED_RUN_ROOT", run_root)
     monkeypatch.setenv("WHODOIRUNLIKE_PROCESSOR_SHARED_SECRET", "secret")
+    monkeypatch.setenv("WHODOIRUNLIKE_PARALLEL_POSE_DENSEPOSE", "true")
+    monkeypatch.setenv("WHODOIRUNLIKE_PARALLEL_POST_FUSION", "true")
+    monkeypatch.setenv("WHODOIRUNLIKE_SAM31_GPU_EXACT_CV2_LOADER", "true")
+    monkeypatch.setenv("WHODOIRUNLIKE_SAM31_GPU_EXACT_CV2_CHUNK_FRAMES", "3")
+    monkeypatch.setenv("WHODOIRUNLIKE_SAM31_GPU_EXACT_CV2_MAX_FRAMES", "321")
+    monkeypatch.setenv(
+        "WHODOIRUNLIKE_SAM31_GPU_EXACT_CV2_MAX_DESTINATION_BYTES",
+        "456789",
+    )
 
     def make_telemetry(**kwargs: Any) -> ProcessingTelemetry:
         telemetry = ProcessingTelemetry(
@@ -1437,6 +1524,16 @@ def test_process_hosted_job_emits_complete_lifecycle_with_worker_attempt_id(
     assert events[0]["runtime"]["runpod_job_id"] == "runpod-job-99"
     assert events[0]["runtime"]["environment"] == "production"
     assert events[0]["runtime"]["processor_version"]
+    assert events[0]["runtime"]["parallel_mask_presentation"] is False
+    assert events[0]["runtime"]["parallel_pose_densepose"] is True
+    assert events[0]["runtime"]["parallel_post_fusion"] is True
+    assert events[0]["runtime"]["sam31_input_loader_mode"] == "exact_cv2"
+    assert events[0]["runtime"]["sam31_exact_cv2_chunk_frames"] == 3
+    assert events[0]["runtime"]["sam31_exact_cv2_max_frames"] == 321
+    assert events[0]["runtime"]["sam31_exact_cv2_max_destination_bytes"] == 456789
+    assert events[0]["runtime"]["sam31_exact_cv2_required_concurrency"] == 1
+    assert events[0]["runtime"]["sam31_exact_cv2_configured_concurrency"] == 1
+    assert events[0]["runtime"]["sam31_exact_cv2_concurrency_ready"] is True
     assert next(
         event
         for event in events

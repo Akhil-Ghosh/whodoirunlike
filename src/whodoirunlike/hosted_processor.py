@@ -38,6 +38,7 @@ from whodoirunlike.processing_telemetry import (
 from whodoirunlike.running_clip_run import RunningClipRun
 from whodoirunlike.sam2_runner import inspect_video
 from whodoirunlike.sam31_gpu_runner import DEFAULT_SAM31_GPU_MODEL
+from whodoirunlike.sam31_loader_config import sam31_exact_cv2_loader_settings
 from whodoirunlike.sam31_mlx_runner import DEFAULT_SAM31_MLX_MODEL
 
 
@@ -1127,6 +1128,20 @@ def _env_int(name: str, default: int, *, minimum: int = 0) -> int:
         return max(minimum, default)
 
 
+def _sam31_input_loader_settings() -> dict[str, Any]:
+    return sam31_exact_cv2_loader_settings().to_dict()
+
+
+def _sam31_input_loader_policy_reason(settings: dict[str, Any]) -> str | None:
+    if not settings["enabled"] or settings["concurrency_ready"]:
+        return None
+    return (
+        "WHODOIRUNLIKE_SAM31_GPU_EXACT_CV2_LOADER requires "
+        "WHODOIRUNLIKE_PROCESSOR_CONCURRENCY=1; configured concurrency is "
+        f"{settings['configured_concurrency']}."
+    )
+
+
 def _env_float(name: str, default: float) -> float:
     try:
         return max(0.1, float(os.getenv(name, str(default))))
@@ -1393,6 +1408,7 @@ def processor_readiness() -> dict[str, Any]:
     parallel_mask_presentation = _env_bool("WHODOIRUNLIKE_PARALLEL_MASK_PRESENTATION")
     parallel_pose_densepose = _env_bool("WHODOIRUNLIKE_PARALLEL_POSE_DENSEPOSE")
     parallel_post_fusion = _env_bool("WHODOIRUNLIKE_PARALLEL_POST_FUSION")
+    sam31_input_loader = _sam31_input_loader_settings()
     execution_policy_reasons: list[str] = []
     if (
         parallel_pose_densepose
@@ -1413,6 +1429,11 @@ def processor_readiness() -> dict[str, Any]:
             "WHODOIRUNLIKE_PARALLEL_MASK_PRESENTATION requires sam31_gpu, "
             "an mmpose backend, and DensePose enabled."
         )
+    sam31_input_loader_policy_reason = _sam31_input_loader_policy_reason(
+        sam31_input_loader
+    )
+    if sam31_input_loader_policy_reason is not None:
+        execution_policy_reasons.append(sam31_input_loader_policy_reason)
     checks = {
         "processor_secret": _readiness_check("processor_secret", _secret_status),
         "identity": _readiness_check(
@@ -1440,6 +1461,7 @@ def processor_readiness() -> dict[str, Any]:
         "parallel_mask_presentation": parallel_mask_presentation,
         "parallel_pose_densepose": parallel_pose_densepose,
         "parallel_post_fusion": parallel_post_fusion,
+        "sam31_input_loader": sam31_input_loader,
         "checks": checks,
     }
 
@@ -1460,6 +1482,7 @@ def process_hosted_job(payload: WorkerJobRequest, *, raise_on_error: bool = Fals
     parallel_mask_presentation = _env_bool("WHODOIRUNLIKE_PARALLEL_MASK_PRESENTATION")
     parallel_pose_densepose = _env_bool("WHODOIRUNLIKE_PARALLEL_POSE_DENSEPOSE")
     parallel_post_fusion = _env_bool("WHODOIRUNLIKE_PARALLEL_POST_FUSION")
+    sam31_input_loader = _sam31_input_loader_settings()
     attempt_elapsed_offset, has_attempt_timing = _elapsed_from_timestamp(
         payload.attempt_started_at or payload.processor_enqueued_at,
         invocation_started_at,
@@ -1483,6 +1506,22 @@ def process_hosted_job(payload: WorkerJobRequest, *, raise_on_error: bool = Fals
             "parallel_mask_presentation": parallel_mask_presentation,
             "parallel_pose_densepose": parallel_pose_densepose,
             "parallel_post_fusion": parallel_post_fusion,
+            "sam31_input_loader_mode": sam31_input_loader["mode"],
+            "sam31_exact_cv2_loader_enabled": sam31_input_loader["enabled"],
+            "sam31_exact_cv2_chunk_frames": sam31_input_loader["chunk_frames"],
+            "sam31_exact_cv2_max_frames": sam31_input_loader["max_frames"],
+            "sam31_exact_cv2_max_destination_bytes": sam31_input_loader[
+                "max_destination_bytes"
+            ],
+            "sam31_exact_cv2_required_concurrency": sam31_input_loader[
+                "required_concurrency"
+            ],
+            "sam31_exact_cv2_configured_concurrency": sam31_input_loader[
+                "configured_concurrency"
+            ],
+            "sam31_exact_cv2_concurrency_ready": sam31_input_loader[
+                "concurrency_ready"
+            ],
             "attempt_timing_available": has_attempt_timing,
         },
         sequence_start=max(100, payload.telemetry_sequence_start or 100),
@@ -1491,6 +1530,14 @@ def process_hosted_job(payload: WorkerJobRequest, *, raise_on_error: bool = Fals
         ),
     )
     try:
+        sam31_input_loader_policy_reason = _sam31_input_loader_policy_reason(
+            sam31_input_loader
+        )
+        if sam31_input_loader_policy_reason is not None:
+            raise RuntimeError(
+                "SAM exact CV2 loader execution policy is not ready: "
+                f"{sam31_input_loader_policy_reason}"
+            )
         _post_worker_report_best_effort(
             callback_base_url=payload.callback_base_url,
             run_id=payload.run_id,

@@ -1,0 +1,90 @@
+# syntax=docker/dockerfile:1
+
+# Reuse the exact live dependency/model image that passed the schedule-only
+# numerical parity run. The final image copies only runtime dependencies and
+# models from this stage; application code always comes from this checkout.
+ARG DEPENDENCY_IMAGE=ghcr.io/akhil-ghosh/whodoirunlike-runpod-processor@sha256:47d776f83ae3e2e1c7f1fa935b0019a9abd82a324ada4ab3d98746b3d75216fc
+FROM --platform=linux/amd64 ${DEPENDENCY_IMAGE} AS dependency-runtime
+
+COPY scripts/runpod_runtime_contract.py /opt/whodoirunlike/runtime-contract.py
+
+RUN mkdir -p /opt/whodoirunlike-provenance \
+    && git -C /opt/detectron2 rev-parse HEAD \
+        > /opt/whodoirunlike-provenance/detectron2.revision \
+    && git -C /opt/sam3 rev-parse HEAD \
+        > /opt/whodoirunlike-provenance/sam3.revision \
+    && python /opt/whodoirunlike/runtime-contract.py \
+        --capture-dependencies \
+        --output /opt/whodoirunlike/donor-dependencies.json \
+    && rm -rf /opt/detectron2/.git /opt/sam3/.git
+
+FROM --platform=linux/amd64 nvidia/cuda:12.8.1-cudnn-runtime-ubuntu24.04@sha256:9175fa92f96de35a8cfb9493f0dfcf9435c7a597e9d95ad41d2cae382a95e3f9 AS runtime
+
+ARG WHODOIRUNLIKE_PROCESSOR_VERSION=unknown
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    HF_HOME=/runpod-volume/huggingface \
+    TORCH_HOME=/opt/rtmlib-cache \
+    WHODOIRUNLIKE_HOSTED_RUN_ROOT=/runpod-volume/whodoirunlike/runs \
+    WHODOIRUNLIKE_IDENTITY_BACKEND=boxmot_bytetrack \
+    WHODOIRUNLIKE_POSE_BACKEND=mmpose_rtmpose_l_384 \
+    WHODOIRUNLIKE_MASK_BACKEND=sam31_gpu \
+    WHODOIRUNLIKE_SAM31_GPU_USE_FA3=false \
+    WHODOIRUNLIKE_SAM31_GPU_CACHE_PREDICTOR=true \
+    WHODOIRUNLIKE_SAM31_GPU_PRESEED_ANCHORS=true \
+    WHODOIRUNLIKE_SAM31_GPU_EXACT_CV2_LOADER=true \
+    WHODOIRUNLIKE_SAM31_GPU_EXACT_CV2_CHUNK_FRAMES=8 \
+    WHODOIRUNLIKE_SAM31_GPU_EXACT_CV2_MAX_FRAMES=600 \
+    WHODOIRUNLIKE_SAM31_GPU_EXACT_CV2_MAX_DESTINATION_BYTES=8589934592 \
+    WHODOIRUNLIKE_PROCESSOR_CONCURRENCY=1 \
+    WHODOIRUNLIKE_PARALLEL_MASK_PRESENTATION=true \
+    WHODOIRUNLIKE_PARALLEL_POSE_DENSEPOSE=true \
+    WHODOIRUNLIKE_PARALLEL_POST_FUSION=true \
+    WHODOIRUNLIKE_PARALLEL_ARTIFACT_PUBLISH=true \
+    WHODOIRUNLIKE_SKIP_DENSEPOSE=false \
+    WHODOIRUNLIKE_PROCESSOR_VERSION=${WHODOIRUNLIKE_PROCESSOR_VERSION} \
+    MMPOSE_DEVICE=cpu \
+    RTMW_RUNTIME_BACKEND=onnxruntime \
+    DENSEPOSE_CONFIG=/opt/detectron2/projects/DensePose/configs/densepose_rcnn_R_50_FPN_s1x.yaml \
+    DENSEPOSE_WEIGHTS=https://dl.fbaipublicfiles.com/densepose/densepose_rcnn_R_50_FPN_s1x/165712039/model_final_162be9.pkl \
+    DENSEPOSE_DEVICE=cuda
+
+WORKDIR /app
+
+RUN export DEBIAN_FRONTEND=noninteractive \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        ffmpeg \
+        libgl1 \
+        libglib2.0-0 \
+        libgomp1 \
+        python3.12 \
+    && rm -rf /var/lib/apt/lists/* \
+    && mkdir -p /usr/local/lib/python3.12/dist-packages
+
+# Copy the complete Python directory layouts. Splitting these paths with shell
+# globs previously omitted valid packages and changed import precedence.
+COPY --from=dependency-runtime /usr/local/bin/ /usr/local/bin/
+COPY --from=dependency-runtime /usr/local/lib/python3.12/ /usr/local/lib/python3.12/
+COPY --from=dependency-runtime /usr/lib/python3/dist-packages/ /usr/lib/python3/dist-packages/
+COPY --from=dependency-runtime /opt/detectron2/ /opt/detectron2/
+COPY --from=dependency-runtime /opt/sam3/ /opt/sam3/
+COPY --from=dependency-runtime /opt/rtmlib-cache/ /opt/rtmlib-cache/
+COPY --from=dependency-runtime /opt/whodoirunlike-provenance/ /opt/whodoirunlike-provenance/
+COPY --from=dependency-runtime /opt/whodoirunlike/donor-dependencies.json /opt/whodoirunlike/donor-dependencies.json
+
+# Never copy /app from the donor. This checkout is the sole source of the
+# processor application and its bundled demo inputs.
+COPY pyproject.toml README.md ./
+COPY src ./src
+COPY site/public/assets/demos ./site/public/assets/demos
+COPY scripts/runpod_runtime_contract.py /opt/whodoirunlike/runtime-contract.py
+
+RUN python /opt/whodoirunlike/runtime-contract.py \
+    --verify \
+    --baseline /opt/whodoirunlike/donor-dependencies.json \
+    --output /opt/whodoirunlike/runtime-contract.json
+
+CMD ["python", "-m", "whodoirunlike.runpod_serverless"]

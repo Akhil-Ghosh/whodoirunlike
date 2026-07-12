@@ -266,7 +266,7 @@ def test_exact_cv2_loader_hard_fails_before_allocation_when_input_exceeds_safety
     assert empty_calls == 0
 
 
-def test_scoped_loader_does_not_fall_back_when_safety_bound_is_exceeded(
+def test_scoped_loader_preserves_upstream_behavior_when_safety_bound_is_exceeded(
     tmp_path: Path,
 ) -> None:
     from whodoirunlike.sam31_cv2_loader import scoped_sam31_exact_cv2_loader
@@ -282,21 +282,23 @@ def test_scoped_loader_does_not_fall_back_when_safety_bound_is_exceeded(
 
     tracking_module = types.SimpleNamespace(load_resource_as_video_frames=original_loader)
 
-    with pytest.raises(ExactCv2LoaderSafetyLimitExceeded, match="refusing unbounded"):
-        with scoped_sam31_exact_cv2_loader(
-            tracking_module=tracking_module,
-            enabled=True,
-            chunk_frames=2,
-            max_frames=6,
-        ) as probe:
-            tracking_module.load_resource_as_video_frames(
-                resource_path=str(video_path),
-                image_size=32,
-                offload_video_to_cpu=True,
-                video_loader_type="cv2",
-            )
+    with scoped_sam31_exact_cv2_loader(
+        tracking_module=tracking_module,
+        enabled=True,
+        chunk_frames=2,
+        max_frames=6,
+    ) as probe:
+        result = tracking_module.load_resource_as_video_frames(
+            resource_path=str(video_path),
+            image_size=32,
+            offload_video_to_cpu=True,
+            video_loader_type="cv2",
+        )
 
-    assert original_calls == 0
+    assert result == "upstream"
+    assert original_calls == 1
     assert probe.attempted is True
     assert probe.used is False
-    assert probe.fallback_reason is None
+    assert probe.fallback_reason == (
+        "SAM exact CV2 loader refused 7 frames because the configured maximum is 6"
+    )

@@ -127,6 +127,7 @@ def test_runner_mask_result_exports_predictor_cache_measurements(tmp_path: Path)
                 "exact_cv2_loader_seconds": 11.75,
                 "exact_cv2_loader_peak_host_staging_bytes": 125_000_000,
                 "frame_count": 260,
+                "data_ready_seconds": 36.5,
                 "elapsed_seconds": 40.0,
             }
         )
@@ -136,6 +137,7 @@ def test_runner_mask_result_exports_predictor_cache_measurements(tmp_path: Path)
     assert completed["measurements"] == {
         "cache_hit": True,
         "close_session_seconds": 0.5,
+        "data_ready_seconds": 36.5,
         "elapsed_seconds": 40.0,
         "exact_cv2_loader_attempted": True,
         "exact_cv2_loader_chunk_frames": 8,
@@ -153,6 +155,7 @@ def test_runner_mask_result_exports_predictor_cache_measurements(tmp_path: Path)
         "milliseconds_per_frame": 153.84615384615384,
         "model_build_seconds": 0.0,
         "preseed_anchors_seconds": 2.5,
+        "presentation_tail_seconds": 3.5,
         "predictor_lock_wait_seconds": 0.004,
         "propagation_seconds": 23.0,
         "start_session_seconds": 12.5,

@@ -43,7 +43,6 @@ def test_slim_image_copies_dependencies_but_not_donor_application() -> None:
         "/usr/local/bin/ /usr/local/bin/",
         "/usr/local/lib/python3.12/ /usr/local/lib/python3.12/",
         "/usr/lib/python3/dist-packages/ /usr/lib/python3/dist-packages/",
-        "/usr/lib/python3.12/dist-packages/ /usr/lib/python3.12/dist-packages/",
         "/opt/detectron2/ /opt/detectron2/",
         "/opt/sam3/ /opt/sam3/",
         "/opt/rtmlib-cache/ /opt/rtmlib-cache/",
@@ -62,6 +61,10 @@ def test_slim_image_copies_dependencies_but_not_donor_application() -> None:
         "        /usr/lib/python3.12/dist-packages"
     )
     assert reset_marker in dockerfile
+    assert (
+        "COPY --from=dependency-runtime /usr/lib/python3.12/dist-packages/"
+        not in dockerfile
+    )
     assert dockerfile.index(reset_marker) < dockerfile.index(
         "COPY --from=dependency-runtime /usr/local/lib/python3.12/"
     )

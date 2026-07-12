@@ -9,6 +9,7 @@ import importlib
 import importlib.util
 import json
 import platform
+import site
 import sys
 from importlib.metadata import PackageNotFoundError, distributions, version
 from pathlib import Path
@@ -21,6 +22,7 @@ EXPECTED_DISTRIBUTIONS = {
     "onnxruntime-gpu": "1.26.0",
     "opencv-contrib-python-headless": "4.11.0.86",
     "rtmlib": "0.0.15",
+    "six": "1.16.0",
     "timm": "1.0.28",
     "torch": "2.9.1+cu128",
     "torchvision": "0.24.1",
@@ -58,6 +60,11 @@ EXPECTED_TREE_FINGERPRINTS = {
     "detectron2": "eb6f3c496af0f85faae1b9e63d8aed8c7f7657b385c9fc966c1bcc42a06698ee",
     "sam3": "1b3a2309e831f5cf45689dcc613a47282a82f9de5060a78f8c0b2b73226aa133",
 }
+EXPECTED_SITE_PACKAGES = [
+    "/usr/local/lib/python3.12/dist-packages",
+    "/usr/lib/python3/dist-packages",
+    "/usr/lib/python3.12/dist-packages",
+]
 TREE_ROOTS = {
     "app": Path("/app"),
     "detectron2": Path("/opt/detectron2"),
@@ -155,6 +162,7 @@ def build_snapshot() -> dict[str, Any]:
     importlib.import_module("densepose")
     importlib.import_module("rtmlib")
     importlib.import_module("sam3")
+    importlib.import_module("six")
 
     # Exercise the Torchvision native extension without requiring a GPU.
     boxes = torch.tensor([[0.0, 0.0, 10.0, 10.0], [1.0, 1.0, 9.0, 9.0]])
@@ -181,6 +189,7 @@ def build_snapshot() -> dict[str, Any]:
             "machine": platform.machine(),
             "python_implementation": platform.python_implementation(),
             "python_major_minor": f"{sys.version_info.major}.{sys.version_info.minor}",
+            "site_packages": site.getsitepackages(),
         },
         "runtime": {
             "torch": torch.__version__,
@@ -239,6 +248,11 @@ def verify_snapshot(snapshot: dict[str, Any]) -> list[str]:
     if snapshot["platform"]["python_major_minor"] != "3.12":
         errors.append(
             "expected Python 3.12, got " + snapshot["platform"]["python_major_minor"]
+        )
+    if snapshot["platform"]["site_packages"] != EXPECTED_SITE_PACKAGES:
+        errors.append(
+            f"Python site roots changed: expected {EXPECTED_SITE_PACKAGES}, "
+            f"got {snapshot['platform']['site_packages']}"
         )
     if snapshot["distribution_fingerprint"] != EXPECTED_DISTRIBUTION_FINGERPRINT:
         errors.append(

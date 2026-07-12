@@ -77,6 +77,7 @@ def test_slim_image_copies_every_runtime_and_model_contract() -> None:
     required_copies = {
         "/usr/local/bin/ /usr/local/bin/",
         "/usr/local/lib/python3.12/ /usr/local/lib/python3.12/",
+        "/usr/lib/python3/dist-packages/ /usr/lib/python3/dist-packages/",
         "/app/ /app/",
         "/opt/detectron2/ /opt/detectron2/",
         "/opt/sam3/ /opt/sam3/",

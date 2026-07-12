@@ -634,6 +634,7 @@ def test_run_densepose_exposes_effective_resize_and_crop_measurements(
     loader_kwargs: list[dict[str, Any]] = []
     apply_kwargs: list[dict[str, Any]] = []
     progress: list[dict[str, Any]] = []
+    evidence: list[tuple[int, bool, np.ndarray | None]] = []
 
     def load_backend(**kwargs: Any) -> DensePoseBackend:
         loader_kwargs.append(kwargs)
@@ -678,6 +679,9 @@ def test_run_densepose_exposes_effective_resize_and_crop_measurements(
         target_crop_padding_ratio=0.25,
         target_crop_padding_pixels=12,
         progress_callback=progress.append,
+        benchmark_evidence_callback=lambda frame_index, row, labels: evidence.append(
+            (frame_index, bool(row["usable"]), labels)
+        ),
     )
 
     assert loader_kwargs[0]["input_min_size_test"] == 512
@@ -702,6 +706,7 @@ def test_run_densepose_exposes_effective_resize_and_crop_measurements(
     assert row["inference_input"]["height"] == 28
     running_progress = [item for item in progress if item["phase"] == "running_densepose"]
     assert running_progress[-1]["inference_input"]["width"] == 40
+    assert evidence == [(0, True, None)]
     manifest = json.loads((run_dir / "cv_run_manifest.json").read_text(encoding="utf-8"))
     assert manifest["stages"]["densepose"]["inference_settings"] == result[
         "inference_settings"
@@ -715,6 +720,7 @@ def test_run_densepose_microbatches_and_reassembles_rows_and_qa_in_frame_order(
     run_dir = _make_run_dir(tmp_path, frame_count=5)
     batch_calls: list[list[int]] = []
     overlay_calls: list[tuple[int, int]] = []
+    evidence_calls: list[tuple[int, int, int]] = []
 
     monkeypatch.setattr(
         densepose_runner,
@@ -776,10 +782,14 @@ def test_run_densepose_microbatches_and_reassembles_rows_and_qa_in_frame_order(
         weights_path="weights.pkl",
         batch_size=3,
         target_crop_enabled=True,
+        benchmark_evidence_callback=lambda frame_index, row, labels: evidence_calls.append(
+            (frame_index, int(row["score"]), int(labels[0, 0]) if labels is not None else -1)
+        ),
     )
 
     assert batch_calls == [[0, 1, 2], [3, 4]]
     assert overlay_calls == [(0, 1), (1, 2), (2, 3), (3, 4), (4, 5)]
+    assert evidence_calls == [(0, 0, 1), (1, 1, 2), (2, 2, 3), (3, 3, 4), (4, 4, 5)]
     rows = _read_jsonl(run_dir / "densepose.jsonl")
     assert [row["frame_index"] for row in rows] == [0, 1, 2, 3, 4]
     assert [row["score"] for row in rows] == [0, 1, 2, 3, 4]

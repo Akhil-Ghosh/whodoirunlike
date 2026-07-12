@@ -35,6 +35,10 @@ class DensePoseSetupError(RuntimeError):
 
 
 DensePoseProgressCallback = Callable[[dict[str, Any]], None]
+DensePoseBenchmarkEvidenceCallback = Callable[
+    [int, dict[str, Any], np.ndarray | None],
+    None,
+]
 
 
 @dataclass(frozen=True)
@@ -701,6 +705,7 @@ def run_densepose(
     batch_size: int = DEFAULT_DENSEPOSE_BATCH_SIZE,
     write_qa_overlay: bool = True,
     progress_callback: DensePoseProgressCallback | None = None,
+    benchmark_evidence_callback: DensePoseBenchmarkEvidenceCallback | None = None,
 ) -> dict[str, Any]:
     started_at = time.monotonic()
     run = RunningClipRun(run_dir)
@@ -880,6 +885,12 @@ def run_densepose(
                 row["frame_index"] = frame_index
                 row.setdefault("usable", False)
                 row.setdefault("drop_reason", None if row["usable"] else "densepose_missing")
+                if benchmark_evidence_callback is not None:
+                    benchmark_evidence_callback(
+                        frame_index,
+                        dict(row),
+                        None if labels is None else np.ascontiguousarray(labels).copy(),
+                    )
                 rows.append(row)
                 if progress_callback and (frame_index == 0 or (frame_index + 1) % 10 == 0):
                     progress_callback(
@@ -988,6 +999,12 @@ def run_densepose(
                     row["frame_index"] = current_frame_index
                     row.setdefault("usable", False)
                     row.setdefault("drop_reason", None if row["usable"] else "densepose_missing")
+                    if benchmark_evidence_callback is not None:
+                        benchmark_evidence_callback(
+                            current_frame_index,
+                            dict(row),
+                            None if labels is None else np.ascontiguousarray(labels).copy(),
+                        )
                     rows.append(row)
                     if progress_callback and (
                         current_frame_index == 0 or (current_frame_index + 1) % 10 == 0

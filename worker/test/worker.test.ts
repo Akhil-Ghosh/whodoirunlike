@@ -77,6 +77,42 @@ describe("processing attempt boundaries", () => {
     );
     expect(staleArtifact.status).toBe(409);
 
+    const staleDeferredArtifact = await exports.default.fetch(
+      `https://example.test/v1/jobs/${job.run_id}/artifacts/features.json?defer_index=1`,
+      {
+        method: "PUT",
+        headers: processorHeaders({
+          "Content-Type": "application/json",
+          "X-Processing-Attempt-Id": staleAttemptId,
+        }),
+        body: new TextEncoder().encode("{}"),
+      },
+    );
+    expect(staleDeferredArtifact.status).toBe(409);
+
+    const staleFinalize = await exports.default.fetch(
+      `https://example.test/v1/jobs/${job.run_id}/artifacts/finalize`,
+      {
+        method: "POST",
+        headers: processorHeaders({
+          "Content-Type": "application/json",
+          "X-Processing-Attempt-Id": staleAttemptId,
+        }),
+        body: JSON.stringify({
+          attempt_id: staleAttemptId,
+          artifacts: [
+            {
+              name: "features.json",
+              content_type: "application/json",
+              object_version: "missing-version",
+              size_bytes: 2,
+            },
+          ],
+        }),
+      },
+    );
+    expect(staleFinalize.status).toBe(409);
+
     const staleReport = await exports.default.fetch(
       `https://example.test/v1/jobs/${job.run_id}/report`,
       {
@@ -113,6 +149,342 @@ describe("processing attempt boundaries", () => {
         `artifacts/${job.run_id}/${staleAttemptId}/fused_overlay.mp4`,
       ),
     ).toBeNull();
+    expect(
+      await env.CLIPS.head(
+        `artifacts/${job.run_id}/${staleAttemptId}/features.json`,
+      ),
+    ).toBeNull();
+  });
+
+  it("exposes a ready overlay while the processing attempt remains nonterminal", async () => {
+    const job = await uploadClip();
+    const running = await postReport(job, {
+      status: "running",
+      progress: { phase: "uploading_artifacts" },
+    });
+    expect(running.status).toBe(200);
+
+    const rejectedDeferredOverlay = await exports.default.fetch(
+      `https://example.test/v1/jobs/${job.run_id}/artifacts/fused_overlay.mp4?defer_index=1`,
+      {
+        method: "PUT",
+        headers: processorHeaders({
+          "Content-Type": "video/mp4",
+          "X-Processing-Attempt-Id": job.attempt_id,
+        }),
+        body: new Uint8Array([0]),
+      },
+    );
+    expect(rejectedDeferredOverlay.status).toBe(400);
+
+    const acceptedArtifact = await exports.default.fetch(
+      `https://example.test/v1/jobs/${job.run_id}/artifacts/fused_overlay.mp4`,
+      {
+        method: "PUT",
+        headers: processorHeaders({
+          "Content-Type": "video/mp4",
+          "X-Processing-Attempt-Id": job.attempt_id,
+        }),
+        body: new Uint8Array([4, 5, 6]),
+      },
+    );
+    expect(acceptedArtifact.status).toBe(200);
+
+    const response = await exports.default.fetch(
+      `https://example.test/v1/jobs/${job.run_id}`,
+    );
+    const publicJob = await response.json<{
+      status: string;
+      result_ready?: boolean;
+      result_ready_at?: string | null;
+      artifacts: Record<string, { href: string }>;
+    }>();
+    expect(publicJob.status).toBe("running");
+    expect(publicJob.result_ready).toBe(true);
+    expect(publicJob.result_ready_at).toMatch(/^\d{4}-\d{2}-\d{2}T/);
+    expect(publicJob.artifacts["fused_overlay.mp4"].href).toBe(
+      `https://api.whodoirunlike.com/v1/artifacts/${job.run_id}/fused_overlay.mp4`,
+    );
+    const artifactResponse = await exports.default.fetch(
+      `https://example.test/v1/artifacts/${job.run_id}/fused_overlay.mp4`,
+    );
+    expect(artifactResponse.status).toBe(200);
+    expect(new Uint8Array(await artifactResponse.arrayBuffer())).toEqual(
+      new Uint8Array([4, 5, 6]),
+    );
+  });
+
+  it("stores secondary artifacts concurrently without exposing them until one finalization", async () => {
+    const job = await uploadClip();
+    const secondaryArtifacts = [
+      {
+        name: "features.json",
+        contentType: "application/json",
+        bytes: new TextEncoder().encode('{"stride":1}'),
+      },
+      {
+        name: "runner_mask.mp4",
+        contentType: "video/mp4",
+        bytes: new Uint8Array([9, 8, 7, 6]),
+      },
+      {
+        name: "empty.json",
+        contentType: "application/json",
+        bytes: new Uint8Array([]),
+      },
+    ];
+
+    const receipts = await Promise.all(
+      secondaryArtifacts.map(async ({ name, contentType, bytes }) => {
+        const response = await exports.default.fetch(
+          `https://example.test/v1/jobs/${job.run_id}/artifacts/${name}?defer_index=1`,
+          {
+            method: "PUT",
+            headers: processorHeaders({
+              "Content-Type": contentType,
+              "X-Processing-Attempt-Id": job.attempt_id,
+            }),
+            body: bytes,
+          },
+        );
+        expect(response.status).toBe(200);
+        return response.json<{
+          artifact: string;
+          content_type: string;
+          object_version: string;
+          size_bytes: number;
+          status: string;
+        }>();
+      }),
+    );
+
+    const beforeFinalize = await exports.default.fetch(
+      `https://example.test/v1/jobs/${job.run_id}`,
+    );
+    const pendingJob = await beforeFinalize.json<{
+      artifacts: Record<string, unknown>;
+    }>();
+    expect(pendingJob.artifacts).toEqual({});
+    for (const artifact of secondaryArtifacts) {
+      expect(
+        await env.CLIPS.head(
+          `artifacts/${job.run_id}/${job.attempt_id}/${artifact.name}`,
+        ),
+      ).not.toBeNull();
+    }
+
+    const finalized = await exports.default.fetch(
+      `https://example.test/v1/jobs/${job.run_id}/artifacts/finalize`,
+      {
+        method: "POST",
+        headers: processorHeaders({
+          "Content-Type": "application/json",
+          "X-Processing-Attempt-Id": job.attempt_id,
+        }),
+        body: JSON.stringify({
+          attempt_id: job.attempt_id,
+          artifacts: receipts.map((receipt) => ({
+            name: receipt.artifact,
+            content_type: receipt.content_type,
+            object_version: receipt.object_version,
+            size_bytes: receipt.size_bytes,
+          })),
+        }),
+      },
+    );
+    expect(finalized.status).toBe(200);
+
+    const afterFinalize = await exports.default.fetch(
+      `https://example.test/v1/jobs/${job.run_id}`,
+    );
+    const publicJob = await afterFinalize.json<{
+      artifacts: Record<string, { content_type: string; size_bytes: number }>;
+    }>();
+    expect(Object.keys(publicJob.artifacts).sort()).toEqual(
+      secondaryArtifacts.map((artifact) => artifact.name).sort(),
+    );
+    for (const artifact of secondaryArtifacts) {
+      const response = await exports.default.fetch(
+        `https://example.test/v1/artifacts/${job.run_id}/${artifact.name}`,
+      );
+      expect(response.status).toBe(200);
+      expect(new Uint8Array(await response.arrayBuffer())).toEqual(artifact.bytes);
+    }
+  });
+
+  it("rejects an invalid deferred batch without exposing any of its artifacts", async () => {
+    const job = await uploadClip();
+    const uploadDeferred = async (name: string, bytes: Uint8Array) => {
+      const response = await exports.default.fetch(
+        `https://example.test/v1/jobs/${job.run_id}/artifacts/${name}?defer_index=1`,
+        {
+          method: "PUT",
+          headers: processorHeaders({
+            "Content-Type": "application/json",
+            "X-Processing-Attempt-Id": job.attempt_id,
+          }),
+          body: bytes,
+        },
+      );
+      expect(response.status).toBe(200);
+      return response.json<{
+        artifact: string;
+        content_type: string;
+        object_version: string;
+        size_bytes: number;
+      }>();
+    };
+    const [features, quality] = await Promise.all([
+      uploadDeferred("features.json", new TextEncoder().encode('{"stride":1}')),
+      uploadDeferred("qc_metrics.json", new TextEncoder().encode('{"quality":1}')),
+    ]);
+
+    const finalize = await exports.default.fetch(
+      `https://example.test/v1/jobs/${job.run_id}/artifacts/finalize`,
+      {
+        method: "POST",
+        headers: processorHeaders({
+          "Content-Type": "application/json",
+          "X-Processing-Attempt-Id": job.attempt_id,
+        }),
+        body: JSON.stringify({
+          attempt_id: job.attempt_id,
+          artifacts: [
+            {
+              name: features.artifact,
+              content_type: features.content_type,
+              object_version: features.object_version,
+              size_bytes: features.size_bytes,
+            },
+            {
+              name: quality.artifact,
+              content_type: quality.content_type,
+              object_version: quality.object_version,
+              size_bytes: quality.size_bytes + 1,
+            },
+          ],
+        }),
+      },
+    );
+    expect(finalize.status).toBe(409);
+
+    const response = await exports.default.fetch(
+      `https://example.test/v1/jobs/${job.run_id}`,
+    );
+    const publicJob = await response.json<{ artifacts: Record<string, unknown> }>();
+    expect(publicJob.artifacts).toEqual({});
+  });
+
+  it("rejects finalization when a deferred artifact was replaced by another R2 version", async () => {
+    const job = await uploadClip();
+    const uploadDeferred = async (bytes: Uint8Array) => {
+      const response = await exports.default.fetch(
+        `https://example.test/v1/jobs/${job.run_id}/artifacts/features.json?defer_index=1`,
+        {
+          method: "PUT",
+          headers: processorHeaders({
+            "Content-Type": "application/json",
+            "X-Processing-Attempt-Id": job.attempt_id,
+          }),
+          body: bytes,
+        },
+      );
+      expect(response.status).toBe(200);
+      return response.json<{
+        artifact: string;
+        content_type: string;
+        object_version: string;
+        size_bytes: number;
+      }>();
+    };
+    const firstReceipt = await uploadDeferred(new Uint8Array([1, 2, 3, 4]));
+    const replacementReceipt = await uploadDeferred(new Uint8Array([5, 6, 7, 8]));
+    expect(firstReceipt.object_version).toMatch(/\S/);
+    expect(replacementReceipt.object_version).toMatch(/\S/);
+    expect(replacementReceipt.object_version).not.toBe(firstReceipt.object_version);
+
+    const finalize = async (receipt: typeof firstReceipt) =>
+      exports.default.fetch(
+        `https://example.test/v1/jobs/${job.run_id}/artifacts/finalize`,
+        {
+          method: "POST",
+          headers: processorHeaders({
+            "Content-Type": "application/json",
+            "X-Processing-Attempt-Id": job.attempt_id,
+          }),
+          body: JSON.stringify({
+            attempt_id: job.attempt_id,
+            artifacts: [
+              {
+                name: receipt.artifact,
+                content_type: receipt.content_type,
+                object_version: receipt.object_version,
+                size_bytes: receipt.size_bytes,
+              },
+            ],
+          }),
+        },
+      );
+
+    expect((await finalize(firstReceipt)).status).toBe(409);
+    const pendingResponse = await exports.default.fetch(
+      `https://example.test/v1/jobs/${job.run_id}`,
+    );
+    const pendingJob = await pendingResponse.json<{ artifacts: Record<string, unknown> }>();
+    expect(pendingJob.artifacts).toEqual({});
+
+    expect((await finalize(replacementReceipt)).status).toBe(200);
+    const artifactResponse = await exports.default.fetch(
+      `https://example.test/v1/artifacts/${job.run_id}/features.json`,
+    );
+    expect(new Uint8Array(await artifactResponse.arrayBuffer())).toEqual(
+      new Uint8Array([5, 6, 7, 8]),
+    );
+
+    await uploadDeferred(new Uint8Array([9, 9, 9, 9]));
+    const overwrittenArtifact = await exports.default.fetch(
+      `https://example.test/v1/artifacts/${job.run_id}/features.json`,
+    );
+    expect(overwrittenArtifact.status).toBe(404);
+  });
+
+  it("does not expose an artifact recorded for another processing attempt", async () => {
+    const job = await uploadClip();
+    const staleAttemptId = crypto.randomUUID();
+    const artifactName = "fused_overlay.mp4";
+    const artifactKey = `artifacts/${job.run_id}/${staleAttemptId}/${artifactName}`;
+    await env.CLIPS.put(artifactKey, new Uint8Array([7, 8, 9]), {
+      httpMetadata: { contentType: "video/mp4" },
+    });
+
+    const record = await readInternalJob(job.run_id);
+    record.artifacts = {
+      [artifactName]: {
+        key: artifactKey,
+        attempt_id: staleAttemptId,
+        content_type: "video/mp4",
+        size_bytes: 3,
+        updated_at: new Date().toISOString(),
+      },
+    };
+    await env.CLIPS.put(`jobs/${job.run_id}.json`, JSON.stringify(record), {
+      httpMetadata: { contentType: "application/json; charset=utf-8" },
+    });
+
+    const jobResponse = await exports.default.fetch(
+      `https://example.test/v1/jobs/${job.run_id}`,
+    );
+    const publicJob = await jobResponse.json<{
+      result_ready: boolean;
+      artifacts: Record<string, { href: string }>;
+    }>();
+    expect(publicJob.result_ready).toBe(false);
+    expect(publicJob.artifacts).not.toHaveProperty(artifactName);
+
+    const artifactResponse = await exports.default.fetch(
+      `https://example.test/v1/artifacts/${job.run_id}/${artifactName}`,
+    );
+    expect(artifactResponse.status).toBe(404);
   });
 
   it("moves current terminal telemetry through a safe public terminal state", async () => {
@@ -163,6 +535,27 @@ describe("processing attempt boundaries", () => {
 });
 
 describe("telemetry ordering and recovery", () => {
+  it("accepts the processor runtime envelope used by observed stages", async () => {
+    const job = await uploadClip();
+    const event = telemetryEvent(job, 100, "stage_started", "target_tracking");
+    event.runtime = Object.fromEntries(
+      Array.from({ length: 34 }, (_, index) => [`runtime_field_${index}`, index]),
+    );
+
+    const response = await postEvent(job.run_id, event);
+
+    expect(response.status).toBe(202);
+    expect(await waitForStoredSequence(job, 100)).toHaveLength(1);
+
+    const oversized = telemetryEvent(job, 101, "stage_started", "target_tracking");
+    oversized.runtime = Object.fromEntries(
+      Array.from({ length: 65 }, (_, index) => [`runtime_field_${index}`, index]),
+    );
+    const rejected = await postEvent(job.run_id, oversized);
+    expect(rejected.status).toBe(400);
+    expect(await waitForStoredSequence(job, 101)).toHaveLength(0);
+  });
+
   it("records direct queue completion from the first running report exactly once", async () => {
     const job = await uploadClip();
     const queueStartedAt = new Date(Date.now() - 1500).toISOString();

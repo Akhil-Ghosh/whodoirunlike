@@ -3,8 +3,9 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from statistics import mean
 from typing import Any, Callable, Iterable, Sequence
@@ -119,6 +120,24 @@ MMPOSE_MODEL_SPECS: dict[str, MMPoseModelSpec] = {
 DEFAULT_MMPOSE_BACKEND = "mmpose_rtmw_l_384"
 _MMPOSE_IMPORT_CHECKED = False
 _MMPOSE_IMPORT_ERROR: str | None = None
+_RTMLIB_MODEL_CACHE: dict[tuple[Any, ...], Any] = {}
+_RTMLIB_MODEL_CACHE_LOCK = threading.RLock()
+
+
+@dataclass
+class _LockedRTMLibModel:
+    model: Any
+    inference_lock: threading.RLock = field(
+        default_factory=threading.RLock,
+        repr=False,
+    )
+
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        with self.inference_lock:
+            return self.model(*args, **kwargs)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.model, name)
 
 COCO_WHOLEBODY_NAMES = [
     "nose",
@@ -728,6 +747,7 @@ def update_manifest_after_mmpose_pose(
     raw_mmpose_landmarks_path: Path,
     skeleton_render_path: Path,
     qa_overlay_path: Path,
+    qa_overlay_key: str,
     features_path: Path,
     result: dict[str, Any],
 ) -> None:
@@ -738,7 +758,7 @@ def update_manifest_after_mmpose_pose(
     paths["pose_landmarks"] = str(pose_landmarks_path)
     paths["mmpose_landmarks"] = str(raw_mmpose_landmarks_path)
     paths["skeleton_render"] = str(skeleton_render_path)
-    paths["qa_overlay"] = str(qa_overlay_path)
+    paths[qa_overlay_key] = str(qa_overlay_path)
     paths["features"] = str(features_path)
     quality = result.get("quality", {})
     manifest.setdefault("stages", {}).setdefault("pose", {}).pop("error", None)
@@ -759,7 +779,7 @@ def update_manifest_after_mmpose_pose(
             "renders": {
                 "status": "partial_complete",
                 "skeleton_render": str(skeleton_render_path),
-                "qa_overlay": str(qa_overlay_path),
+                qa_overlay_key: str(qa_overlay_path),
             },
             "features": {"status": "complete", "output": str(features_path)},
         },
@@ -783,20 +803,44 @@ def build_rtmlib_model(
     *,
     device: str,
     runtime_backend: str,
+    cache_enabled: bool = True,
 ) -> Any:
-    from rtmlib import Custom
-
-    return Custom(
-        det_class="YOLOX",
-        det=spec.detector_url,
-        det_input_size=spec.detector_input_size,
-        pose_class="RTMPose",
-        pose=spec.pose_url,
-        pose_input_size=spec.pose_input_size,
-        to_openpose=False,
-        backend=runtime_backend,
-        device=device,
+    key = (
+        spec.id,
+        spec.detector_url,
+        spec.pose_url,
+        spec.detector_input_size,
+        spec.pose_input_size,
+        str(runtime_backend),
+        str(device),
     )
+    with _RTMLIB_MODEL_CACHE_LOCK:
+        if cache_enabled and key in _RTMLIB_MODEL_CACHE:
+            return _RTMLIB_MODEL_CACHE[key]
+
+        from rtmlib import Custom
+
+        model = _LockedRTMLibModel(
+            Custom(
+                det_class="YOLOX",
+                det=spec.detector_url,
+                det_input_size=spec.detector_input_size,
+                pose_class="RTMPose",
+                pose=spec.pose_url,
+                pose_input_size=spec.pose_input_size,
+                to_openpose=False,
+                backend=runtime_backend,
+                device=device,
+            )
+        )
+        if cache_enabled:
+            _RTMLIB_MODEL_CACHE[key] = model
+        return model
+
+
+def clear_rtmlib_model_cache() -> None:
+    with _RTMLIB_MODEL_CACHE_LOCK:
+        _RTMLIB_MODEL_CACHE.clear()
 
 
 def process_mmpose_video(
@@ -811,6 +855,7 @@ def process_mmpose_video(
     spec: MMPoseModelSpec,
     device: str,
     runtime_backend: str = DEFAULT_RTMW_RUNTIME_BACKEND,
+    normalize_qa_overlay: bool = True,
     progress_callback: MMPoseProgressCallback | None = None,
 ) -> dict[str, Any]:
     started_at = time.monotonic()
@@ -956,7 +1001,10 @@ def process_mmpose_video(
                 elapsed_seconds=time.monotonic() - started_at,
             )
         )
-    make_browser_playable_mp4s([skeleton_render_path, qa_overlay_path])
+    browser_outputs = [skeleton_render_path]
+    if normalize_qa_overlay:
+        browser_outputs.append(qa_overlay_path)
+    make_browser_playable_mp4s(browser_outputs)
     if progress_callback:
         progress_callback(
             build_pose_progress(
@@ -985,6 +1033,7 @@ def run_mmpose_pose(
     run_dir: Path,
     model_id: str = DEFAULT_MMPOSE_BACKEND,
     device: str | None = None,
+    isolate_qa_overlay: bool = False,
     progress_callback: MMPoseProgressCallback | None = None,
 ) -> dict[str, Any]:
     started_at = time.monotonic()
@@ -998,7 +1047,8 @@ def run_mmpose_pose(
     raw_mmpose_landmarks_path = run.artifact_path("mmpose_landmarks", manifest)
     pose_landmarks_path = run.artifact_path("pose_landmarks", manifest)
     skeleton_render_path = run.artifact_path("skeleton_render", manifest)
-    qa_overlay_path = run.artifact_path("qa_overlay", manifest)
+    qa_overlay_key = "pose_qa_overlay" if isolate_qa_overlay else "qa_overlay"
+    qa_overlay_path = run.artifact_path(qa_overlay_key, manifest)
     features_path = run.artifact_path("features", manifest)
 
     if not setup["ready"]:
@@ -1028,6 +1078,7 @@ def run_mmpose_pose(
             spec=spec,
             device=device or str(setup["device"]),
             runtime_backend=str(setup.get("runtime_backend") or DEFAULT_RTMW_RUNTIME_BACKEND),
+            normalize_qa_overlay=not isolate_qa_overlay,
             progress_callback=progress_callback,
         )
         update_manifest_after_mmpose_pose(
@@ -1037,6 +1088,7 @@ def run_mmpose_pose(
             raw_mmpose_landmarks_path=raw_mmpose_landmarks_path,
             skeleton_render_path=skeleton_render_path,
             qa_overlay_path=qa_overlay_path,
+            qa_overlay_key=qa_overlay_key,
             features_path=features_path,
             result=result,
         )

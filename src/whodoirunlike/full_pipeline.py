@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import shutil
+import threading
+from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Callable
 
@@ -12,6 +15,7 @@ from whodoirunlike.processing_telemetry import ProcessingTelemetry
 from whodoirunlike.qc import run_qc_metrics
 from whodoirunlike.running_clip_run import RunningClipRun
 from whodoirunlike.sam31_mlx_runner import run_sam31_mlx_mask
+from whodoirunlike.video_io import make_browser_playable_mp4
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -67,6 +71,8 @@ def _run_mask_stage(
     mask_backend: str,
     mask_quality_mode: str,
     progress_callback: Callable[[dict[str, Any]], None] | None = None,
+    runner_mask_ready_callback: Callable[[], None] | None = None,
+    render_qa_overlay: bool = True,
 ) -> dict[str, Any]:
     normalized = mask_backend.strip().lower()
     if normalized in {"sam31", "sam31_mlx", "sam3.1_mlx", "mlx"}:
@@ -78,11 +84,43 @@ def _run_mask_stage(
     if normalized in {"sam31_gpu", "sam3.1_gpu", "sam31_cuda", "sam3.1_cuda"}:
         from whodoirunlike.sam31_gpu_runner import run_sam31_gpu_mask
 
-        return run_sam31_gpu_mask(run_dir=run_dir, progress_callback=progress_callback)
+        return run_sam31_gpu_mask(
+            run_dir=run_dir,
+            progress_callback=progress_callback,
+            runner_mask_ready_callback=runner_mask_ready_callback,
+            render_qa_overlay=render_qa_overlay,
+        )
     raise ValueError("mask_backend must be one of: sam31_mlx, sam31_gpu")
 
 
 _FAILURE_STATUSES = frozenset({"failed", "failure", "unavailable", "error"})
+_SAM31_GPU_BACKENDS = frozenset({"sam31_gpu", "sam3.1_gpu", "sam31_cuda", "sam3.1_cuda"})
+
+
+def _wait_for_runner_mask_readiness(
+    ready: threading.Event,
+    future: Future[dict[str, Any]],
+) -> None:
+    while not ready.wait(timeout=0.05):
+        if future.done():
+            future.result()
+            raise RuntimeError("SAM mask stage completed without signaling runner-mask readiness")
+
+
+def _finalize_render_artifact_pointers(run_dir: Path) -> None:
+    """Resolve QA pointers after the parallel pose/DensePose join."""
+
+    run = RunningClipRun(run_dir)
+    if not run.manifest_path.is_file():
+        return
+    manifest = run.read_manifest()
+    values: dict[str, Any] = {}
+    for key in ("qa_overlay", "pose_qa_overlay"):
+        path = run.artifact_path(key, manifest)
+        if path.is_file():
+            values[key] = str(path)
+    if values:
+        run.update_stage("renders", values, manifest)
 
 
 def _run_observed_stage(
@@ -152,6 +190,7 @@ _MASK_PHASE_SPANS = {
     "rendering": "render",
     "encoding": "encode",
     "writing_outputs": "write",
+    "analytical_mask_ready": None,
     "completed": None,
 }
 _POSE_PHASE_SPANS = {
@@ -206,8 +245,25 @@ def run_full_cv_pipeline(
     mask_backend: str = "sam31_mlx",
     mask_quality_mode: str = "native",
     skip_densepose: bool = False,
+    parallel_mask_presentation: bool = False,
+    parallel_pose_densepose: bool = False,
+    parallel_post_fusion: bool = False,
     telemetry: ProcessingTelemetry | None = None,
 ) -> dict[str, Any]:
+    if parallel_pose_densepose and not skip_densepose and not pose_backend.startswith("mmpose_"):
+        raise ValueError(
+            "parallel_pose_densepose requires an mmpose backend with isolated QA output"
+        )
+    normalized_mask_backend = mask_backend.strip().lower()
+    if parallel_mask_presentation and (
+        normalized_mask_backend not in _SAM31_GPU_BACKENDS
+        or not pose_backend.startswith("mmpose_")
+        or skip_densepose
+    ):
+        raise ValueError(
+            "parallel_mask_presentation requires sam31_gpu, an mmpose backend, "
+            "and DensePose enabled"
+        )
     result: dict[str, Any] = {"run_dir": str(run_dir), "steps": []}
     identity = _run_observed_stage(
         telemetry=telemetry,
@@ -222,19 +278,43 @@ def run_full_cv_pipeline(
     )
     result["steps"].append({"stage": "identity", "result": identity})
 
-    mask = _run_observed_stage(
-        telemetry=telemetry,
-        stage="runner_mask",
-        runtime={"backend": mask_backend, "quality_mode": mask_quality_mode},
-        phase_spans=_MASK_PHASE_SPANS,
-        action=lambda progress: _run_mask_stage(
-            run_dir=run_dir,
-            mask_backend=mask_backend,
-            mask_quality_mode=mask_quality_mode,
-            progress_callback=progress,
-        ),
-    )
-    result["steps"].append({"stage": "mask", "result": mask})
+    runner_mask_ready = threading.Event() if parallel_mask_presentation else None
+
+    def run_observed_mask_stage() -> dict[str, Any]:
+        return _run_observed_stage(
+            telemetry=telemetry,
+            stage="runner_mask",
+            runtime={
+                "backend": mask_backend,
+                "quality_mode": mask_quality_mode,
+                "parallel_presentation": parallel_mask_presentation,
+            },
+            phase_spans=_MASK_PHASE_SPANS,
+            action=lambda progress: _run_mask_stage(
+                run_dir=run_dir,
+                mask_backend=mask_backend,
+                mask_quality_mode=mask_quality_mode,
+                progress_callback=progress,
+                runner_mask_ready_callback=(
+                    runner_mask_ready.set if runner_mask_ready is not None else None
+                ),
+                render_qa_overlay=not parallel_mask_presentation,
+            ),
+        )
+
+    mask_executor: ThreadPoolExecutor | None = None
+    mask_future: Future[dict[str, Any]] | None = None
+    mask: dict[str, Any] | None = None
+    if runner_mask_ready is not None:
+        mask_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="mask-presentation")
+        mask_future = mask_executor.submit(run_observed_mask_stage)
+        try:
+            _wait_for_runner_mask_readiness(runner_mask_ready, mask_future)
+        except BaseException:
+            mask_executor.shutdown(wait=True)
+            raise
+    else:
+        mask = run_observed_mask_stage()
 
     if pose_backend.startswith("mmpose_"):
         from whodoirunlike.mmpose_runner import run_mmpose_pose
@@ -245,6 +325,7 @@ def run_full_cv_pipeline(
             return run_mmpose_pose(
                 run_dir=run_dir,
                 model_id=pose_backend,
+                isolate_qa_overlay=True,
                 progress_callback=progress,
             )
     elif pose_backend == "mediapipe":
@@ -269,39 +350,61 @@ def run_full_cv_pipeline(
                 run_dir=run_dir,
                 progress_callback=progress,
             )
-    pose = _run_observed_stage(
-        telemetry=telemetry,
-        stage="pose_sequence",
-        runtime={"backend": pose_backend},
-        phase_spans=_POSE_PHASE_SPANS,
-        action=pose_action,
-    )
-    result["steps"].append({"stage": "pose", "result": pose})
+    pose_runtime: dict[str, Any] = {"backend": pose_backend}
+    if pose_backend.startswith("mmpose_"):
+        pose_runtime.update(
+            {
+                "device": _env_value("MMPOSE_DEVICE") or "cpu",
+                "runtime_backend": _env_value("RTMW_RUNTIME_BACKEND") or "onnxruntime",
+            }
+        )
+
+    def run_pose_stage() -> dict[str, Any]:
+        return _run_observed_stage(
+            telemetry=telemetry,
+            stage="pose_sequence",
+            runtime=pose_runtime,
+            phase_spans=_POSE_PHASE_SPANS,
+            action=pose_action,
+        )
 
     if not skip_densepose:
         from whodoirunlike.densepose_runner import run_densepose
 
         densepose_kwargs = _densepose_runtime_kwargs()
-        densepose = _run_observed_stage(
-            telemetry=telemetry,
-            stage="densepose_body_map",
-            runtime={"backend": "densepose", "device": densepose_kwargs["device"]},
-            phase_spans=_DENSEPOSE_PHASE_SPANS,
-            action=lambda progress: run_densepose(
-                run_dir=run_dir,
-                progress_callback=progress,
-                **densepose_kwargs,
-            ),
-        )
-        result["steps"].append({"stage": "densepose", "result": densepose})
+
+        def run_densepose_stage() -> dict[str, Any]:
+            return _run_observed_stage(
+                telemetry=telemetry,
+                stage="densepose_body_map",
+                runtime={
+                    "backend": "densepose",
+                    "device": densepose_kwargs["device"],
+                },
+                phase_spans=_DENSEPOSE_PHASE_SPANS,
+                action=lambda progress: run_densepose(
+                    run_dir=run_dir,
+                    progress_callback=progress,
+                    **densepose_kwargs,
+                ),
+            )
     else:
-        def skip_densepose(_: Callable[[dict[str, Any]], None] | None) -> dict[str, Any]:
+        def write_skipped_densepose(
+            _: Callable[[dict[str, Any]], None] | None,
+        ) -> dict[str, Any]:
             run = RunningClipRun(run_dir)
             manifest = run.read_manifest()
             densepose_path = run.artifact_path("densepose", manifest)
             if not densepose_path.exists():
                 densepose_path.parent.mkdir(parents=True, exist_ok=True)
                 densepose_path.write_text("", encoding="utf-8")
+            if pose_backend.startswith("mmpose_"):
+                pose_qa_path = run.artifact_path("pose_qa_overlay", manifest)
+                canonical_qa_path = run.artifact_path("qa_overlay", manifest)
+                if pose_qa_path.exists():
+                    canonical_qa_path.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copyfile(pose_qa_path, canonical_qa_path)
+                    make_browser_playable_mp4(canonical_qa_path)
             densepose_stage = manifest.setdefault("stages", {}).setdefault("densepose", {})
             densepose_stage.pop("error", None)
             densepose_stage.pop("setup_instructions", None)
@@ -313,15 +416,63 @@ def run_full_cv_pipeline(
             )
             return {"status": "skipped"}
 
-        densepose = _run_observed_stage(
-            telemetry=telemetry,
-            stage="densepose_body_map",
-            runtime={"backend": "densepose", "skipped": True},
-            action=skip_densepose,
-            default_span=None,
-            single_span="write",
-        )
-        result["steps"].append({"stage": "densepose", "result": densepose})
+        def run_densepose_stage() -> dict[str, Any]:
+            return _run_observed_stage(
+                telemetry=telemetry,
+                stage="densepose_body_map",
+                runtime={"backend": "densepose", "skipped": True},
+                action=write_skipped_densepose,
+                default_span=None,
+                single_span="write",
+            )
+
+    concurrent_errors: list[BaseException] = []
+    try:
+        if parallel_pose_densepose and not skip_densepose:
+            with ThreadPoolExecutor(max_workers=2, thread_name_prefix="cv-analysis") as executor:
+                pose_future = executor.submit(run_pose_stage)
+                densepose_future = executor.submit(run_densepose_stage)
+                try:
+                    pose = pose_future.result()
+                except BaseException as error:
+                    concurrent_errors.append(error)
+                try:
+                    densepose = densepose_future.result()
+                except BaseException as error:
+                    concurrent_errors.append(error)
+        else:
+            pose = run_pose_stage()
+            densepose = run_densepose_stage()
+    except BaseException as error:
+        concurrent_errors.append(error)
+
+    try:
+        if mask_future is not None:
+            try:
+                mask = mask_future.result()
+            except BaseException as error:
+                concurrent_errors.append(error)
+    finally:
+        if mask_executor is not None:
+            mask_executor.shutdown(wait=True)
+
+    if len(concurrent_errors) == 1:
+        raise concurrent_errors[0]
+    if concurrent_errors:
+        if all(isinstance(error, Exception) for error in concurrent_errors):
+            raise ExceptionGroup(
+                "Concurrent CV stages failed",
+                [error for error in concurrent_errors if isinstance(error, Exception)],
+            )
+        raise concurrent_errors[0]
+
+    if mask is None:
+        raise RuntimeError("Mask stage did not produce a result")
+
+    result["steps"].append({"stage": "mask", "result": mask})
+    result["steps"].append({"stage": "pose", "result": pose})
+    result["steps"].append({"stage": "densepose", "result": densepose})
+    _finalize_render_artifact_pointers(run_dir)
 
     fusion = _run_observed_stage(
         telemetry=telemetry,
@@ -333,30 +484,50 @@ def run_full_cv_pipeline(
         ),
     )
     result["steps"].append({"stage": "fusion", "result": fusion})
-    features = _run_observed_stage(
-        telemetry=telemetry,
-        stage="form_feature_compilation",
-        phase_spans=_FEATURE_PHASE_SPANS,
-        action=lambda progress: compile_form_features(
-            run_dir=run_dir,
-            progress_callback=progress,
-        ),
-    )
+
+    def run_features_stage() -> dict[str, Any]:
+        return _run_observed_stage(
+            telemetry=telemetry,
+            stage="form_feature_compilation",
+            phase_spans=_FEATURE_PHASE_SPANS,
+            action=lambda progress: compile_form_features(
+                run_dir=run_dir,
+                progress_callback=progress,
+            ),
+        )
+
+    def run_tables_stage() -> dict[str, Any]:
+        return _run_observed_stage(
+            telemetry=telemetry,
+            stage="artifact_table_export",
+            action=lambda _: export_cv_tables(run_dir),
+            default_span=None,
+            single_span="write",
+        )
+
+    def run_qc_stage() -> dict[str, Any]:
+        return _run_observed_stage(
+            telemetry=telemetry,
+            stage="quality_control",
+            action=lambda _: run_qc_metrics(run_dir),
+            default_span=None,
+            single_span="postprocess",
+        )
+
+    if parallel_post_fusion:
+        with ThreadPoolExecutor(max_workers=3, thread_name_prefix="cv-postprocess") as executor:
+            features_future = executor.submit(run_features_stage)
+            tables_future = executor.submit(run_tables_stage)
+            qc_future = executor.submit(run_qc_stage)
+            features = features_future.result()
+            tables = tables_future.result()
+            qc = qc_future.result()
+    else:
+        features = run_features_stage()
+        tables = run_tables_stage()
+        qc = run_qc_stage()
+
     result["steps"].append({"stage": "features", "result": features})
-    tables = _run_observed_stage(
-        telemetry=telemetry,
-        stage="artifact_table_export",
-        action=lambda _: export_cv_tables(run_dir),
-        default_span=None,
-        single_span="write",
-    )
     result["steps"].append({"stage": "artifact_tables", "result": tables})
-    qc = _run_observed_stage(
-        telemetry=telemetry,
-        stage="quality_control",
-        action=lambda _: run_qc_metrics(run_dir),
-        default_span=None,
-        single_span="postprocess",
-    )
     result["steps"].append({"stage": "qc", "result": qc})
     return result

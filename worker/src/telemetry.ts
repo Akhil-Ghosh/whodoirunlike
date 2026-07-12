@@ -96,6 +96,7 @@ const OUTBOX_BATCH_SIZE = 100;
 const OUTBOX_CONCURRENCY = 10;
 const RECONCILIATION_BATCH_SIZE = 50;
 const MAX_OUTBOX_OBJECT_BYTES = TELEMETRY_MAX_BODY_BYTES + 16 * 1024;
+const MAX_METADATA_PROPERTIES = 64;
 
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const METADATA_KEY_PATTERN = /^[A-Za-z][A-Za-z0-9_.-]{0,63}$/;
@@ -639,7 +640,7 @@ function validateBoundedRecord(
   budget: { nodes: number },
 ): { ok: true; value: BoundedJsonObject } | { ok: false; error: string } {
   const entries = Object.entries(record);
-  if (entries.length > 32) {
+  if (entries.length > MAX_METADATA_PROPERTIES) {
     return { ok: false, error: `Telemetry ${field} has too many properties.` };
   }
   const output: BoundedJsonObject = {};

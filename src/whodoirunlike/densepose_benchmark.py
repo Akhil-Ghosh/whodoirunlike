@@ -32,6 +32,10 @@ BENCHMARK_TYPE = "densepose_batch_benchmark"
 BENCHMARK_RESULT_TYPE = "densepose_batch_benchmark_result"
 BENCHMARK_SCHEMA_VERSION = 1
 CANONICAL_FIXTURE_ID = "cole-frame130-production-v1"
+BENCHMARK_PROFILE_ENV = "WHODOIRUNLIKE_DENSEPOSE_BENCHMARK_PROFILE"
+TARGET_CROP_PROFILE_ID = "target-crop-512-960-v1"
+LIVE_CONTROL_PROFILE_ID = "live-control-no-resize-override-v1"
+BENCHMARK_PROFILE_IDS = frozenset({TARGET_CROP_PROFILE_ID, LIVE_CONTROL_PROFILE_ID})
 ALLOWED_BATCH_SIZES = (1, 2, 4, 8)
 MEASURED_REPETITIONS = 3
 MAX_REQUEST_BYTES = 1024 * 1024
@@ -168,17 +172,20 @@ def bounded_failure(
     batch_size: int | None = None,
     exception_type: str | None = None,
 ) -> dict[str, Any]:
-    error: dict[str, Any] = {"code": code}
+    failure: dict[str, Any] = {"code": code}
     if batch_size in ALLOWED_BATCH_SIZES:
-        error["batch_size"] = batch_size
+        failure["batch_size"] = batch_size
     if exception_type and len(exception_type) <= 96 and exception_type.replace("_", "").isalnum():
-        error["exception_type"] = exception_type
+        failure["exception_type"] = exception_type
     return ensure_bounded_response(
         {
             "type": BENCHMARK_RESULT_TYPE,
             "schema_version": BENCHMARK_SCHEMA_VERSION,
             "status": "failed",
-            "error": error,
+            # RunPod treats a top-level `error` key as an SDK control flag and removes it
+            # from otherwise successful handler output. Keep bounded diagnostics under a
+            # neutral field so callers can inspect the failure code and exception class.
+            "failure": failure,
         }
     )
 
@@ -283,14 +290,38 @@ def verify_fixture(source_path: Path, runner_mask_path: Path) -> dict[str, Any]:
     }
 
 
-def validate_runtime_configuration(runtime_kwargs: dict[str, Any]) -> None:
+def benchmark_profile() -> str:
+    profile_id = os.getenv(BENCHMARK_PROFILE_ENV, "").strip() or TARGET_CROP_PROFILE_ID
+    if profile_id not in BENCHMARK_PROFILE_IDS:
+        raise BenchmarkContractError("DensePose benchmark profile is unsupported")
+    return profile_id
+
+
+def validate_runtime_configuration(
+    runtime_kwargs: dict[str, Any],
+    *,
+    profile_id: str | None = None,
+) -> None:
+    selected_profile = profile_id or benchmark_profile()
+    if selected_profile == TARGET_CROP_PROFILE_ID:
+        numerical_settings = {
+            "input_min_size_test": 512,
+            "input_max_size_test": 960,
+            "target_crop_enabled": True,
+        }
+    elif selected_profile == LIVE_CONTROL_PROFILE_ID:
+        numerical_settings = {
+            "input_min_size_test": None,
+            "input_max_size_test": None,
+            "target_crop_enabled": False,
+        }
+    else:
+        raise BenchmarkContractError("DensePose benchmark profile is unsupported")
     expected = {
         "device": "cuda",
-        "input_min_size_test": 512,
-        "input_max_size_test": 960,
-        "target_crop_enabled": True,
         "target_crop_padding_ratio": 0.2,
         "target_crop_padding_pixels": 16,
+        **numerical_settings,
     }
     mismatches = [key for key, value in expected.items() if runtime_kwargs.get(key) != value]
     if mismatches:
@@ -1044,9 +1075,10 @@ def evaluate_performance(
 
 def run_benchmark(request: BenchmarkRequest) -> dict[str, Any]:
     identity = runtime_identity()
+    profile_id = benchmark_profile()
     runtime_kwargs = _densepose_runtime_kwargs()
     runtime_kwargs.pop("batch_size", None)
-    validate_runtime_configuration(runtime_kwargs)
+    validate_runtime_configuration(runtime_kwargs, profile_id=profile_id)
     cuda = load_cuda_runtime()
     if cuda.gpu_name != EXPECTED_GPU_NAME:
         raise BenchmarkContractError(
@@ -1158,6 +1190,7 @@ def run_benchmark(request: BenchmarkRequest) -> dict[str, Any]:
             },
             "runtime": {
                 **identity,
+                "benchmark_profile": profile_id,
                 "gpu_name": cuda.gpu_name,
                 "torch_version": cuda.torch_version,
                 "cuda_version": cuda.cuda_version,

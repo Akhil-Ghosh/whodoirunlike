@@ -209,6 +209,8 @@ def test_bounded_failure_never_contains_message_path_or_traceback() -> None:
     serialized = json.dumps(failure)
     assert failure["status"] == "failed"
     assert failure["response_bytes"] <= densepose_benchmark.MAX_RESPONSE_BYTES
+    assert "error" not in failure
+    assert failure["failure"]["code"] == "benchmark_execution_failed"
     assert "message" not in serialized
     assert "traceback" not in serialized.lower()
     assert "/" not in serialized
@@ -240,6 +242,8 @@ def test_serverless_health_is_shallow_bounded_and_advertises_disabled_state(
 
     assert result["benchmark_enabled"] is False
     assert result["runtime_identity_pinned"] is False
+    assert result["benchmark_profile"] == densepose_benchmark.TARGET_CROP_PROFILE_ID
+    assert result["benchmark_profile_ids"] == sorted(densepose_benchmark.BENCHMARK_PROFILE_IDS)
     assert result["allowed_batch_sizes"] == [1, 2, 4, 8]
     assert result["isolation"] == "fresh_spawned_process_per_matrix"
     assert result["response_bytes"] <= densepose_benchmark.MAX_RESPONSE_BYTES
@@ -298,7 +302,7 @@ def test_child_failure_is_bounded_and_does_not_return_exception_text(
 
     assert sender.value is not None
     serialized = json.dumps(sender.value)
-    assert sender.value["error"] == {
+    assert sender.value["failure"] == {
         "code": "benchmark_execution_failed",
         "exception_type": "RuntimeError",
     }
@@ -319,7 +323,7 @@ def test_spawned_matrix_process_returns_a_bounded_failure_on_unpinned_runtime(
     )
 
     assert result["status"] == "failed"
-    assert result["error"] == {
+    assert result["failure"] == {
         "code": "benchmark_execution_failed",
         "exception_type": "BenchmarkContractError",
     }
@@ -525,6 +529,38 @@ def test_runtime_configuration_fails_closed_on_unpinned_setting() -> None:
         densepose_benchmark.validate_runtime_configuration(runtime)
 
 
+def test_live_control_runtime_profile_requires_unset_size_overrides_and_no_crop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(
+        densepose_benchmark.BENCHMARK_PROFILE_ENV,
+        densepose_benchmark.LIVE_CONTROL_PROFILE_ID,
+    )
+    runtime = {
+        "device": "cuda",
+        "input_min_size_test": None,
+        "input_max_size_test": None,
+        "target_crop_enabled": False,
+        "target_crop_padding_ratio": 0.2,
+        "target_crop_padding_pixels": 16,
+    }
+
+    densepose_benchmark.validate_runtime_configuration(runtime)
+
+    runtime["input_max_size_test"] = 960
+    with pytest.raises(BenchmarkContractError, match="input_max_size_test"):
+        densepose_benchmark.validate_runtime_configuration(runtime)
+
+
+def test_benchmark_profile_fails_closed_on_unknown_value(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(densepose_benchmark.BENCHMARK_PROFILE_ENV, "not-a-profile")
+
+    with pytest.raises(BenchmarkContractError, match="profile"):
+        densepose_benchmark.benchmark_profile()
+
+
 def test_runtime_identity_requires_commit_and_immutable_image_digest(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -708,6 +744,7 @@ def test_full_matrix_orchestration_is_warm_balanced_bounded_and_strict(
 
     assert result["status"] == "complete"
     assert result["passed"] is True
+    assert result["runtime"]["benchmark_profile"] == (densepose_benchmark.TARGET_CROP_PROFILE_ID)
     assert calls[:4] == [1, 2, 4, 8]
     assert calls[4:] == [1, 2, 4, 8, 4, 8, 1, 2, 8, 4, 2, 1]
     assert result["runtime"]["warmup_runs_per_batch"] == 1

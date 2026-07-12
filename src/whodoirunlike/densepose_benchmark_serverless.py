@@ -10,11 +10,13 @@ from whodoirunlike.densepose_benchmark import (
     BENCHMARK_RESULT_TYPE,
     BENCHMARK_SCHEMA_VERSION,
     BENCHMARK_TYPE,
+    BENCHMARK_PROFILE_IDS,
     CANONICAL_FIXTURE_ID,
     MAX_REQUEST_BYTES,
     MAX_RESPONSE_BYTES,
     BenchmarkRequest,
     BenchmarkResponseTooLarge,
+    benchmark_profile,
     bounded_failure,
     ensure_bounded_response,
     run_benchmark,
@@ -32,6 +34,7 @@ def _enabled() -> bool:
 
 
 def health() -> dict[str, Any]:
+    profile_id = benchmark_profile()
     try:
         runtime_identity()
         runtime_identity_pinned = True
@@ -46,6 +49,8 @@ def health() -> dict[str, Any]:
             "benchmark_enabled": _enabled(),
             "runtime_identity_pinned": runtime_identity_pinned,
             "fixture_id": CANONICAL_FIXTURE_ID,
+            "benchmark_profile": profile_id,
+            "benchmark_profile_ids": sorted(BENCHMARK_PROFILE_IDS),
             "allowed_batch_sizes": list(ALLOWED_BATCH_SIZES),
             "request_limit_bytes": MAX_REQUEST_BYTES,
             "response_limit_bytes": MAX_RESPONSE_BYTES,

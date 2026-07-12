@@ -763,6 +763,47 @@ def test_artifact_put_sends_processing_attempt_header(
         "11111111-1111-4111-8111-111111111111"
     )
 
+
+@pytest.mark.parametrize(("status", "expected_attempts"), [(503, 3), (409, 1)])
+def test_indexed_artifact_put_retries_only_transient_callback_failures(
+    monkeypatch: Any,
+    tmp_path: Path,
+    status: int,
+    expected_attempts: int,
+) -> None:
+    import urllib.error
+
+    from whodoirunlike import hosted_processor
+
+    artifact = tmp_path / "fused_overlay.mp4"
+    artifact.write_bytes(b"fused")
+    requests: list[Any] = []
+    sleeps: list[float] = []
+
+    def fail_urlopen(request: Any, *, timeout: float) -> Any:
+        assert timeout == 120
+        requests.append(request)
+        raise urllib.error.HTTPError(request.full_url, status, "failed", {}, None)
+
+    monkeypatch.setenv("WHODOIRUNLIKE_PROCESSOR_SHARED_SECRET", "secret")
+    monkeypatch.setenv("WHODOIRUNLIKE_ARTIFACT_PUBLISH_ATTEMPTS", "3")
+    monkeypatch.setenv("WHODOIRUNLIKE_ARTIFACT_PUBLISH_BACKOFF_SECONDS", "0.25")
+    monkeypatch.setattr(hosted_processor.urllib.request, "urlopen", fail_urlopen)
+    monkeypatch.setattr(hosted_processor.time, "sleep", sleeps.append)
+
+    with pytest.raises(urllib.error.HTTPError) as raised:
+        hosted_processor._put_worker_artifact(
+            callback_base_url="https://api.whodoirunlike.com",
+            run_id="12345678-1234-4234-9234-123456789abc",
+            attempt_id="11111111-1111-4111-8111-111111111111",
+            name=artifact.name,
+            path=artifact,
+        )
+
+    assert raised.value.code == status
+    assert len(requests) == expected_attempts
+    assert sleeps == ([0.25, 0.5] if status == 503 else [])
+
 def test_deferred_artifact_put_and_finalize_send_validated_attempt_metadata(
     monkeypatch: Any,
     tmp_path: Path,

@@ -398,20 +398,29 @@ def _put_worker_artifact(
     path: Path,
 ) -> None:
     content_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
-    with path.open("rb") as artifact:
-        request = urllib.request.Request(
-            f"{callback_base_url.rstrip('/')}/v1/jobs/{run_id}/artifacts/{name}",
-            data=artifact,
-            method="PUT",
-            headers={
-                **_request_headers(),
-                "X-Processing-Attempt-Id": attempt_id,
-                "Content-Type": content_type,
-                "Content-Length": str(path.stat().st_size),
-            },
-        )
-        with urllib.request.urlopen(request, timeout=120):
-            return
+    size_bytes = path.stat().st_size
+    attempts, backoff_seconds = _artifact_publish_retry_settings()
+    endpoint = f"{callback_base_url.rstrip('/')}/v1/jobs/{run_id}/artifacts/{name}"
+    for attempt_index in range(attempts):
+        try:
+            with path.open("rb") as artifact:
+                request = urllib.request.Request(
+                    endpoint,
+                    data=artifact,
+                    method="PUT",
+                    headers={
+                        **_request_headers(),
+                        "X-Processing-Attempt-Id": attempt_id,
+                        "Content-Type": content_type,
+                        "Content-Length": str(size_bytes),
+                    },
+                )
+                with urllib.request.urlopen(request, timeout=120):
+                    return
+        except (TimeoutError, OSError, urllib.error.URLError) as error:
+            if not _retryable_artifact_publish_error(error) or attempt_index + 1 >= attempts:
+                raise
+            _artifact_publish_retry_delay(backoff_seconds, attempt_index)
 
 
 def _artifact_content_type(path: Path) -> str:

@@ -108,7 +108,7 @@ def scoped_sam31_exact_cv2_loader(
                 max_destination_bytes=max_destination_bytes,
                 diagnostics_callback=lambda sample: setattr(probe, "diagnostics", sample),
             )
-        except ExactCv2LoaderUnavailable as exc:
+        except (ExactCv2LoaderUnavailable, ExactCv2LoaderSafetyLimitExceeded) as exc:
             probe.used = False
             probe.fallback_reason = str(exc)
             return original_loader(**kwargs)
@@ -169,13 +169,13 @@ def load_video_frames_exact_cv2(
             raise ExactCv2LoaderSafetyLimitExceeded(
                 "SAM exact CV2 loader refused "
                 f"{frame_capacity} frames because the configured maximum is "
-                f"{effective_max_frames}; refusing unbounded upstream fallback"
+                f"{effective_max_frames}"
             )
         if destination_bytes > effective_max_destination_bytes:
             raise ExactCv2LoaderSafetyLimitExceeded(
                 "SAM exact CV2 loader refused a "
                 f"{destination_bytes}-byte destination because the configured maximum is "
-                f"{effective_max_destination_bytes}; refusing unbounded upstream fallback"
+                f"{effective_max_destination_bytes}"
             )
 
         device = "cpu" if offload_video_to_cpu else "cuda"

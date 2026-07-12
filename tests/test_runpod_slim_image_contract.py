@@ -51,6 +51,11 @@ def test_slim_image_copies_dependencies_but_not_donor_application() -> None:
         assert required in dockerfile
     assert "COPY --from=dependency-runtime /app" not in dockerfile
     assert "yolo26" not in dockerfile.lower()
+    reset_marker = "rm -rf \\\n        /usr/local/lib/python3.12 \\\n        /usr/lib/python3/dist-packages"
+    assert reset_marker in dockerfile
+    assert dockerfile.index(reset_marker) < dockerfile.index(
+        "COPY --from=dependency-runtime /usr/local/lib/python3.12/"
+    )
 
 
 def test_slim_image_preserves_quality_environment_without_override_knobs() -> None:

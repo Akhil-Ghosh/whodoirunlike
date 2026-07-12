@@ -1257,6 +1257,7 @@ def _measurements_from_result(result: Mapping[str, Any]) -> dict[str, Any]:
         "artifacts_uploaded",
         "cache_hit",
         "close_session_seconds",
+        "data_ready_seconds",
         "detected_frames",
         "elapsed_seconds",
         "exact_cv2_loader_attempted",
@@ -1302,6 +1303,9 @@ def _measurements_from_result(result: Mapping[str, Any]) -> dict[str, Any]:
     elapsed = _safe_float(measurements.get("elapsed_seconds"))
     if frame_count and elapsed is not None and frame_count > 0:
         measurements["milliseconds_per_frame"] = elapsed * 1000.0 / frame_count
+    data_ready = _safe_float(measurements.get("data_ready_seconds"))
+    if elapsed is not None and data_ready is not None and 0.0 <= data_ready <= elapsed:
+        measurements["presentation_tail_seconds"] = elapsed - data_ready
     return measurements
 
 

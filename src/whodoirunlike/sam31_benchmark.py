@@ -124,6 +124,17 @@ VARIANTS = {
         strategy=SAM31_GPU_STRATEGY_PRESEED_SINGLE_PASS,
         scaffold_uncached_frame_outputs=True,
     ),
+    "preseed_single_pass_cache_scaffold_compile": VariantConfig(
+        strategy=SAM31_GPU_STRATEGY_PRESEED_SINGLE_PASS,
+        compile=True,
+        scaffold_uncached_frame_outputs=True,
+    ),
+    "preseed_single_pass_cache_scaffold_compile_warm_up": VariantConfig(
+        strategy=SAM31_GPU_STRATEGY_PRESEED_SINGLE_PASS,
+        compile=True,
+        warm_up=True,
+        scaffold_uncached_frame_outputs=True,
+    ),
     "preseed_single_pass_cache_scaffold_frame_dir": VariantConfig(
         strategy=SAM31_GPU_STRATEGY_PRESEED_SINGLE_PASS,
         resource="frame_dir",

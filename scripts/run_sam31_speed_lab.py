@@ -47,6 +47,8 @@ VARIANT_IDS = (
     "probe_then_anchor_64",
     "seed_single_pass_cache_scaffold",
     "preseed_single_pass_cache_scaffold",
+    "preseed_single_pass_cache_scaffold_compile",
+    "preseed_single_pass_cache_scaffold_compile_warm_up",
     "preseed_single_pass_cache_scaffold_frame_dir",
     "preseed_single_pass_cache_scaffold_frame_dir_offload",
 )

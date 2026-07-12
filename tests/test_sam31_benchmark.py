@@ -74,6 +74,23 @@ def test_quality_comparison_reports_exact_agreement() -> None:
     assert quality["strict_mask_agreement_gate"]["passed"] is True
 
 
+def test_compile_variants_are_explicit_and_cache_distinct_predictors() -> None:
+    compile_only = sam31_benchmark.VARIANTS[
+        "preseed_single_pass_cache_scaffold_compile"
+    ]
+    compiled_and_warmed = sam31_benchmark.VARIANTS[
+        "preseed_single_pass_cache_scaffold_compile_warm_up"
+    ]
+
+    assert compile_only.compile is True
+    assert compile_only.warm_up is False
+    assert compiled_and_warmed.compile is True
+    assert compiled_and_warmed.warm_up is True
+    assert sam31_benchmark._predictor_key(compile_only, None) != (
+        sam31_benchmark._predictor_key(compiled_and_warmed, None)
+    )
+
+
 def test_serverless_handler_rejects_benchmark_when_disabled(monkeypatch) -> None:
     monkeypatch.delenv("WHODOIRUNLIKE_ENABLE_SAM31_BENCHMARK", raising=False)
 

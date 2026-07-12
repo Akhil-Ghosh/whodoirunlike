@@ -166,6 +166,11 @@ def test_manual_lab_workflow_never_tags_or_deploys_production() -> None:
     assert "Dockerfile.runpod-slim" in workflow
     assert "platforms: linux/amd64" in workflow
     assert "${{ steps.build.outputs.digest }}" in workflow
+    assert (
+        "LAB_IMAGE: ghcr.io/akhil-ghosh/whodoirunlike-runpod-processor@"
+        "${{ needs.build.outputs.digest }}"
+    ) in workflow
+    assert "LAB_IMAGE: ${{ env.IMAGE_NAME }}" not in workflow
     assert "--network none" in workflow
     assert DONOR_DIGEST in workflow
     assert 'docker manifest inspect --verbose "${DONOR_IMAGE}"' in workflow

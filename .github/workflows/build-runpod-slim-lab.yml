@@ -60,7 +60,7 @@ jobs:
       contents: read
       packages: read
     env:
-      LAB_IMAGE: ${{ env.IMAGE_NAME }}@${{ needs.build.outputs.digest }}
+      LAB_IMAGE: ghcr.io/akhil-ghosh/whodoirunlike-runpod-processor@${{ needs.build.outputs.digest }}
     steps:
       - name: Log in to GHCR
         uses: docker/login-action@v3

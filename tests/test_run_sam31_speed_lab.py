@@ -90,6 +90,10 @@ def test_cli_resolves_full_profile_selection_and_named_matrix() -> None:
         profile_id=None,
         profile_matrix="authoritative-candidate",
     ) == ["production_candidate"]
+    assert script._resolve_full_profile_ids(
+        profile_id=None,
+        profile_matrix="authoritative-candidate-schedule-only",
+    ) == ["production_candidate_schedule_only"]
 
 
 def test_cli_rejects_profile_and_matrix_together() -> None:

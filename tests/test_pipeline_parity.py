@@ -33,6 +33,7 @@ from whodoirunlike.pipeline_parity import (
     compare_feature_artifacts,
     compare_artifact_contracts,
     compare_qc_payloads,
+    compare_runner_mask_videos,
     compare_video_contracts,
     compare_pipeline_runs,
     compare_pose_rows,
@@ -944,6 +945,75 @@ def _write_test_video(path: Path) -> None:
     writer.release()
 
 
+def _write_test_mask_video(
+    path: Path,
+    *,
+    rectangle_width: int = 20,
+    frame_size: tuple[int, int] = (64, 48),
+) -> None:
+    width, height = frame_size
+    writer = cv2.VideoWriter(
+        str(path),
+        cv2.VideoWriter_fourcc(*"mp4v"),
+        10.0,
+        (width, height),
+    )
+    assert writer.isOpened()
+    for index in range(3):
+        frame = np.zeros((height, width, 3), dtype=np.uint8)
+        x1 = 10 + index
+        cv2.rectangle(frame, (x1, 10), (x1 + rectangle_width, 35), (255, 255, 255), -1)
+        writer.write(frame)
+    writer.release()
+
+
+def test_runner_mask_comparison_decodes_and_gates_framewise_binary_agreement(
+    tmp_path: Path,
+) -> None:
+    control = tmp_path / "control.mp4"
+    candidate = tmp_path / "candidate.mp4"
+    _write_test_mask_video(control)
+    shutil.copy2(control, candidate)
+
+    gate = compare_runner_mask_videos(
+        control,
+        candidate,
+        expected_width=64,
+        expected_height=48,
+        expected_frame_count=3,
+    )
+
+    assert gate["passed"] is True
+    assert gate["measurements"]["iou_mean"] == 1.0
+    assert gate["measurements"]["iou_p05"] == 1.0
+    assert gate["measurements"]["coverage_mae"] == 0.0
+    assert gate["measurements"]["mask_churn_abs_delta"] == 0.0
+    assert gate["thresholds"]["iou_mean_min"] == 0.985
+    assert gate["thresholds"]["iou_p05_min"] == 0.975
+
+
+def test_runner_mask_comparison_rejects_coverage_and_geometry_drift(
+    tmp_path: Path,
+) -> None:
+    control = tmp_path / "control.mp4"
+    candidate = tmp_path / "candidate.mp4"
+    _write_test_mask_video(control, rectangle_width=20)
+    _write_test_mask_video(candidate, rectangle_width=32)
+
+    gate = compare_runner_mask_videos(
+        control,
+        candidate,
+        expected_width=64,
+        expected_height=48,
+        expected_frame_count=3,
+    )
+
+    assert gate["passed"] is False
+    assert gate["checks"]["iou_mean"] is False
+    assert gate["checks"]["iou_p05"] is False
+    assert gate["checks"]["coverage_mae"] is False
+
+
 def test_video_contract_comparison_decodes_every_frame_in_both_profiles(
     tmp_path: Path,
 ) -> None:
@@ -1012,6 +1082,8 @@ def test_full_profile_matrix_defaults_to_three_arm_mask_and_optimization_isolati
         "WHODOIRUNLIKE_PARALLEL_POSE_DENSEPOSE": "true",
         "WHODOIRUNLIKE_PARALLEL_POST_FUSION": "true",
         "WHODOIRUNLIKE_PARALLEL_ARTIFACT_PUBLISH": "true",
+        "MMPOSE_DEVICE": "cuda",
+        "RTMW_RUNTIME_BACKEND": "onnxruntime",
         "MMPOSE_USE_DETECTOR": "false",
         "DENSEPOSE_INPUT_MIN_SIZE_TEST": "512",
         "DENSEPOSE_INPUT_MAX_SIZE_TEST": "960",
@@ -1026,10 +1098,25 @@ def test_full_profile_registry_includes_direct_production_pipeline_timing_modes(
         "downstream_candidate_optimized",
         "production_control",
         "production_candidate",
+        "production_candidate_schedule_only",
     }
     assert PIPELINE_BENCHMARK_PROFILES["production_candidate"].execution_mode == (
         "production_full_pipeline"
     )
+    assert dict(
+        PIPELINE_BENCHMARK_PROFILES["production_candidate_schedule_only"].environment_overrides
+    ) == {
+        "WHODOIRUNLIKE_PARALLEL_MASK_PRESENTATION": "true",
+        "WHODOIRUNLIKE_PARALLEL_POSE_DENSEPOSE": "true",
+        "WHODOIRUNLIKE_PARALLEL_POST_FUSION": "true",
+        "WHODOIRUNLIKE_PARALLEL_ARTIFACT_PUBLISH": "true",
+        "MMPOSE_DEVICE": "cpu",
+        "RTMW_RUNTIME_BACKEND": "onnxruntime",
+        "MMPOSE_USE_DETECTOR": "true",
+        "DENSEPOSE_INPUT_MIN_SIZE_TEST": None,
+        "DENSEPOSE_INPUT_MAX_SIZE_TEST": None,
+        "DENSEPOSE_TARGET_CROP_ENABLED": None,
+    }
 
 
 def test_full_profile_matrix_rejects_more_than_three_executions() -> None:
@@ -1188,6 +1275,8 @@ def test_production_profiles_apply_exact_deploy_configs_and_restore_environment(
                 "parallel_mask_presentation": parallel_mask_presentation,
                 "parallel_pose_densepose": parallel_pose_densepose,
                 "parallel_post_fusion": parallel_post_fusion,
+                "device": os.getenv("MMPOSE_DEVICE"),
+                "runtime_backend": os.getenv("RTMW_RUNTIME_BACKEND"),
                 "use_detector": os.getenv("MMPOSE_USE_DETECTOR"),
                 "densepose_min": os.getenv("DENSEPOSE_INPUT_MIN_SIZE_TEST"),
                 "densepose_max": os.getenv("DENSEPOSE_INPUT_MAX_SIZE_TEST"),
@@ -1201,6 +1290,7 @@ def test_production_profiles_apply_exact_deploy_configs_and_restore_environment(
     monkeypatch.setenv("MMPOSE_USE_DETECTOR", "outside")
     (tmp_path / "control").mkdir()
     (tmp_path / "candidate").mkdir()
+    (tmp_path / "schedule-only").mkdir()
 
     run_pipeline_profile(
         tmp_path / "control",
@@ -1209,6 +1299,10 @@ def test_production_profiles_apply_exact_deploy_configs_and_restore_environment(
     run_pipeline_profile(
         tmp_path / "candidate",
         PIPELINE_BENCHMARK_PROFILES["production_candidate"],
+    )
+    run_pipeline_profile(
+        tmp_path / "schedule-only",
+        PIPELINE_BENCHMARK_PROFILES["production_candidate_schedule_only"],
     )
 
     assert calls[0] | {"run_dir": None} == {
@@ -1219,6 +1313,8 @@ def test_production_profiles_apply_exact_deploy_configs_and_restore_environment(
         "parallel_mask_presentation": False,
         "parallel_pose_densepose": False,
         "parallel_post_fusion": False,
+        "device": "cpu",
+        "runtime_backend": "onnxruntime",
         "use_detector": "true",
         "densepose_min": None,
         "densepose_max": None,
@@ -1233,10 +1329,28 @@ def test_production_profiles_apply_exact_deploy_configs_and_restore_environment(
         "parallel_mask_presentation": True,
         "parallel_pose_densepose": True,
         "parallel_post_fusion": True,
+        "device": "cuda",
+        "runtime_backend": "onnxruntime",
         "use_detector": "false",
         "densepose_min": "512",
         "densepose_max": "960",
         "densepose_crop": "true",
+        "parallel_publish": "true",
+    }
+    assert calls[2] | {"run_dir": None} == {
+        "run_dir": None,
+        "pose_backend": "mmpose_rtmpose_l_384",
+        "mask_backend": "sam31_gpu",
+        "skip_densepose": False,
+        "parallel_mask_presentation": True,
+        "parallel_pose_densepose": True,
+        "parallel_post_fusion": True,
+        "device": "cpu",
+        "runtime_backend": "onnxruntime",
+        "use_detector": "true",
+        "densepose_min": None,
+        "densepose_max": None,
+        "densepose_crop": None,
         "parallel_publish": "true",
     }
     assert os.environ["MMPOSE_USE_DETECTOR"] == "outside"
@@ -1683,14 +1797,64 @@ def test_full_benchmark_persists_complete_scratch_artifacts_when_configured(
     assert (bundle_dir / "benchmark_result.json").is_file()
 
 
+@pytest.mark.parametrize(
+    (
+        "profile_id",
+        "image_role",
+        "base_commit",
+        "base_digest",
+        "code_commit",
+        "code_source",
+        "code_reference_digest",
+        "dependency_role",
+        "dependency_commit",
+        "dependency_digest",
+    ),
+    [
+        (
+            "production_candidate",
+            "candidate",
+            pipeline_parity.EXACT_CANDIDATE_COMMIT,
+            pipeline_parity.EXACT_CANDIDATE_IMAGE_DIGEST,
+            pipeline_parity.EXACT_CANDIDATE_COMMIT,
+            "base_image",
+            pipeline_parity.EXACT_CANDIDATE_IMAGE_DIGEST,
+            "candidate",
+            pipeline_parity.EXACT_CANDIDATE_COMMIT,
+            pipeline_parity.EXACT_CANDIDATE_IMAGE_DIGEST,
+        ),
+        (
+            "production_candidate_schedule_only",
+            "schedule_only",
+            pipeline_parity.EXACT_CONTROL_COMMIT,
+            pipeline_parity.EXACT_CONTROL_IMAGE_DIGEST,
+            pipeline_parity.EXACT_CANDIDATE_COMMIT,
+            "git_commit",
+            pipeline_parity.EXACT_CANDIDATE_IMAGE_DIGEST,
+            "control",
+            pipeline_parity.EXACT_CONTROL_COMMIT,
+            pipeline_parity.EXACT_CONTROL_IMAGE_DIGEST,
+        ),
+    ],
+)
 def test_candidate_handoff_adds_authoritative_cross_image_gate_without_blobs(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    profile_id: str,
+    image_role: str,
+    base_commit: str,
+    base_digest: str,
+    code_commit: str,
+    code_source: str,
+    code_reference_digest: str,
+    dependency_role: str,
+    dependency_commit: str,
+    dependency_digest: str,
 ) -> None:
     source, payload = _small_full_benchmark_payload(
         tmp_path,
         monkeypatch,
-        profile_ids=["production_candidate"],
+        profile_ids=[profile_id],
     )
     payload["artifact_sink"] = {
         "callback_base_url": "https://parity-scratch.example.com",
@@ -1701,14 +1865,26 @@ def test_candidate_handoff_adds_authoritative_cross_image_gate_without_blobs(
         "WHODOIRUNLIKE_PARITY_SINK_ORIGIN",
         "https://parity-scratch.example.com",
     )
-    monkeypatch.setenv("WHODOIRUNLIKE_BENCHMARK_IMAGE_ROLE", "candidate")
+    monkeypatch.setenv("WHODOIRUNLIKE_BENCHMARK_IMAGE_ROLE", image_role)
     monkeypatch.setenv(
         "WHODOIRUNLIKE_BASE_PROCESSOR_COMMIT",
-        pipeline_parity.EXACT_CANDIDATE_COMMIT,
+        base_commit,
     )
     monkeypatch.setenv(
         "WHODOIRUNLIKE_BASE_PROCESSOR_IMAGE_DIGEST",
-        pipeline_parity.EXACT_CANDIDATE_IMAGE_DIGEST,
+        base_digest,
+    )
+    monkeypatch.setenv("WHODOIRUNLIKE_CODE_OVERLAY_COMMIT", code_commit)
+    monkeypatch.setenv("WHODOIRUNLIKE_CODE_OVERLAY_SOURCE", code_source)
+    monkeypatch.setenv(
+        "WHODOIRUNLIKE_CODE_OVERLAY_REFERENCE_IMAGE_DIGEST",
+        code_reference_digest,
+    )
+    monkeypatch.setenv("WHODOIRUNLIKE_DEPENDENCY_BASE_ROLE", dependency_role)
+    monkeypatch.setenv("WHODOIRUNLIKE_DEPENDENCY_BASE_COMMIT", dependency_commit)
+    monkeypatch.setenv(
+        "WHODOIRUNLIKE_DEPENDENCY_BASE_IMAGE_DIGEST",
+        dependency_digest,
     )
     control_dir = tmp_path / "downloaded-control"
     control_dir.mkdir()
@@ -1752,6 +1928,7 @@ def test_candidate_handoff_adds_authoritative_cross_image_gate_without_blobs(
     )
 
     assert result["comparisons"]["authoritative_cross_image"]["passed"] is True
+    assert result["comparisons"]["authoritative_cross_image"]["candidate_profile_id"] == profile_id
     assert result["parity_passed"] is True
     assert result["handoff"]["gates"]["name"] == "parity_gates.json"
     assert payload["assets"]["baseline_runner_mask_mp4"]["data"] not in json.dumps(result)

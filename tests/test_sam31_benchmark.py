@@ -235,6 +235,7 @@ def test_serverless_health_advertises_full_profiles_and_scopes() -> None:
         "downstream_candidate_optimized",
     ]
     assert "production_candidate" in health["full_profile_ids"]
+    assert "production_candidate_schedule_only" in health["full_profile_ids"]
 
 
 def test_serverless_fails_closed_when_exact_base_contract_changes(

@@ -27,7 +27,7 @@ import uuid
 import cv2
 import numpy as np
 
-from whodoirunlike.mask_artifacts import write_masks_jsonl_from_video
+from whodoirunlike.mask_artifacts import iter_mask_video, write_masks_jsonl_from_video
 from whodoirunlike.running_clip_run import RunningClipRun
 from whodoirunlike.sam31_parity import (
     CANONICAL_FRAME130_FIXTURE_ID,
@@ -35,6 +35,7 @@ from whodoirunlike.sam31_parity import (
     EXACT_CANDIDATE_IMAGE_DIGEST,
     EXACT_CONTROL_COMMIT,
     EXACT_CONTROL_IMAGE_DIGEST,
+    STRICT_MASK_GATE_THRESHOLDS,
     get_parity_fixture,
     validate_prompt_for_fixture,
     verify_non_overlay_production_files,
@@ -157,6 +158,24 @@ class VideoParityMeasurements:
 
 
 @dataclass(frozen=True)
+class RunnerMaskParityMeasurements:
+    control_width: int
+    control_height: int
+    candidate_width: int
+    candidate_height: int
+    control_frame_count: int
+    candidate_frame_count: int
+    control_nonempty_frame_count: int
+    candidate_nonempty_frame_count: int
+    iou_mean: float | None
+    iou_p05: float | None
+    boundary_f1_mean: float | None
+    centroid_error_normalized_mean: float | None
+    coverage_mae: float | None
+    mask_churn_abs_delta: float | None
+
+
+@dataclass(frozen=True)
 class PipelineBenchmarkProfile:
     profile_id: str
     execution_mode: str
@@ -175,6 +194,20 @@ _CONTROL_DEPLOY_ENV = (
     ("WHODOIRUNLIKE_PARALLEL_POSE_DENSEPOSE", "false"),
     ("WHODOIRUNLIKE_PARALLEL_POST_FUSION", "false"),
     ("WHODOIRUNLIKE_PARALLEL_ARTIFACT_PUBLISH", "false"),
+    ("MMPOSE_DEVICE", "cpu"),
+    ("RTMW_RUNTIME_BACKEND", "onnxruntime"),
+    ("MMPOSE_USE_DETECTOR", "true"),
+    ("DENSEPOSE_INPUT_MIN_SIZE_TEST", None),
+    ("DENSEPOSE_INPUT_MAX_SIZE_TEST", None),
+    ("DENSEPOSE_TARGET_CROP_ENABLED", None),
+)
+_SCHEDULE_ONLY_DEPLOY_ENV = (
+    ("WHODOIRUNLIKE_PARALLEL_MASK_PRESENTATION", "true"),
+    ("WHODOIRUNLIKE_PARALLEL_POSE_DENSEPOSE", "true"),
+    ("WHODOIRUNLIKE_PARALLEL_POST_FUSION", "true"),
+    ("WHODOIRUNLIKE_PARALLEL_ARTIFACT_PUBLISH", "true"),
+    ("MMPOSE_DEVICE", "cpu"),
+    ("RTMW_RUNTIME_BACKEND", "onnxruntime"),
     ("MMPOSE_USE_DETECTOR", "true"),
     ("DENSEPOSE_INPUT_MIN_SIZE_TEST", None),
     ("DENSEPOSE_INPUT_MAX_SIZE_TEST", None),
@@ -185,6 +218,8 @@ _OPTIMIZED_DEPLOY_ENV = (
     ("WHODOIRUNLIKE_PARALLEL_POSE_DENSEPOSE", "true"),
     ("WHODOIRUNLIKE_PARALLEL_POST_FUSION", "true"),
     ("WHODOIRUNLIKE_PARALLEL_ARTIFACT_PUBLISH", "true"),
+    ("MMPOSE_DEVICE", "cuda"),
+    ("RTMW_RUNTIME_BACKEND", "onnxruntime"),
     ("MMPOSE_USE_DETECTOR", "false"),
     ("DENSEPOSE_INPUT_MIN_SIZE_TEST", "512"),
     ("DENSEPOSE_INPUT_MAX_SIZE_TEST", "960"),
@@ -248,6 +283,15 @@ PIPELINE_BENCHMARK_PROFILES = {
         parallel_pose_densepose=True,
         parallel_post_fusion=True,
         environment_overrides=_OPTIMIZED_DEPLOY_ENV,
+    ),
+    "production_candidate_schedule_only": PipelineBenchmarkProfile(
+        profile_id="production_candidate_schedule_only",
+        execution_mode="production_full_pipeline",
+        mask_source="production",
+        parallel_mask_presentation=True,
+        parallel_pose_densepose=True,
+        parallel_post_fusion=True,
+        environment_overrides=_SCHEDULE_ONLY_DEPLOY_ENV,
     ),
 }
 DEFAULT_PIPELINE_PROFILE_MATRIX = (
@@ -911,6 +955,14 @@ def _resolve_full_source_path() -> Path:
 
 def _full_runtime_metadata() -> dict[str, Any]:
     image_role = os.getenv("WHODOIRUNLIKE_BENCHMARK_IMAGE_ROLE", "candidate")
+    base_processor_commit = os.getenv(
+        "WHODOIRUNLIKE_BASE_PROCESSOR_COMMIT",
+        EXACT_CANDIDATE_COMMIT,
+    )
+    base_processor_image_digest = os.getenv(
+        "WHODOIRUNLIKE_BASE_PROCESSOR_IMAGE_DIGEST",
+        EXACT_CANDIDATE_IMAGE_DIGEST,
+    )
     result = {
         "processor_version": os.getenv("WHODOIRUNLIKE_PROCESSOR_VERSION", "unknown"),
         "benchmark_version": os.getenv("WHODOIRUNLIKE_BENCHMARK_VERSION", "unknown"),
@@ -923,13 +975,31 @@ def _full_runtime_metadata() -> dict[str, Any]:
             EXACT_CANDIDATE_IMAGE_DIGEST,
         ),
         "base_image_role": image_role,
-        "base_processor_commit": os.getenv(
-            "WHODOIRUNLIKE_BASE_PROCESSOR_COMMIT",
-            EXACT_CANDIDATE_COMMIT,
+        "base_processor_commit": base_processor_commit,
+        "base_processor_image_digest": base_processor_image_digest,
+        "code_overlay_commit": os.getenv(
+            "WHODOIRUNLIKE_CODE_OVERLAY_COMMIT",
+            base_processor_commit,
         ),
-        "base_processor_image_digest": os.getenv(
-            "WHODOIRUNLIKE_BASE_PROCESSOR_IMAGE_DIGEST",
-            EXACT_CANDIDATE_IMAGE_DIGEST,
+        "code_overlay_source": os.getenv(
+            "WHODOIRUNLIKE_CODE_OVERLAY_SOURCE",
+            "base_image",
+        ),
+        "code_overlay_reference_image_digest": os.getenv(
+            "WHODOIRUNLIKE_CODE_OVERLAY_REFERENCE_IMAGE_DIGEST",
+            base_processor_image_digest,
+        ),
+        "dependency_base_role": os.getenv(
+            "WHODOIRUNLIKE_DEPENDENCY_BASE_ROLE",
+            image_role,
+        ),
+        "dependency_base_commit": os.getenv(
+            "WHODOIRUNLIKE_DEPENDENCY_BASE_COMMIT",
+            base_processor_commit,
+        ),
+        "dependency_base_image_digest": os.getenv(
+            "WHODOIRUNLIKE_DEPENDENCY_BASE_IMAGE_DIGEST",
+            base_processor_image_digest,
         ),
     }
     if os.getenv("WHODOIRUNLIKE_ENFORCE_BASE_CONTRACT", "").lower() in {
@@ -1204,6 +1274,12 @@ def _create_handoff_bundle(
         "image_role": image_role,
         "base_processor_commit": runtime.get("base_processor_commit"),
         "base_processor_image_digest": runtime.get("base_processor_image_digest"),
+        "code_overlay_commit": runtime.get("code_overlay_commit"),
+        "code_overlay_source": runtime.get("code_overlay_source"),
+        "code_overlay_reference_image_digest": runtime.get("code_overlay_reference_image_digest"),
+        "dependency_base_role": runtime.get("dependency_base_role"),
+        "dependency_base_commit": runtime.get("dependency_base_commit"),
+        "dependency_base_image_digest": runtime.get("dependency_base_image_digest"),
         "base_contract": runtime.get("base_contract"),
         "gpu_name": runtime.get("gpu_name"),
         "fixture": {
@@ -1503,6 +1579,7 @@ def run_full_pipeline_benchmark(
     sink = _validate_artifact_sink(payload.get("artifact_sink"))
     runtime = _full_runtime_metadata()
     image_role = str(runtime.get("base_image_role") or "candidate")
+    is_candidate_handoff = image_role in {"candidate", "schedule_only"}
     profile_ids = [profile.profile_id for profile in profiles]
     if sink is not None:
         if image_role == "control":
@@ -1515,16 +1592,40 @@ def run_full_pipeline_benchmark(
                 raise ValueError("Control handoff is not running on the exact control image.")
         elif image_role == "candidate":
             if profile_ids != ["production_candidate"]:
-                raise ValueError(
-                    "Candidate handoff requires exactly the production_candidate profile."
-                )
+                raise ValueError("Candidate handoff requires production_candidate.")
             if (
                 runtime.get("base_processor_commit") != EXACT_CANDIDATE_COMMIT
                 or runtime.get("base_processor_image_digest") != EXACT_CANDIDATE_IMAGE_DIGEST
             ):
                 raise ValueError("Candidate handoff is not running on the exact candidate image.")
+        elif image_role == "schedule_only":
+            if profile_ids != ["production_candidate_schedule_only"]:
+                raise ValueError(
+                    "Schedule-only handoff requires production_candidate_schedule_only."
+                )
+            schedule_provenance = {
+                "base_processor_commit": runtime.get("base_processor_commit")
+                == EXACT_CONTROL_COMMIT,
+                "base_processor_image_digest": runtime.get("base_processor_image_digest")
+                == EXACT_CONTROL_IMAGE_DIGEST,
+                "code_overlay_commit": runtime.get("code_overlay_commit") == EXACT_CANDIDATE_COMMIT,
+                "code_overlay_source": runtime.get("code_overlay_source") == "git_commit",
+                "code_overlay_reference_image_digest": runtime.get(
+                    "code_overlay_reference_image_digest"
+                )
+                == EXACT_CANDIDATE_IMAGE_DIGEST,
+                "dependency_base_role": runtime.get("dependency_base_role") == "control",
+                "dependency_base_commit": runtime.get("dependency_base_commit")
+                == EXACT_CONTROL_COMMIT,
+                "dependency_base_image_digest": runtime.get("dependency_base_image_digest")
+                == EXACT_CONTROL_IMAGE_DIGEST,
+            }
+            if not all(schedule_provenance.values()):
+                raise ValueError("Schedule-only handoff provenance is not exact.")
         else:
-            raise ValueError("Artifact handoff requires a control or candidate image role.")
+            raise ValueError(
+                "Artifact handoff requires a control, candidate, or schedule-only image role."
+            )
 
     execute_profile = profile_runner or (
         lambda run_dir, profile: run_pipeline_profile(run_dir, profile)
@@ -1610,7 +1711,8 @@ def run_full_pipeline_benchmark(
             for comparison_id, control, candidate in _comparison_pairs(profiles)
         }
         handoff: dict[str, Any] = {"status": "not_requested"}
-        if sink is not None and image_role == "candidate":
+        if sink is not None and is_candidate_handoff:
+            candidate_profile_id = profile_ids[0]
             control_profile_dir, control_handoff = _load_control_handoff(
                 sink=sink,
                 workspace=temp_root,
@@ -1619,14 +1721,14 @@ def run_full_pipeline_benchmark(
             )
             cross_image = compare_pipeline_runs(
                 control_profile_dir,
-                run_dirs["production_candidate"],
+                run_dirs[candidate_profile_id],
                 expected_width=fixture.width,
                 expected_height=fixture.height,
                 expected_frame_count=fixture.frame_count,
                 expected_fps=float(source_meta.get("fps") or 0.0),
             )
             cross_image["control_profile_id"] = "production_control"
-            cross_image["candidate_profile_id"] = "production_candidate"
+            cross_image["candidate_profile_id"] = candidate_profile_id
             cross_image["provenance"] = control_handoff
             comparisons["authoritative_cross_image"] = cross_image
 
@@ -1706,7 +1808,7 @@ def run_full_pipeline_benchmark(
             "unavailable_metrics": list(FULL_BENCHMARK_UNAVAILABLE_METRICS),
             "response_bytes": 0,
         }
-        if sink is not None and image_role == "candidate":
+        if sink is not None and is_candidate_handoff:
             gate_payload = {
                 "schema_version": 1,
                 "type": "authoritative_cross_image_parity",
@@ -1790,6 +1892,18 @@ QC_PARITY_THRESHOLDS = {
     "uncertainty_increase_max": 0.01,
 }
 VIDEO_PARITY_THRESHOLDS = {"fps_max_abs_delta_max": 0.01}
+RUNNER_MASK_PARITY_THRESHOLDS = {
+    "iou_mean_min": float(STRICT_MASK_GATE_THRESHOLDS["iou_mean_min"]),
+    "iou_p05_min": float(STRICT_MASK_GATE_THRESHOLDS["iou_p05_min"]),
+    "boundary_f1_mean_min": float(STRICT_MASK_GATE_THRESHOLDS["boundary_f1_mean_min"]),
+    "centroid_error_normalized_mean_max": float(
+        STRICT_MASK_GATE_THRESHOLDS["centroid_error_normalized_mean_max"]
+    ),
+    "coverage_mae_max": 0.01,
+    "mask_churn_abs_delta_max": float(
+        STRICT_MASK_GATE_THRESHOLDS["temporal_iou_absolute_delta_max"]
+    ),
+}
 
 
 def evaluate_pose_parity(
@@ -2039,6 +2153,60 @@ def evaluate_video_parity(
         "thresholds": {
             "expected_video_count": expected_video_count,
             **VIDEO_PARITY_THRESHOLDS,
+        },
+    }
+
+
+def evaluate_runner_mask_parity(
+    measurements: RunnerMaskParityMeasurements,
+    *,
+    expected_width: int,
+    expected_height: int,
+    expected_frame_count: int,
+) -> dict[str, Any]:
+    if expected_width <= 0 or expected_height <= 0 or expected_frame_count <= 0:
+        raise ValueError("Runner-mask parity expectations must be positive.")
+    checks = {
+        "control_dimensions_exact": (
+            measurements.control_width == expected_width
+            and measurements.control_height == expected_height
+        ),
+        "candidate_dimensions_exact": (
+            measurements.candidate_width == expected_width
+            and measurements.candidate_height == expected_height
+        ),
+        "control_frame_count_exact": measurements.control_frame_count == expected_frame_count,
+        "candidate_frame_count_exact": measurements.candidate_frame_count == expected_frame_count,
+        "control_nonempty_frame_count_exact": measurements.control_nonempty_frame_count
+        == expected_frame_count,
+        "candidate_nonempty_frame_count_exact": measurements.candidate_nonempty_frame_count
+        == expected_frame_count,
+        "iou_mean": measurements.iou_mean is not None
+        and measurements.iou_mean >= RUNNER_MASK_PARITY_THRESHOLDS["iou_mean_min"],
+        "iou_p05": measurements.iou_p05 is not None
+        and measurements.iou_p05 >= RUNNER_MASK_PARITY_THRESHOLDS["iou_p05_min"],
+        "boundary_f1_mean": measurements.boundary_f1_mean is not None
+        and measurements.boundary_f1_mean >= RUNNER_MASK_PARITY_THRESHOLDS["boundary_f1_mean_min"],
+        "centroid_error_normalized_mean": (
+            measurements.centroid_error_normalized_mean is not None
+            and measurements.centroid_error_normalized_mean
+            <= RUNNER_MASK_PARITY_THRESHOLDS["centroid_error_normalized_mean_max"]
+        ),
+        "coverage_mae": measurements.coverage_mae is not None
+        and measurements.coverage_mae <= RUNNER_MASK_PARITY_THRESHOLDS["coverage_mae_max"],
+        "mask_churn_abs_delta": measurements.mask_churn_abs_delta is not None
+        and measurements.mask_churn_abs_delta
+        <= RUNNER_MASK_PARITY_THRESHOLDS["mask_churn_abs_delta_max"],
+    }
+    return {
+        "passed": all(checks.values()),
+        "checks": checks,
+        "measurements": asdict(measurements),
+        "thresholds": {
+            "expected_width": expected_width,
+            "expected_height": expected_height,
+            "expected_frame_count": expected_frame_count,
+            **RUNNER_MASK_PARITY_THRESHOLDS,
         },
     }
 
@@ -2895,6 +3063,55 @@ def compare_artifact_contracts(
     return result
 
 
+def compare_runner_mask_videos(
+    control_path: Path,
+    candidate_path: Path,
+    *,
+    expected_width: int,
+    expected_height: int,
+    expected_frame_count: int,
+) -> dict[str, Any]:
+    from whodoirunlike.sam31_benchmark import compare_masks_to_production_baseline
+
+    control_meta, control_masks = iter_mask_video(control_path)
+    candidate_meta, candidate_masks = iter_mask_video(candidate_path)
+    quality = compare_masks_to_production_baseline(
+        candidate_masks,
+        control_masks,
+        track_boxes={},
+        expected_frame_count=expected_frame_count,
+    )
+    coverage_errors = [
+        abs(float(np.mean(control_mask > 0)) - float(np.mean(candidate_mask > 0)))
+        for control_mask, candidate_mask in zip(control_masks, candidate_masks)
+    ]
+    measurements = RunnerMaskParityMeasurements(
+        control_width=int(control_meta["width"]),
+        control_height=int(control_meta["height"]),
+        candidate_width=int(candidate_meta["width"]),
+        candidate_height=int(candidate_meta["height"]),
+        control_frame_count=len(control_masks),
+        candidate_frame_count=len(candidate_masks),
+        control_nonempty_frame_count=sum(int(bool(np.any(mask))) for mask in control_masks),
+        candidate_nonempty_frame_count=sum(int(bool(np.any(mask))) for mask in candidate_masks),
+        iou_mean=quality["iou"]["mean"],
+        iou_p05=quality["iou"]["p05"],
+        boundary_f1_mean=quality["boundary_f1_2px_mean"],
+        centroid_error_normalized_mean=quality["centroid_error_normalized_mean"],
+        coverage_mae=(float(statistics.fmean(coverage_errors)) if coverage_errors else None),
+        mask_churn_abs_delta=quality["temporal_iou"]["absolute_delta"],
+    )
+    result = evaluate_runner_mask_parity(
+        measurements,
+        expected_width=expected_width,
+        expected_height=expected_height,
+        expected_frame_count=expected_frame_count,
+    )
+    result["worst_frame_indices"] = quality["worst_frame_indices"]
+    result["baseline_is_lossy_mp4_not_ground_truth"] = True
+    return result
+
+
 def _decode_video_contract(path: Path) -> dict[str, Any]:
     capture = cv2.VideoCapture(str(path))
     if not capture.isOpened():
@@ -3074,6 +3291,25 @@ def compare_pipeline_runs(
             )
         except Exception as exc:
             comparisons[name] = _invalid_comparison(exc)
+
+    runner_mask_name = "runner_mask.mp4"
+    control_runner_mask = control_dir / runner_mask_name
+    candidate_runner_mask = candidate_dir / runner_mask_name
+    if not control_runner_mask.is_file() or not candidate_runner_mask.is_file():
+        comparisons["runner_mask"] = _unavailable_comparison(runner_mask_name)
+    else:
+        try:
+            comparisons["runner_mask"] = _available_comparison(
+                compare_runner_mask_videos(
+                    control_runner_mask,
+                    candidate_runner_mask,
+                    expected_width=expected_width,
+                    expected_height=expected_height,
+                    expected_frame_count=expected_frame_count,
+                )
+            )
+        except Exception as exc:
+            comparisons["runner_mask"] = _invalid_comparison(exc)
 
     compare_jsonl_family("pose", "pose_landmarks.jsonl", compare_pose_rows)
     compare_jsonl_family("densepose", "densepose.jsonl", compare_densepose_rows)

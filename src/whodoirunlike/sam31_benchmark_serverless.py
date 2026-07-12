@@ -92,6 +92,36 @@ def handler(event: dict[str, Any]) -> dict[str, Any]:
                 "WHODOIRUNLIKE_BASE_PROCESSOR_IMAGE_DIGEST",
                 EXACT_CANDIDATE_IMAGE_DIGEST,
             ),
+            "code_overlay_commit": os.getenv(
+                "WHODOIRUNLIKE_CODE_OVERLAY_COMMIT",
+                os.getenv("WHODOIRUNLIKE_BASE_PROCESSOR_COMMIT", EXACT_CANDIDATE_COMMIT),
+            ),
+            "code_overlay_source": os.getenv(
+                "WHODOIRUNLIKE_CODE_OVERLAY_SOURCE",
+                "base_image",
+            ),
+            "code_overlay_reference_image_digest": os.getenv(
+                "WHODOIRUNLIKE_CODE_OVERLAY_REFERENCE_IMAGE_DIGEST",
+                os.getenv(
+                    "WHODOIRUNLIKE_BASE_PROCESSOR_IMAGE_DIGEST",
+                    EXACT_CANDIDATE_IMAGE_DIGEST,
+                ),
+            ),
+            "dependency_base_role": os.getenv(
+                "WHODOIRUNLIKE_DEPENDENCY_BASE_ROLE",
+                os.getenv("WHODOIRUNLIKE_BENCHMARK_IMAGE_ROLE", "candidate"),
+            ),
+            "dependency_base_commit": os.getenv(
+                "WHODOIRUNLIKE_DEPENDENCY_BASE_COMMIT",
+                os.getenv("WHODOIRUNLIKE_BASE_PROCESSOR_COMMIT", EXACT_CANDIDATE_COMMIT),
+            ),
+            "dependency_base_image_digest": os.getenv(
+                "WHODOIRUNLIKE_DEPENDENCY_BASE_IMAGE_DIGEST",
+                os.getenv(
+                    "WHODOIRUNLIKE_BASE_PROCESSOR_IMAGE_DIGEST",
+                    EXACT_CANDIDATE_IMAGE_DIGEST,
+                ),
+            ),
             "base_contract": contract or {"status": "not_enforced"},
             "has_hf_token": bool(
                 os.getenv("HF_TOKEN", "").strip() or os.getenv("HUGGING_FACE_HUB_TOKEN", "").strip()

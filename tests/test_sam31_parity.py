@@ -230,6 +230,12 @@ def test_non_overlay_base_contract_hashes_every_registered_production_file(
     assert result["mismatches"] == []
 
 
+def test_schedule_only_contract_requires_exact_candidate_production_code() -> None:
+    assert dict(sam31_parity.NON_OVERLAY_PRODUCTION_SHA256["schedule_only"]) == dict(
+        sam31_parity.NON_OVERLAY_PRODUCTION_SHA256["candidate"]
+    )
+
+
 def test_non_overlay_base_contract_fails_closed_on_one_changed_file(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

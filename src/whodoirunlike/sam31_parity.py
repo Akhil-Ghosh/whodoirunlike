@@ -17,7 +17,7 @@ EXACT_CONTROL_COMMIT = "fd35d9cf56e9f1271380575149a3e72afec31344"
 EXACT_CONTROL_IMAGE_DIGEST = (
     "sha256:47d776f83ae3e2e1c7f1fa935b0019a9abd82a324ada4ab3d98746b3d75216fc"
 )
-NON_OVERLAY_PRODUCTION_SHA256 = MappingProxyType(
+_BASE_NON_OVERLAY_PRODUCTION_SHA256 = MappingProxyType(
     {
         "control": MappingProxyType(
             {
@@ -51,6 +51,15 @@ NON_OVERLAY_PRODUCTION_SHA256 = MappingProxyType(
                 "running_clip_run.py": "931435c93c67c34453603615e6f3b5259e614038134dd4e210bf1ed79ea204de",
             }
         ),
+    }
+)
+NON_OVERLAY_PRODUCTION_SHA256 = MappingProxyType(
+    {
+        "control": _BASE_NON_OVERLAY_PRODUCTION_SHA256["control"],
+        "candidate": _BASE_NON_OVERLAY_PRODUCTION_SHA256["candidate"],
+        # The schedule-only image uses the exact live control dependency/model base,
+        # then copies the immutable 657 candidate Python source tree into /app/src.
+        "schedule_only": _BASE_NON_OVERLAY_PRODUCTION_SHA256["candidate"],
     }
 )
 

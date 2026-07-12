@@ -1,0 +1,73 @@
+name: Build RunPod Schedule-only Parity Image
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE_NAME: ghcr.io/akhil-ghosh/whodoirunlike-runpod-processor
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Materialize exact candidate source
+        run: |
+          mkdir -p .schedule-only-source
+          git archive 657d36588f3ca073554bfd40071ff747e0e750bb src/whodoirunlike \
+            | tar -x -C .schedule-only-source
+          python - <<'PY'
+          import hashlib
+          from pathlib import Path
+          import runpy
+
+          contract = runpy.run_path("src/whodoirunlike/sam31_parity.py")[
+              "NON_OVERLAY_PRODUCTION_SHA256"
+          ]["schedule_only"]
+          source = Path(".schedule-only-source/src/whodoirunlike")
+          observed = {
+              name: hashlib.sha256((source / name).read_bytes()).hexdigest()
+              for name in contract
+          }
+          assert observed == dict(contract), (observed, dict(contract))
+          PY
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Free runner disk
+        run: |
+          df -h
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache
+          docker system prune -af || true
+          df -h
+
+      - name: Build and push schedule-only image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.runpod.benchmark.schedule-only
+          push: true
+          build-args: |
+            WHODOIRUNLIKE_BENCHMARK_VERSION=${{ github.sha }}
+          tags: |
+            ${{ env.IMAGE_NAME }}:sam31-parity-schedule-only-${{ github.sha }}
+          provenance: false

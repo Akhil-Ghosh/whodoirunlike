@@ -30,6 +30,7 @@ FULL_PROFILE_IDS = (
     "downstream_candidate_optimized",
     "production_control",
     "production_candidate",
+    "production_candidate_schedule_only",
 )
 FULL_PROFILE_MATRICES = {
     "three-arm": [
@@ -41,6 +42,7 @@ FULL_PROFILE_MATRICES = {
     "production-reversed": ["production_candidate", "production_control"],
     "authoritative-control": ["production_control"],
     "authoritative-candidate": ["production_candidate"],
+    "authoritative-candidate-schedule-only": ["production_candidate_schedule_only"],
 }
 _FORBIDDEN_PARITY_SINK_HOSTS = frozenset({"api.whodoirunlike.com", "staging-api.whodoirunlike.com"})
 
@@ -324,10 +326,11 @@ def main() -> int:
     if args.artifact_sink_file is not None and profile_ids not in (
         ["production_control"],
         ["production_candidate"],
+        ["production_candidate_schedule_only"],
     ):
         parser.error(
             "--artifact-sink-file requires authoritative-control, "
-            "authoritative-candidate, or the matching single --profile-id"
+            "an authoritative candidate matrix, or the matching single --profile-id"
         )
     print(f"Loading and verifying fixture {args.fixture_id}...", flush=True)
     benchmark_input = {

@@ -58,6 +58,41 @@ def test_benchmark_images_are_exact_additive_overlays(
     assert "WHODOIRUNLIKE_ENFORCE_BASE_CONTRACT=true" in text
 
 
+def test_schedule_only_image_uses_live_dependencies_and_immutable_candidate_source() -> None:
+    text = (REPO_ROOT / "Dockerfile.runpod.benchmark.schedule-only").read_text(encoding="utf-8")
+    instructions = [
+        line.strip()
+        for line in text.splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
+    from_lines = [line for line in instructions if line.startswith("FROM ")]
+    copy_lines = [line for line in instructions if line.startswith("COPY ")]
+
+    assert from_lines == [
+        "FROM ghcr.io/akhil-ghosh/whodoirunlike-runpod-processor@"
+        "sha256:47d776f83ae3e2e1c7f1fa935b0019a9abd82a324ada4ab3d98746b3d75216fc",
+    ]
+    assert copy_lines[0] == (
+        "COPY .schedule-only-source/src/whodoirunlike/ /app/src/whodoirunlike/"
+    )
+    assert {line.split()[1] for line in copy_lines[1:]} == OVERLAY_SOURCES
+    assert len(copy_lines) == len(OVERLAY_SOURCES) + 1
+    assert "WHODOIRUNLIKE_BENCHMARK_IMAGE_ROLE=schedule_only" in text
+    assert "WHODOIRUNLIKE_DEPENDENCY_BASE_ROLE=control" in text
+    assert "WHODOIRUNLIKE_CODE_OVERLAY_SOURCE=git_commit" in text
+    assert "WHODOIRUNLIKE_CODE_OVERLAY_COMMIT=657d36588f3ca073554bfd40071ff747e0e750bb" in text
+    assert "MMPOSE_DEVICE=cpu" in text
+    assert "MMPOSE_USE_DETECTOR=true" in text
+    assert not any(line.startswith(("RUN ", "ADD ")) for line in instructions)
+
+    workflow = (REPO_ROOT / ".github/workflows/build-runpod-schedule-only.yml").read_text(
+        encoding="utf-8"
+    )
+    assert "fetch-depth: 0" in workflow
+    assert "git archive 657d36588f3ca073554bfd40071ff747e0e750bb" in workflow
+    assert '"NON_OVERLAY_PRODUCTION_SHA256"' in workflow
+
+
 def test_overlay_uses_only_public_production_entrypoints() -> None:
     mask_source = (REPO_ROOT / "src/whodoirunlike/sam31_benchmark.py").read_text(encoding="utf-8")
     pipeline_source = (REPO_ROOT / "src/whodoirunlike/pipeline_parity.py").read_text(

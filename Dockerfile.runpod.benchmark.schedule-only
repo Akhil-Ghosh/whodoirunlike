@@ -1,0 +1,36 @@
+FROM ghcr.io/akhil-ghosh/whodoirunlike-runpod-processor@sha256:47d776f83ae3e2e1c7f1fa935b0019a9abd82a324ada4ab3d98746b3d75216fc
+
+ARG WHODOIRUNLIKE_BENCHMARK_VERSION=unknown
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    WHODOIRUNLIKE_ENABLE_SAM31_BENCHMARK=true \
+    WHODOIRUNLIKE_ENVIRONMENT=benchmark \
+    WHODOIRUNLIKE_BENCHMARK_VERSION=${WHODOIRUNLIKE_BENCHMARK_VERSION} \
+    WHODOIRUNLIKE_BENCHMARK_IMAGE_ROLE=schedule_only \
+    WHODOIRUNLIKE_BASE_PROCESSOR_COMMIT=fd35d9cf56e9f1271380575149a3e72afec31344 \
+    WHODOIRUNLIKE_BASE_PROCESSOR_IMAGE_DIGEST=sha256:47d776f83ae3e2e1c7f1fa935b0019a9abd82a324ada4ab3d98746b3d75216fc \
+    WHODOIRUNLIKE_CODE_OVERLAY_SOURCE=git_commit \
+    WHODOIRUNLIKE_CODE_OVERLAY_COMMIT=657d36588f3ca073554bfd40071ff747e0e750bb \
+    WHODOIRUNLIKE_CODE_OVERLAY_REFERENCE_IMAGE_DIGEST=sha256:52392c71b9a44d804f0ba7fcd894247988319dbe98e6160cb05d70a13894714a \
+    WHODOIRUNLIKE_DEPENDENCY_BASE_ROLE=control \
+    WHODOIRUNLIKE_DEPENDENCY_BASE_COMMIT=fd35d9cf56e9f1271380575149a3e72afec31344 \
+    WHODOIRUNLIKE_DEPENDENCY_BASE_IMAGE_DIGEST=sha256:47d776f83ae3e2e1c7f1fa935b0019a9abd82a324ada4ab3d98746b3d75216fc \
+    WHODOIRUNLIKE_CANDIDATE_COMMIT=657d36588f3ca073554bfd40071ff747e0e750bb \
+    WHODOIRUNLIKE_CANDIDATE_IMAGE_DIGEST=sha256:52392c71b9a44d804f0ba7fcd894247988319dbe98e6160cb05d70a13894714a \
+    WHODOIRUNLIKE_ENFORCE_BASE_CONTRACT=true \
+    MMPOSE_DEVICE=cpu \
+    RTMW_RUNTIME_BACKEND=onnxruntime \
+    MMPOSE_USE_DETECTOR=true
+
+WORKDIR /app
+
+# Keep the exact live fd35 dependency/model image, but copy the complete immutable
+# 657 production Python tree materialized by the build workflow from that Git commit.
+COPY .schedule-only-source/src/whodoirunlike/ /app/src/whodoirunlike/
+COPY src/whodoirunlike/sam31_parity.py /app/src/whodoirunlike/sam31_parity.py
+COPY src/whodoirunlike/sam31_benchmark.py /app/src/whodoirunlike/sam31_benchmark.py
+COPY src/whodoirunlike/pipeline_parity.py /app/src/whodoirunlike/pipeline_parity.py
+COPY src/whodoirunlike/sam31_benchmark_serverless.py /app/src/whodoirunlike/sam31_benchmark_serverless.py
+
+CMD ["python", "-m", "whodoirunlike.sam31_benchmark_serverless"]

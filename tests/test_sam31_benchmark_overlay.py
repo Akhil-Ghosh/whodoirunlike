@@ -27,9 +27,9 @@ OVERLAY_SOURCES = {
         (
             "Dockerfile.runpod.benchmark.control",
             "ghcr.io/akhil-ghosh/whodoirunlike-runpod-processor@"
-            "sha256:a137045767045edb502f1fcce14f5e113ce3c92b2a376bfa2f04e906cea7e73b",
+            "sha256:47d776f83ae3e2e1c7f1fa935b0019a9abd82a324ada4ab3d98746b3d75216fc",
             "control",
-            "8b33d07cd129cb6878f4630af133bf30c291914b",
+            "fd35d9cf56e9f1271380575149a3e72afec31344",
         ),
     ],
 )

@@ -13,26 +13,26 @@ EXACT_CANDIDATE_COMMIT = "657d36588f3ca073554bfd40071ff747e0e750bb"
 EXACT_CANDIDATE_IMAGE_DIGEST = (
     "sha256:52392c71b9a44d804f0ba7fcd894247988319dbe98e6160cb05d70a13894714a"
 )
-EXACT_CONTROL_COMMIT = "8b33d07cd129cb6878f4630af133bf30c291914b"
+EXACT_CONTROL_COMMIT = "fd35d9cf56e9f1271380575149a3e72afec31344"
 EXACT_CONTROL_IMAGE_DIGEST = (
-    "sha256:a137045767045edb502f1fcce14f5e113ce3c92b2a376bfa2f04e906cea7e73b"
+    "sha256:47d776f83ae3e2e1c7f1fa935b0019a9abd82a324ada4ab3d98746b3d75216fc"
 )
 NON_OVERLAY_PRODUCTION_SHA256 = MappingProxyType(
     {
         "control": MappingProxyType(
             {
-                "full_pipeline.py": "e84713cec7ff8932f2467b3ca805ee531a56fba200f625c71bbc45521db112b6",
+                "full_pipeline.py": "519de206085ea60bdc76652bcdfd1228fe38eb380af10d5f4e2ad61e8250b8ff",
                 "sam31_gpu_runner.py": "cc12ccadcd209451e7fa106bfde58a6a10f100d48528862de8262f0d494710fa",
                 "sam31_mlx_runner.py": "5235da2c165cc8fff8df7cfacde229f5e6df750b58a107193cf76d7c52b540ed",
                 "sam2_runner.py": "71a07013f98c8335606df3e7cffa0c7d8b33c1ee16d79a5684ff1b7246e4ef20",
                 "mask_artifacts.py": "682286c9a59c7338579e80c903f1657917d5e99a50a6202ef040d8ddb4999714",
-                "mmpose_runner.py": "d32fc621c8dfcdd065f8ccfdb97250f6ada5df55885701d2e766e9388ed7036e",
-                "densepose_runner.py": "e84ba8623db1244b493a3a17c2edf92359045aa4f1223047f5971ca35a881f9b",
+                "mmpose_runner.py": "4bc266c122a6a83d4fa604b83243d1823ddc8208064b6fc1a5a93b9ab1c99797",
+                "densepose_runner.py": "7cdd4b5714b98a08ece74a2f6a29241630129b06ae578db1e748addb37cdca8c",
                 "fusion_runner.py": "a50e0fe9e18ae90ea76fb716fc1af0d7a9892547ea5ba9e77cd0faeb6cb4f67f",
                 "form_features.py": "cfdae5b2757016e7c98a0f77140b4568a62b27477335b84aa98da5c2bb0d3d89",
                 "artifact_tables.py": "d0d055b0159b966ddf0a7d46e24dc2f4d7891e57407c4638ca5fb99fa66de23d",
                 "qc.py": "6b1358d911c63ab0fda4da3c8f28189e8bdb3d9617ed4f9306bc2d8649b8bf13",
-                "running_clip_run.py": "931435c93c67c34453603615e6f3b5259e614038134dd4e210bf1ed79ea204de",
+                "running_clip_run.py": "2a97a98b6ab4bcb8664d84c6e47ce7992437347bd2ea8f942601b12e43d3a25e",
             }
         ),
         "candidate": MappingProxyType(

@@ -4,7 +4,8 @@ import copy
 import os
 import shutil
 import tempfile
-from concurrent.futures import ThreadPoolExecutor
+import threading
+from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Callable
 
@@ -136,6 +137,8 @@ def _run_mask_stage(
     mask_backend: str,
     mask_quality_mode: str,
     progress_callback: Callable[[dict[str, Any]], None] | None = None,
+    runner_mask_ready_callback: Callable[[], None] | None = None,
+    render_qa_overlay: bool = True,
 ) -> dict[str, Any]:
     normalized = mask_backend.strip().lower()
     if normalized in {"sam31", "sam31_mlx", "sam3.1_mlx", "mlx"}:
@@ -147,7 +150,12 @@ def _run_mask_stage(
     if normalized in {"sam31_gpu", "sam3.1_gpu", "sam31_cuda", "sam3.1_cuda"}:
         from whodoirunlike.sam31_gpu_runner import run_sam31_gpu_mask
 
-        return run_sam31_gpu_mask(run_dir=run_dir, progress_callback=progress_callback)
+        return run_sam31_gpu_mask(
+            run_dir=run_dir,
+            progress_callback=progress_callback,
+            runner_mask_ready_callback=runner_mask_ready_callback,
+            render_qa_overlay=render_qa_overlay,
+        )
     raise ValueError("mask_backend must be one of: sam31_mlx, sam31_gpu")
 
 
@@ -159,6 +167,17 @@ _MASK_ARTIFACT_KEYS = (
     "runner_mask_metadata",
     "masks_jsonl",
 )
+_SAM31_GPU_BACKENDS = frozenset({"sam31_gpu", "sam3.1_gpu", "sam31_cuda", "sam3.1_cuda"})
+
+
+def _wait_for_runner_mask_readiness(
+    ready: threading.Event,
+    future: Future[dict[str, Any]],
+) -> None:
+    while not ready.wait(timeout=0.05):
+        if future.done():
+            future.result()
+            raise RuntimeError("SAM mask stage completed without signaling runner-mask readiness")
 
 
 def _rewrite_staged_paths(value: Any, replacements: dict[str, str]) -> Any:
@@ -395,6 +414,7 @@ _MASK_PHASE_SPANS = {
     "rendering": "render",
     "encoding": "encode",
     "writing_outputs": "write",
+    "analytical_mask_ready": None,
     "completed": None,
 }
 _POSE_PHASE_SPANS = {
@@ -456,6 +476,7 @@ def run_full_cv_pipeline(
     inline_mask_temporal_reset_gap_frames: int = 3,
     inline_mask_sam_fallback: bool = True,
     inline_mask_fallback_backend: str = "sam31_gpu",
+    parallel_mask_presentation: bool = False,
     parallel_pose_densepose: bool = False,
     parallel_post_fusion: bool = False,
     telemetry: ProcessingTelemetry | None = None,
@@ -463,6 +484,16 @@ def run_full_cv_pipeline(
     if parallel_pose_densepose and not skip_densepose and not pose_backend.startswith("mmpose_"):
         raise ValueError(
             "parallel_pose_densepose requires an mmpose backend with isolated QA output"
+        )
+    normalized_mask_backend = mask_backend.strip().lower()
+    if parallel_mask_presentation and (
+        normalized_mask_backend not in _SAM31_GPU_BACKENDS
+        or not pose_backend.startswith("mmpose_")
+        or skip_densepose
+    ):
+        raise ValueError(
+            "parallel_mask_presentation requires sam31_gpu, an mmpose backend, "
+            "and DensePose enabled"
         )
     result: dict[str, Any] = {"run_dir": str(run_dir), "steps": []}
     inline_segmentation = _uses_inline_segmentation(mask_backend)
@@ -518,6 +549,7 @@ def run_full_cv_pipeline(
     mask_runtime: dict[str, Any] = {
         "backend": mask_backend,
         "quality_mode": mask_quality_mode,
+        "parallel_presentation": parallel_mask_presentation,
     }
     mask_phase_spans: dict[str, str | None] | None = _MASK_PHASE_SPANS
     mask_default_span: str | None = "inference"
@@ -573,23 +605,43 @@ def run_full_cv_pipeline(
                 mask_backend=mask_backend,
                 mask_quality_mode=mask_quality_mode,
                 progress_callback=progress,
+                runner_mask_ready_callback=(
+                    runner_mask_ready.set if runner_mask_ready is not None else None
+                ),
+                render_qa_overlay=not parallel_mask_presentation,
             )
 
-    mask = _run_observed_stage(
-        telemetry=telemetry,
-        stage="runner_mask",
-        runtime=mask_runtime,
-        phase_spans=mask_phase_spans,
-        default_span=mask_default_span,
-        action=run_mask_stage,
-    )
-    if inline_segmentation and mask.get("fallback_from"):
+    runner_mask_ready = threading.Event() if parallel_mask_presentation else None
+
+    def run_observed_mask_stage() -> dict[str, Any]:
+        return _run_observed_stage(
+            telemetry=telemetry,
+            stage="runner_mask",
+            runtime=mask_runtime,
+            phase_spans=mask_phase_spans,
+            default_span=mask_default_span,
+            action=run_mask_stage,
+        )
+
+    mask_executor: ThreadPoolExecutor | None = None
+    mask_future: Future[dict[str, Any]] | None = None
+    mask: dict[str, Any] | None = None
+    if runner_mask_ready is not None:
+        mask_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="mask-presentation")
+        mask_future = mask_executor.submit(run_observed_mask_stage)
+        try:
+            _wait_for_runner_mask_readiness(runner_mask_ready, mask_future)
+        except BaseException:
+            mask_executor.shutdown(wait=True)
+            raise
+    else:
+        mask = run_observed_mask_stage()
+
+    if inline_segmentation and mask is not None and mask.get("fallback_from"):
         inline_identity_mask = identity.get("inline_mask")
         if isinstance(inline_identity_mask, dict):
             inline_identity_mask.pop("deferred_browser_encoding", None)
             inline_identity_mask["superseded_by"] = mask.get("backend")
-    result["steps"].append({"stage": "mask", "result": mask})
-
     if pose_backend.startswith("mmpose_"):
         from whodoirunlike.mmpose_runner import run_mmpose_pose
 
@@ -711,16 +763,50 @@ def run_full_cv_pipeline(
                 single_span="write",
             )
 
-    if parallel_pose_densepose and not skip_densepose:
-        with ThreadPoolExecutor(max_workers=2, thread_name_prefix="cv-analysis") as executor:
-            pose_future = executor.submit(run_pose_stage)
-            densepose_future = executor.submit(run_densepose_stage)
-            pose = pose_future.result()
-            densepose = densepose_future.result()
-    else:
-        pose = run_pose_stage()
-        densepose = run_densepose_stage()
+    concurrent_errors: list[BaseException] = []
+    try:
+        if parallel_pose_densepose and not skip_densepose:
+            with ThreadPoolExecutor(max_workers=2, thread_name_prefix="cv-analysis") as executor:
+                pose_future = executor.submit(run_pose_stage)
+                densepose_future = executor.submit(run_densepose_stage)
+                try:
+                    pose = pose_future.result()
+                except BaseException as error:
+                    concurrent_errors.append(error)
+                try:
+                    densepose = densepose_future.result()
+                except BaseException as error:
+                    concurrent_errors.append(error)
+        else:
+            pose = run_pose_stage()
+            densepose = run_densepose_stage()
+    except BaseException as error:
+        concurrent_errors.append(error)
 
+    try:
+        if mask_future is not None:
+            try:
+                mask = mask_future.result()
+            except BaseException as error:
+                concurrent_errors.append(error)
+    finally:
+        if mask_executor is not None:
+            mask_executor.shutdown(wait=True)
+
+    if len(concurrent_errors) == 1:
+        raise concurrent_errors[0]
+    if concurrent_errors:
+        if all(isinstance(error, Exception) for error in concurrent_errors):
+            raise ExceptionGroup(
+                "Concurrent CV stages failed",
+                [error for error in concurrent_errors if isinstance(error, Exception)],
+            )
+        raise concurrent_errors[0]
+
+    if mask is None:
+        raise RuntimeError("Mask stage did not produce a result")
+
+    result["steps"].append({"stage": "mask", "result": mask})
     result["steps"].append({"stage": "pose", "result": pose})
     result["steps"].append({"stage": "densepose", "result": densepose})
     _finalize_render_artifact_pointers(run_dir)

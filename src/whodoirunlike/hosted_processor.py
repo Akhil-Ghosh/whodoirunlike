@@ -14,8 +14,10 @@ import tempfile
 import threading
 import time
 import traceback
+import urllib.error
 import urllib.parse
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from datetime import datetime, timezone
 from pathlib import Path
@@ -82,6 +84,20 @@ DEFAULT_TELEMETRY_SNAPSHOT_TIMEOUT_SECONDS = 0.25
 DEFAULT_CALLBACK_ORIGINS = (
     "https://api.whodoirunlike.com",
     "https://staging-api.whodoirunlike.com",
+)
+DEFAULT_ARTIFACT_PUBLISH_WORKERS = 4
+MAX_ARTIFACT_PUBLISH_WORKERS = 8
+DEFAULT_ARTIFACT_PUBLISH_ATTEMPTS = 3
+MAX_ARTIFACT_PUBLISH_ATTEMPTS = 5
+DEFAULT_ARTIFACT_PUBLISH_BACKOFF_SECONDS = 0.1
+MAX_ARTIFACT_PUBLISH_BACKOFF_SECONDS = 2.0
+MAX_ARTIFACT_FINALIZE_BODY_BYTES = 64 * 1024
+MAX_ARTIFACT_FINALIZE_COUNT = 64
+MAX_R2_OBJECT_BYTES = 5 * 1024 * 1024 * 1024
+ARTIFACT_NAME_PATTERN = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,95}$")
+R2_OBJECT_VERSION_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$")
+ARTIFACT_CONTENT_TYPE_PATTERN = re.compile(
+    r"^[a-zA-Z0-9!#$&^_.+-]+/[a-zA-Z0-9!#$&^_.+-]+(?:\s*;[^\r\n]*)?$"
 )
 
 
@@ -410,6 +426,194 @@ def _put_worker_artifact(
         )
         with urllib.request.urlopen(request, timeout=120):
             return
+
+
+def _artifact_content_type(path: Path) -> str:
+    return mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+
+
+def _artifact_publish_retry_settings() -> tuple[int, float]:
+    attempts = min(
+        MAX_ARTIFACT_PUBLISH_ATTEMPTS,
+        _env_int(
+            "WHODOIRUNLIKE_ARTIFACT_PUBLISH_ATTEMPTS",
+            DEFAULT_ARTIFACT_PUBLISH_ATTEMPTS,
+            minimum=1,
+        ),
+    )
+    backoff_seconds = min(
+        MAX_ARTIFACT_PUBLISH_BACKOFF_SECONDS,
+        _env_float(
+            "WHODOIRUNLIKE_ARTIFACT_PUBLISH_BACKOFF_SECONDS",
+            DEFAULT_ARTIFACT_PUBLISH_BACKOFF_SECONDS,
+        ),
+    )
+    return attempts, backoff_seconds
+
+
+def _retryable_artifact_publish_error(error: BaseException) -> bool:
+    if isinstance(error, urllib.error.HTTPError):
+        return error.code in {408, 425, 429} or error.code >= 500
+    return isinstance(
+        error,
+        (TimeoutError, ConnectionError, urllib.error.URLError, OSError),
+    )
+
+
+def _artifact_publish_retry_delay(backoff_seconds: float, attempt_index: int) -> None:
+    time.sleep(min(backoff_seconds * (2**attempt_index), MAX_ARTIFACT_PUBLISH_BACKOFF_SECONDS))
+
+
+def _put_worker_artifact_deferred(
+    *,
+    callback_base_url: str,
+    run_id: str,
+    attempt_id: str,
+    name: str,
+    path: Path,
+) -> dict[str, Any]:
+    if not ARTIFACT_NAME_PATTERN.fullmatch(name) or name in _RESULT_READY_ARTIFACT_NAMES:
+        raise ValueError("Deferred artifact name is invalid.")
+    size_bytes = path.stat().st_size
+    if not 0 <= size_bytes <= MAX_R2_OBJECT_BYTES:
+        raise ValueError("Deferred artifact size is invalid.")
+    content_type = _artifact_content_type(path)
+    endpoint = (
+        f"{callback_base_url.rstrip('/')}/v1/jobs/{run_id}/artifacts/"
+        f"{urllib.parse.quote(name, safe='')}?defer_index=1"
+    )
+    attempts, backoff_seconds = _artifact_publish_retry_settings()
+    response_body: bytes | None = None
+    for attempt_index in range(attempts):
+        try:
+            with path.open("rb") as artifact:
+                request = urllib.request.Request(
+                    endpoint,
+                    data=artifact,
+                    method="PUT",
+                    headers={
+                        **_request_headers(),
+                        "X-Processing-Attempt-Id": attempt_id,
+                        "Accept": "application/json",
+                        "Content-Type": content_type,
+                        "Content-Length": str(size_bytes),
+                    },
+                )
+                with urllib.request.urlopen(request, timeout=120) as response:
+                    response_body = response.read(MAX_ARTIFACT_FINALIZE_BODY_BYTES + 1)
+            break
+        except (TimeoutError, OSError, urllib.error.URLError) as error:
+            if not _retryable_artifact_publish_error(error) or attempt_index + 1 >= attempts:
+                raise
+            _artifact_publish_retry_delay(backoff_seconds, attempt_index)
+
+    if response_body is None:
+        raise RuntimeError("Deferred artifact upload completed without a response.")
+
+    if len(response_body) > MAX_ARTIFACT_FINALIZE_BODY_BYTES:
+        raise ValueError("Deferred artifact response is too large.")
+    try:
+        receipt = json.loads(response_body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError("Deferred artifact response must be valid JSON.") from error
+    if (
+        not isinstance(receipt, dict)
+        or receipt.get("run_id") != run_id
+        or receipt.get("attempt_id") != attempt_id
+        or receipt.get("artifact") != name
+        or receipt.get("status") != "stored_unindexed"
+        or receipt.get("content_type") != content_type
+        or not isinstance(receipt.get("object_version"), str)
+        or not R2_OBJECT_VERSION_PATTERN.fullmatch(receipt["object_version"])
+        or receipt.get("size_bytes") != size_bytes
+    ):
+        raise ValueError("Deferred artifact response metadata did not match the upload.")
+    return {
+        "name": name,
+        "content_type": content_type,
+        "object_version": receipt["object_version"],
+        "size_bytes": size_bytes,
+    }
+
+
+def _finalize_worker_artifacts(
+    *,
+    callback_base_url: str,
+    run_id: str,
+    attempt_id: str,
+    artifacts: list[dict[str, Any]],
+) -> None:
+    if not artifacts:
+        return
+    if len(artifacts) > MAX_ARTIFACT_FINALIZE_COUNT:
+        raise ValueError("Deferred artifact finalization contains too many artifacts.")
+    names: set[str] = set()
+    normalized_artifacts: list[dict[str, Any]] = []
+    for artifact in artifacts:
+        name = artifact.get("name")
+        content_type = artifact.get("content_type")
+        object_version = artifact.get("object_version")
+        size_bytes = artifact.get("size_bytes")
+        if (
+            not isinstance(name, str)
+            or not ARTIFACT_NAME_PATTERN.fullmatch(name)
+            or name in _RESULT_READY_ARTIFACT_NAMES
+            or name in names
+            or not isinstance(content_type, str)
+            or not 3 <= len(content_type) <= 200
+            or not ARTIFACT_CONTENT_TYPE_PATTERN.fullmatch(content_type)
+            or not isinstance(object_version, str)
+            or not R2_OBJECT_VERSION_PATTERN.fullmatch(object_version)
+            or not isinstance(size_bytes, int)
+            or isinstance(size_bytes, bool)
+            or not 0 <= size_bytes <= MAX_R2_OBJECT_BYTES
+        ):
+            raise ValueError("Deferred artifact finalization metadata is invalid.")
+        names.add(name)
+        normalized_artifacts.append(
+            {
+                "name": name,
+                "content_type": content_type,
+                "object_version": object_version,
+                "size_bytes": size_bytes,
+            }
+        )
+
+    body = json.dumps(
+        {
+            "attempt_id": attempt_id,
+            "artifacts": normalized_artifacts,
+        },
+        separators=(",", ":"),
+    ).encode("utf-8")
+    if len(body) > MAX_ARTIFACT_FINALIZE_BODY_BYTES:
+        raise ValueError("Deferred artifact finalization body is too large.")
+    endpoint = f"{callback_base_url.rstrip('/')}/v1/jobs/{run_id}/artifacts/finalize"
+    timeout = _env_float(
+        "WHODOIRUNLIKE_REPORT_TIMEOUT_SECONDS",
+        DEFAULT_REPORT_TIMEOUT_SECONDS,
+    )
+    attempts, backoff_seconds = _artifact_publish_retry_settings()
+    for attempt_index in range(attempts):
+        request = urllib.request.Request(
+            endpoint,
+            data=body,
+            method="POST",
+            headers={
+                **_request_headers(),
+                "X-Processing-Attempt-Id": attempt_id,
+                "Accept": "application/json",
+                "Content-Type": "application/json; charset=utf-8",
+                "Content-Length": str(len(body)),
+            },
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=timeout):
+                return
+        except (TimeoutError, OSError, urllib.error.URLError) as error:
+            if not _retryable_artifact_publish_error(error) or attempt_index + 1 >= attempts:
+                raise
+            _artifact_publish_retry_delay(backoff_seconds, attempt_index)
 
 
 def _write_prompt_frame(
@@ -859,6 +1063,145 @@ def _finalize_deferred_browser_encoding(
     )
 
 
+def _upload_artifacts_in_parallel(
+    payload: WorkerJobRequest,
+    *,
+    run: RunningClipRun,
+    artifact_attempt_id: str,
+    upload_queue: list[tuple[str, Path]],
+    deferred_paths: set[Path],
+    telemetry: ProcessingTelemetry | None,
+) -> list[str]:
+    result_ready_queue = [
+        item for item in upload_queue if item[0] in _RESULT_READY_ARTIFACT_NAMES
+    ]
+    secondary_queue = [
+        item for item in upload_queue if item[0] not in _RESULT_READY_ARTIFACT_NAMES
+    ]
+    uploaded: list[str] = []
+
+    for public_name, path in result_ready_queue:
+        artifact_type = public_name.rsplit(".", 1)[0]
+        span_context = (
+            telemetry.span(
+                "artifact_publish",
+                "publish",
+                measurements={
+                    "artifact_type": artifact_type,
+                    "bytes": path.stat().st_size,
+                },
+            )
+            if telemetry is not None
+            else nullcontext()
+        )
+        with span_context:
+            _put_worker_artifact(
+                callback_base_url=payload.callback_base_url,
+                run_id=payload.run_id,
+                attempt_id=artifact_attempt_id,
+                name=public_name,
+                path=path,
+            )
+        uploaded.append(public_name)
+        if telemetry is not None:
+            telemetry.result_ready(
+                {
+                    "artifact_type": artifact_type,
+                    "bytes": path.stat().st_size,
+                }
+            )
+
+    encoded_deferred_paths: set[Path] = set()
+    for public_name, path in secondary_queue:
+        resolved_path = path.resolve(strict=False)
+        if resolved_path not in deferred_paths:
+            continue
+        artifact_type = public_name.rsplit(".", 1)[0]
+        encode_context = (
+            telemetry.span(
+                "artifact_publish",
+                "encode",
+                measurements={
+                    "artifact_type": artifact_type,
+                    "bytes": path.stat().st_size,
+                    "deferred_from_stage": "target_tracking",
+                },
+            )
+            if telemetry is not None
+            else nullcontext()
+        )
+        with encode_context:
+            make_browser_playable_mp4(path)
+        encoded_deferred_paths.add(resolved_path)
+    if deferred_paths and encoded_deferred_paths == deferred_paths:
+        _finalize_deferred_browser_encoding(run, completed_at=utc_now_iso())
+
+    def upload_secondary(item: tuple[str, Path]) -> dict[str, Any]:
+        public_name, path = item
+        artifact_type = public_name.rsplit(".", 1)[0]
+        span_context = (
+            telemetry.span(
+                "artifact_publish",
+                "publish",
+                measurements={
+                    "artifact_type": artifact_type,
+                    "bytes": path.stat().st_size,
+                },
+            )
+            if telemetry is not None
+            else nullcontext()
+        )
+        with span_context:
+            return _put_worker_artifact_deferred(
+                callback_base_url=payload.callback_base_url,
+                run_id=payload.run_id,
+                attempt_id=artifact_attempt_id,
+                name=public_name,
+                path=path,
+            )
+
+    receipts: list[dict[str, Any]] = []
+    if secondary_queue:
+        configured_workers = _env_int(
+            "WHODOIRUNLIKE_ARTIFACT_PUBLISH_WORKERS",
+            DEFAULT_ARTIFACT_PUBLISH_WORKERS,
+            minimum=1,
+        )
+        worker_count = min(
+            MAX_ARTIFACT_PUBLISH_WORKERS,
+            configured_workers,
+            len(secondary_queue),
+        )
+        with ThreadPoolExecutor(
+            max_workers=worker_count,
+            thread_name_prefix="artifact-publish",
+        ) as executor:
+            receipts = list(executor.map(upload_secondary, secondary_queue))
+
+        finalize_context = (
+            telemetry.span(
+                "artifact_publish",
+                "publish",
+                measurements={
+                    "artifact_type": "secondary_artifact_index",
+                    "artifact_count": len(receipts),
+                    "bytes": sum(int(receipt["size_bytes"]) for receipt in receipts),
+                },
+            )
+            if telemetry is not None
+            else nullcontext()
+        )
+        with finalize_context:
+            _finalize_worker_artifacts(
+                callback_base_url=payload.callback_base_url,
+                run_id=payload.run_id,
+                attempt_id=artifact_attempt_id,
+                artifacts=receipts,
+            )
+        uploaded.extend(public_name for public_name, _ in secondary_queue)
+    return uploaded
+
+
 def _upload_artifacts(
     payload: WorkerJobRequest,
     run_dir: Path,
@@ -894,6 +1237,15 @@ def _upload_artifacts(
                 if item[0] in _RESULT_READY_ARTIFACT_NAMES
                 else 0,
             )
+        )
+    if _env_bool("WHODOIRUNLIKE_PARALLEL_ARTIFACT_PUBLISH", False):
+        return _upload_artifacts_in_parallel(
+            payload,
+            run=run,
+            artifact_attempt_id=artifact_attempt_id,
+            upload_queue=upload_queue,
+            deferred_paths=deferred_paths,
+            telemetry=telemetry,
         )
     encoded_deferred_paths: set[Path] = set()
     deferred_state_finalized = False
@@ -1421,6 +1773,7 @@ def processor_readiness() -> dict[str, Any]:
     pose_backend = os.getenv("WHODOIRUNLIKE_POSE_BACKEND", "mmpose_rtmpose_l_384")
     mask_backend = _mask_backend()
     skip_densepose = _env_bool("WHODOIRUNLIKE_SKIP_DENSEPOSE")
+    parallel_mask_presentation = _env_bool("WHODOIRUNLIKE_PARALLEL_MASK_PRESENTATION")
     parallel_pose_densepose = _env_bool("WHODOIRUNLIKE_PARALLEL_POSE_DENSEPOSE")
     parallel_post_fusion = _env_bool("WHODOIRUNLIKE_PARALLEL_POST_FUSION")
     inline_mask_settings = _inline_mask_settings()
@@ -1433,6 +1786,16 @@ def processor_readiness() -> dict[str, Any]:
         execution_policy_reasons.append(
             "WHODOIRUNLIKE_PARALLEL_POSE_DENSEPOSE requires an mmpose backend "
             "with isolated QA output."
+        )
+    if parallel_mask_presentation and (
+        mask_backend.strip().lower()
+        not in {"sam31_gpu", "sam3.1_gpu", "sam31_cuda", "sam3.1_cuda"}
+        or not pose_backend.startswith("mmpose_")
+        or skip_densepose
+    ):
+        execution_policy_reasons.append(
+            "WHODOIRUNLIKE_PARALLEL_MASK_PRESENTATION requires sam31_gpu, "
+            "an mmpose backend, and DensePose enabled."
         )
     checks = {
         "processor_secret": _readiness_check("processor_secret", _secret_status),
@@ -1460,6 +1823,7 @@ def processor_readiness() -> dict[str, Any]:
         "pose_backend": pose_backend,
         "mask_backend": mask_backend,
         "skip_densepose": skip_densepose,
+        "parallel_mask_presentation": parallel_mask_presentation,
         "parallel_pose_densepose": parallel_pose_densepose,
         "parallel_post_fusion": parallel_post_fusion,
         "inline_mask": inline_mask_settings,
@@ -1480,6 +1844,7 @@ def process_hosted_job(payload: WorkerJobRequest, *, raise_on_error: bool = Fals
     pose_backend = os.getenv("WHODOIRUNLIKE_POSE_BACKEND", "mmpose_rtmpose_l_384")
     mask_backend = _mask_backend()
     skip_densepose = _env_bool("WHODOIRUNLIKE_SKIP_DENSEPOSE")
+    parallel_mask_presentation = _env_bool("WHODOIRUNLIKE_PARALLEL_MASK_PRESENTATION")
     parallel_pose_densepose = _env_bool("WHODOIRUNLIKE_PARALLEL_POSE_DENSEPOSE")
     parallel_post_fusion = _env_bool("WHODOIRUNLIKE_PARALLEL_POST_FUSION")
     inline_mask_settings = _inline_mask_settings()
@@ -1503,6 +1868,7 @@ def process_hosted_job(payload: WorkerJobRequest, *, raise_on_error: bool = Fals
             "pose_backend": pose_backend,
             "mask_backend": mask_backend,
             "skip_densepose": skip_densepose,
+            "parallel_mask_presentation": parallel_mask_presentation,
             "parallel_pose_densepose": parallel_pose_densepose,
             "parallel_post_fusion": parallel_post_fusion,
             **inline_mask_settings,
@@ -1577,6 +1943,7 @@ def process_hosted_job(payload: WorkerJobRequest, *, raise_on_error: bool = Fals
             mask_backend=mask_backend,
             mask_quality_mode=os.getenv("WHODOIRUNLIKE_MASK_QUALITY_MODE", "native"),
             skip_densepose=skip_densepose,
+            parallel_mask_presentation=parallel_mask_presentation,
             parallel_pose_densepose=parallel_pose_densepose,
             parallel_post_fusion=parallel_post_fusion,
             **inline_mask_settings,

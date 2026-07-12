@@ -247,6 +247,194 @@ def test_full_pipeline_can_fork_pose_and_densepose_then_join_before_fusion(
     ]
 
 
+def test_full_pipeline_overlaps_sam_presentation_with_pose_and_densepose(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    pose_started = threading.Event()
+    densepose_started = threading.Event()
+    mask_presentation_finished = threading.Event()
+
+    monkeypatch.setattr(full_pipeline, "run_identity_tracking", lambda **_: {"status": "complete"})
+
+    def run_mask(**kwargs: Any) -> dict[str, Any]:
+        assert kwargs["render_qa_overlay"] is False
+        ready = kwargs["runner_mask_ready_callback"]
+        assert callable(ready)
+        ready()
+        assert pose_started.wait(timeout=1.0), "Pose waited for mask presentation"
+        assert densepose_started.wait(timeout=1.0), "DensePose waited for mask presentation"
+        mask_presentation_finished.set()
+        return {"status": "complete", "backend": "sam31_gpu"}
+
+    def run_pose(**kwargs: Any) -> dict[str, Any]:
+        assert kwargs["isolate_qa_overlay"] is True
+        assert not mask_presentation_finished.is_set()
+        pose_started.set()
+        return {"status": "complete"}
+
+    def run_densepose(**_: Any) -> dict[str, Any]:
+        assert not mask_presentation_finished.is_set()
+        densepose_started.set()
+        return {"status": "complete"}
+
+    def run_fusion(**_: Any) -> dict[str, Any]:
+        assert mask_presentation_finished.is_set()
+        return {"status": "complete"}
+
+    monkeypatch.setattr(full_pipeline, "_run_mask_stage", run_mask)
+    monkeypatch.setattr("whodoirunlike.mmpose_runner.run_mmpose_pose", run_pose)
+    monkeypatch.setattr("whodoirunlike.densepose_runner.run_densepose", run_densepose)
+    monkeypatch.setattr(full_pipeline, "run_fused_form", run_fusion)
+    monkeypatch.setattr(full_pipeline, "compile_form_features", lambda **_: {"status": "complete"})
+    monkeypatch.setattr(full_pipeline, "export_cv_tables", lambda *_: {"status": "complete"})
+    monkeypatch.setattr(full_pipeline, "run_qc_metrics", lambda *_: {"status": "complete"})
+
+    result = full_pipeline.run_full_cv_pipeline(
+        run_dir=tmp_path,
+        mask_backend="sam31_gpu",
+        pose_backend="mmpose_rtmpose_l_384",
+        parallel_mask_presentation=True,
+        parallel_pose_densepose=True,
+    )
+
+    assert [step["stage"] for step in result["steps"]] == [
+        "identity",
+        "mask",
+        "pose",
+        "densepose",
+        "fusion",
+        "features",
+        "artifact_tables",
+        "qc",
+    ]
+
+
+def test_parallel_mask_presentation_requires_sam_gpu_mmpose_and_densepose(
+    tmp_path: Path,
+) -> None:
+    for kwargs in (
+        {"mask_backend": "sam31_mlx", "pose_backend": "mmpose_rtmpose_l_384"},
+        {"mask_backend": "sam31_gpu", "pose_backend": "mediapipe"},
+        {
+            "mask_backend": "sam31_gpu",
+            "pose_backend": "mmpose_rtmpose_l_384",
+            "skip_densepose": True,
+        },
+    ):
+        with pytest.raises(ValueError, match="parallel_mask_presentation requires"):
+            full_pipeline.run_full_cv_pipeline(
+                run_dir=tmp_path,
+                parallel_mask_presentation=True,
+                **kwargs,
+            )
+
+
+def test_parallel_mask_presentation_propagates_failure_before_readiness(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(full_pipeline, "run_identity_tracking", lambda **_: {"status": "complete"})
+    monkeypatch.setattr(
+        full_pipeline,
+        "_run_mask_stage",
+        lambda **_: (_ for _ in ()).throw(RuntimeError("mask failed before readiness")),
+    )
+
+    with pytest.raises(RuntimeError, match="mask failed before readiness"):
+        full_pipeline.run_full_cv_pipeline(
+            run_dir=tmp_path,
+            mask_backend="sam31_gpu",
+            pose_backend="mmpose_rtmpose_l_384",
+            parallel_mask_presentation=True,
+            parallel_pose_densepose=True,
+        )
+
+
+def test_parallel_mask_presentation_failure_after_readiness_blocks_fusion(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    pose_started = threading.Event()
+    densepose_started = threading.Event()
+    fusion_called = False
+    monkeypatch.setattr(full_pipeline, "run_identity_tracking", lambda **_: {"status": "complete"})
+
+    def run_mask(**kwargs: Any) -> dict[str, Any]:
+        kwargs["runner_mask_ready_callback"]()
+        assert pose_started.wait(timeout=1.0)
+        assert densepose_started.wait(timeout=1.0)
+        raise RuntimeError("mask presentation failed")
+
+    def run_pose(**_: Any) -> dict[str, Any]:
+        pose_started.set()
+        return {"status": "complete"}
+
+    def run_densepose(**_: Any) -> dict[str, Any]:
+        densepose_started.set()
+        return {"status": "complete"}
+
+    def run_fusion(**_: Any) -> dict[str, Any]:
+        nonlocal fusion_called
+        fusion_called = True
+        return {"status": "complete"}
+
+    monkeypatch.setattr(full_pipeline, "_run_mask_stage", run_mask)
+    monkeypatch.setattr("whodoirunlike.mmpose_runner.run_mmpose_pose", run_pose)
+    monkeypatch.setattr("whodoirunlike.densepose_runner.run_densepose", run_densepose)
+    monkeypatch.setattr(full_pipeline, "run_fused_form", run_fusion)
+
+    with pytest.raises(RuntimeError, match="mask presentation failed"):
+        full_pipeline.run_full_cv_pipeline(
+            run_dir=tmp_path,
+            mask_backend="sam31_gpu",
+            pose_backend="mmpose_rtmpose_l_384",
+            parallel_mask_presentation=True,
+            parallel_pose_densepose=True,
+        )
+
+    assert fusion_called is False
+
+
+def test_parallel_mask_and_analysis_failures_are_both_reported(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    pose_started = threading.Event()
+    monkeypatch.setattr(full_pipeline, "run_identity_tracking", lambda **_: {"status": "complete"})
+
+    def run_mask(**kwargs: Any) -> dict[str, Any]:
+        kwargs["runner_mask_ready_callback"]()
+        assert pose_started.wait(timeout=1.0)
+        raise RuntimeError("presentation boom")
+
+    def run_pose(**_: Any) -> dict[str, Any]:
+        pose_started.set()
+        raise ValueError("pose boom")
+
+    monkeypatch.setattr(full_pipeline, "_run_mask_stage", run_mask)
+    monkeypatch.setattr("whodoirunlike.mmpose_runner.run_mmpose_pose", run_pose)
+    monkeypatch.setattr(
+        "whodoirunlike.densepose_runner.run_densepose",
+        lambda **_: (_ for _ in ()).throw(RuntimeError("densepose boom")),
+    )
+
+    with pytest.raises(ExceptionGroup) as caught:
+        full_pipeline.run_full_cv_pipeline(
+            run_dir=tmp_path,
+            mask_backend="sam31_gpu",
+            pose_backend="mmpose_rtmpose_l_384",
+            parallel_mask_presentation=True,
+            parallel_pose_densepose=True,
+        )
+
+    assert [str(error) for error in caught.value.exceptions] == [
+        "pose boom",
+        "densepose boom",
+        "presentation boom",
+    ]
+
+
 def test_full_pipeline_can_fan_out_independent_post_fusion_work(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

@@ -470,6 +470,227 @@ def test_upload_artifacts_emits_result_ready_only_after_fused_overlay_put(
     assert events[0]["sequence"] == 100
 
 
+def test_upload_artifacts_parallel_mode_indexes_fused_first_and_batches_secondary_metadata(
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    import threading
+
+    from whodoirunlike import hosted_processor
+    from whodoirunlike.processing_telemetry import ProcessingTelemetry
+
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    paths = {
+        "fused_overlay": run_dir / "fused_overlay.mp4",
+        "features": run_dir / "features.json",
+        "qc_metrics": run_dir / "qc_metrics.json",
+    }
+    paths["fused_overlay"].write_bytes(b"fused-video")
+    paths["features"].write_text('{"stride":1}', encoding="utf-8")
+    paths["qc_metrics"].write_text('{"quality":1}', encoding="utf-8")
+    (run_dir / "cv_run_manifest.json").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "paths": {name: str(path) for name, path in paths.items()},
+                "stages": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+    payload = hosted_processor.WorkerJobRequest(
+        run_id="12345678-1234-4234-9234-123456789abc",
+        attempt_id="11111111-1111-4111-8111-111111111111",
+        callback_base_url="https://api.whodoirunlike.com",
+        source={
+            "url": "https://api.whodoirunlike.com/v1/jobs/source",
+            "key": "uploads/source.mp4",
+            "content_type": "video/mp4",
+            "size_bytes": 123,
+        },
+    )
+
+    indexed_puts: list[str] = []
+    deferred_puts: list[str] = []
+    finalized_batches: list[list[dict[str, Any]]] = []
+    concurrency_lock = threading.Lock()
+    release_two_uploads = threading.Barrier(2)
+    active_uploads = 0
+    max_active_uploads = 0
+    started_uploads = 0
+
+    def indexed_put(**kwargs: Any) -> None:
+        indexed_puts.append(kwargs["name"])
+
+    def deferred_put(**kwargs: Any) -> dict[str, Any]:
+        nonlocal active_uploads, max_active_uploads, started_uploads
+        name = kwargs["name"]
+        with concurrency_lock:
+            started_uploads += 1
+            upload_ordinal = started_uploads
+            active_uploads += 1
+            max_active_uploads = max(max_active_uploads, active_uploads)
+        try:
+            if upload_ordinal <= 2:
+                release_two_uploads.wait(timeout=2)
+            deferred_puts.append(name)
+            return {
+                "name": name,
+                "content_type": "video/mp4" if name.endswith(".mp4") else "application/json",
+                "object_version": f"version-{name}",
+                "size_bytes": kwargs["path"].stat().st_size,
+            }
+        finally:
+            with concurrency_lock:
+                active_uploads -= 1
+
+    def finalize(**kwargs: Any) -> None:
+        assert active_uploads == 0
+        finalized_batches.append(kwargs["artifacts"])
+
+    monkeypatch.setenv("WHODOIRUNLIKE_PARALLEL_ARTIFACT_PUBLISH", "1")
+    monkeypatch.setenv("WHODOIRUNLIKE_ARTIFACT_PUBLISH_WORKERS", "2")
+    monkeypatch.setattr(hosted_processor, "_put_worker_artifact", indexed_put)
+    monkeypatch.setattr(hosted_processor, "_put_worker_artifact_deferred", deferred_put)
+    monkeypatch.setattr(hosted_processor, "_finalize_worker_artifacts", finalize)
+    telemetry = ProcessingTelemetry(
+        run_id=payload.run_id,
+        attempt_id=payload.attempt_id,
+        local_path=tmp_path / "events.jsonl",
+        resource_sampler=lambda: {},
+        asynchronous_delivery=False,
+    )
+
+    uploaded = hosted_processor._upload_artifacts(payload, run_dir, telemetry=telemetry)
+
+    assert uploaded == [
+        "fused_overlay.mp4",
+        "cv_run_manifest.json",
+        "features.json",
+        "qc_metrics.json",
+    ]
+    assert indexed_puts == ["fused_overlay.mp4"]
+    assert set(deferred_puts) == {
+        "cv_run_manifest.json",
+        "features.json",
+        "qc_metrics.json",
+    }
+    assert max_active_uploads == 2
+    assert len(finalized_batches) == 1
+    assert [item["name"] for item in finalized_batches[0]] == uploaded[1:]
+
+    events = [json.loads(line) for line in telemetry.local_path.read_text().splitlines()]
+    published_artifacts = {
+        event["measurements"]["artifact_type"]
+        for event in events
+        if event["event_type"] == "span_completed"
+        and event["stage"] == "artifact_publish"
+        and event["measurements"].get("artifact_type") != "secondary_artifact_index"
+    }
+    assert published_artifacts == {
+        "fused_overlay",
+        "cv_run_manifest",
+        "features",
+        "qc_metrics",
+    }
+
+
+def test_upload_artifacts_parallel_mode_does_not_finalize_a_partial_secondary_batch(
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    from whodoirunlike import hosted_processor
+    from whodoirunlike.processing_telemetry import ProcessingTelemetry
+
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    fused_overlay = run_dir / "fused_overlay.mp4"
+    features = run_dir / "features.json"
+    qc_metrics = run_dir / "qc_metrics.json"
+    fused_overlay.write_bytes(b"fused-video")
+    features.write_text("{}", encoding="utf-8")
+    qc_metrics.write_text("{}", encoding="utf-8")
+    (run_dir / "cv_run_manifest.json").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "paths": {
+                    "fused_overlay": str(fused_overlay),
+                    "features": str(features),
+                    "qc_metrics": str(qc_metrics),
+                },
+                "stages": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+    payload = hosted_processor.WorkerJobRequest(
+        run_id="12345678-1234-4234-9234-123456789abc",
+        attempt_id="11111111-1111-4111-8111-111111111111",
+        callback_base_url="https://api.whodoirunlike.com",
+        source={
+            "url": "https://api.whodoirunlike.com/v1/jobs/source",
+            "key": "uploads/source.mp4",
+            "content_type": "video/mp4",
+            "size_bytes": 123,
+        },
+    )
+    indexed_puts: list[str] = []
+    deferred_puts: list[str] = []
+    finalized_batches: list[list[dict[str, Any]]] = []
+
+    def deferred_put(**kwargs: Any) -> dict[str, Any]:
+        name = kwargs["name"]
+        deferred_puts.append(name)
+        if name == "qc_metrics.json":
+            raise OSError("secondary R2 write failed")
+        return {
+            "name": name,
+            "content_type": "application/json",
+            "object_version": f"version-{name}",
+            "size_bytes": kwargs["path"].stat().st_size,
+        }
+
+    monkeypatch.setenv("WHODOIRUNLIKE_PARALLEL_ARTIFACT_PUBLISH", "1")
+    monkeypatch.setattr(
+        hosted_processor,
+        "_put_worker_artifact",
+        lambda **kwargs: indexed_puts.append(kwargs["name"]),
+    )
+    monkeypatch.setattr(hosted_processor, "_put_worker_artifact_deferred", deferred_put)
+    monkeypatch.setattr(
+        hosted_processor,
+        "_finalize_worker_artifacts",
+        lambda **kwargs: finalized_batches.append(kwargs["artifacts"]),
+    )
+    telemetry = ProcessingTelemetry(
+        run_id=payload.run_id,
+        attempt_id=payload.attempt_id,
+        local_path=tmp_path / "events.jsonl",
+        resource_sampler=lambda: {},
+        asynchronous_delivery=False,
+    )
+
+    with pytest.raises(OSError, match="secondary R2 write failed"):
+        hosted_processor._upload_artifacts(payload, run_dir, telemetry=telemetry)
+
+    assert indexed_puts == ["fused_overlay.mp4"]
+    assert set(deferred_puts) == {
+        "cv_run_manifest.json",
+        "features.json",
+        "qc_metrics.json",
+    }
+    assert finalized_batches == []
+    events = [json.loads(line) for line in telemetry.local_path.read_text().splitlines()]
+    assert any(event["event_type"] == "result_ready" for event in events)
+    assert any(
+        event["event_type"] == "span_failed"
+        and event["measurements"].get("artifact_type") == "qc_metrics"
+        for event in events
+    )
+
+
 def test_upload_artifacts_encodes_deferred_inline_masks_after_result_ready(
     monkeypatch: Any,
     tmp_path: Path,
@@ -783,6 +1004,229 @@ def test_artifact_put_sends_processing_attempt_header(
     assert requests[0].get_header("X-processing-attempt-id") == (
         "11111111-1111-4111-8111-111111111111"
     )
+
+
+def test_deferred_artifact_put_and_finalize_send_validated_attempt_metadata(
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    from whodoirunlike import hosted_processor
+
+    artifact = tmp_path / "features.json"
+    artifact.write_bytes(b"")
+    run_id = "12345678-1234-4234-9234-123456789abc"
+    attempt_id = "11111111-1111-4111-8111-111111111111"
+    receipt_payload = {
+        "run_id": run_id,
+        "attempt_id": attempt_id,
+        "artifact": artifact.name,
+        "status": "stored_unindexed",
+        "content_type": "application/json",
+        "object_version": "version-1",
+        "size_bytes": artifact.stat().st_size,
+    }
+    requests: list[Any] = []
+    timeouts: list[float] = []
+
+    class FakeResponse:
+        def __init__(self, body: bytes = b"") -> None:
+            self.body = body
+
+        def __enter__(self) -> FakeResponse:
+            return self
+
+        def __exit__(self, *_: Any) -> None:
+            return None
+
+        def read(self, limit: int) -> bytes:
+            return self.body[:limit]
+
+    def fake_urlopen(request: Any, *, timeout: float) -> FakeResponse:
+        requests.append(request)
+        timeouts.append(timeout)
+        if request.get_method() == "PUT":
+            return FakeResponse(json.dumps(receipt_payload).encode("utf-8"))
+        return FakeResponse()
+
+    monkeypatch.setenv("WHODOIRUNLIKE_PROCESSOR_SHARED_SECRET", "secret")
+    monkeypatch.setattr(hosted_processor.urllib.request, "urlopen", fake_urlopen)
+
+    receipt = hosted_processor._put_worker_artifact_deferred(
+        callback_base_url="https://api.whodoirunlike.com",
+        run_id=run_id,
+        attempt_id=attempt_id,
+        name=artifact.name,
+        path=artifact,
+    )
+    hosted_processor._finalize_worker_artifacts(
+        callback_base_url="https://api.whodoirunlike.com",
+        run_id=run_id,
+        attempt_id=attempt_id,
+        artifacts=[receipt],
+    )
+
+    assert receipt == {
+        "name": "features.json",
+        "content_type": "application/json",
+        "object_version": "version-1",
+        "size_bytes": artifact.stat().st_size,
+    }
+    assert requests[0].full_url.endswith("/artifacts/features.json?defer_index=1")
+    assert requests[0].get_header("X-processing-attempt-id") == attempt_id
+    assert requests[1].full_url.endswith("/artifacts/finalize")
+    assert requests[1].get_header("X-processing-attempt-id") == attempt_id
+    assert json.loads(requests[1].data) == {
+        "attempt_id": attempt_id,
+        "artifacts": [receipt],
+    }
+    assert timeouts == [120, hosted_processor.DEFAULT_REPORT_TIMEOUT_SECONDS]
+
+
+def test_deferred_artifact_put_and_finalize_retry_transient_callback_failures(
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    import urllib.error
+
+    from whodoirunlike import hosted_processor
+
+    artifact = tmp_path / "features.json"
+    artifact.write_text("{}", encoding="utf-8")
+    run_id = "12345678-1234-4234-9234-123456789abc"
+    attempt_id = "11111111-1111-4111-8111-111111111111"
+    receipt_payload = {
+        "run_id": run_id,
+        "attempt_id": attempt_id,
+        "artifact": artifact.name,
+        "status": "stored_unindexed",
+        "content_type": "application/json",
+        "object_version": "version-1",
+        "size_bytes": artifact.stat().st_size,
+    }
+    call_count = {"PUT": 0, "POST": 0}
+    sleeps: list[float] = []
+
+    class FakeResponse:
+        def __init__(self, body: bytes = b"") -> None:
+            self.body = body
+
+        def __enter__(self) -> FakeResponse:
+            return self
+
+        def __exit__(self, *_: Any) -> None:
+            return None
+
+        def read(self, limit: int) -> bytes:
+            return self.body[:limit]
+
+    def fake_urlopen(request: Any, *, timeout: float) -> FakeResponse:
+        del timeout
+        method = request.get_method()
+        call_count[method] += 1
+        if call_count[method] == 1:
+            status = 503 if method == "PUT" else 429
+            raise urllib.error.HTTPError(request.full_url, status, "retry", {}, None)
+        if method == "PUT":
+            return FakeResponse(json.dumps(receipt_payload).encode("utf-8"))
+        return FakeResponse()
+
+    monkeypatch.setenv("WHODOIRUNLIKE_PROCESSOR_SHARED_SECRET", "secret")
+    monkeypatch.setenv("WHODOIRUNLIKE_ARTIFACT_PUBLISH_ATTEMPTS", "3")
+    monkeypatch.setenv("WHODOIRUNLIKE_ARTIFACT_PUBLISH_BACKOFF_SECONDS", "0.25")
+    monkeypatch.setattr(hosted_processor.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(hosted_processor.time, "sleep", sleeps.append)
+
+    receipt = hosted_processor._put_worker_artifact_deferred(
+        callback_base_url="https://api.whodoirunlike.com",
+        run_id=run_id,
+        attempt_id=attempt_id,
+        name=artifact.name,
+        path=artifact,
+    )
+    hosted_processor._finalize_worker_artifacts(
+        callback_base_url="https://api.whodoirunlike.com",
+        run_id=run_id,
+        attempt_id=attempt_id,
+        artifacts=[receipt],
+    )
+
+    assert call_count == {"PUT": 2, "POST": 2}
+    assert sleeps == [0.25, 0.25]
+
+
+def test_deferred_artifact_put_stops_after_bounded_retry_attempts(
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    import urllib.error
+
+    from whodoirunlike import hosted_processor
+
+    artifact = tmp_path / "features.json"
+    artifact.write_text("{}", encoding="utf-8")
+    requests: list[Any] = []
+
+    def fail_urlopen(request: Any, *, timeout: float) -> Any:
+        del timeout
+        requests.append(request)
+        raise urllib.error.URLError("callback unavailable")
+
+    monkeypatch.setenv("WHODOIRUNLIKE_PROCESSOR_SHARED_SECRET", "secret")
+    monkeypatch.setenv("WHODOIRUNLIKE_ARTIFACT_PUBLISH_ATTEMPTS", "3")
+    monkeypatch.setattr(hosted_processor.urllib.request, "urlopen", fail_urlopen)
+    monkeypatch.setattr(hosted_processor.time, "sleep", lambda _: None)
+
+    with pytest.raises(urllib.error.URLError, match="callback unavailable"):
+        hosted_processor._put_worker_artifact_deferred(
+            callback_base_url="https://api.whodoirunlike.com",
+            run_id="12345678-1234-4234-9234-123456789abc",
+            attempt_id="11111111-1111-4111-8111-111111111111",
+            name=artifact.name,
+            path=artifact,
+        )
+
+    assert len(requests) == 3
+
+
+@pytest.mark.parametrize(("status", "expected_attempts"), [(503, 3), (409, 1)])
+def test_deferred_artifact_finalize_bounds_retries_to_retryable_failures(
+    monkeypatch: Any,
+    status: int,
+    expected_attempts: int,
+) -> None:
+    import urllib.error
+
+    from whodoirunlike import hosted_processor
+
+    requests: list[Any] = []
+
+    def fail_urlopen(request: Any, *, timeout: float) -> Any:
+        del timeout
+        requests.append(request)
+        raise urllib.error.HTTPError(request.full_url, status, "failed", {}, None)
+
+    monkeypatch.setenv("WHODOIRUNLIKE_PROCESSOR_SHARED_SECRET", "secret")
+    monkeypatch.setenv("WHODOIRUNLIKE_ARTIFACT_PUBLISH_ATTEMPTS", "3")
+    monkeypatch.setattr(hosted_processor.urllib.request, "urlopen", fail_urlopen)
+    monkeypatch.setattr(hosted_processor.time, "sleep", lambda _: None)
+
+    with pytest.raises(urllib.error.HTTPError) as raised:
+        hosted_processor._finalize_worker_artifacts(
+            callback_base_url="https://api.whodoirunlike.com",
+            run_id="12345678-1234-4234-9234-123456789abc",
+            attempt_id="11111111-1111-4111-8111-111111111111",
+            artifacts=[
+                {
+                    "name": "features.json",
+                    "content_type": "application/json",
+                    "object_version": "version-1",
+                    "size_bytes": 0,
+                }
+            ],
+        )
+
+    assert raised.value.code == status
+    assert len(requests) == expected_attempts
 
 
 def test_worker_report_uses_durable_job_mutation_timeout(monkeypatch: Any) -> None:
@@ -1297,6 +1741,73 @@ def test_processor_readiness_rejects_parallel_non_mmpose_policy(monkeypatch: Any
     assert "mmpose" in readiness["checks"]["execution_policy"]["reasons"][0]
 
 
+def test_processor_readiness_accepts_sam_mask_presentation_overlap(monkeypatch: Any) -> None:
+    from whodoirunlike import hosted_processor
+
+    monkeypatch.setenv("WHODOIRUNLIKE_PROCESSOR_SHARED_SECRET", "secret")
+    monkeypatch.setenv("WHODOIRUNLIKE_MASK_BACKEND", "sam31_gpu")
+    monkeypatch.setenv("WHODOIRUNLIKE_POSE_BACKEND", "mmpose_rtmpose_l_384")
+    monkeypatch.setenv("WHODOIRUNLIKE_SKIP_DENSEPOSE", "false")
+    monkeypatch.setenv("WHODOIRUNLIKE_PARALLEL_MASK_PRESENTATION", "true")
+    monkeypatch.setattr(
+        hosted_processor,
+        "identity_setup_status",
+        lambda backend=None: {"ready": True, "reasons": [], "backend": backend},
+    )
+    monkeypatch.setattr(
+        hosted_processor,
+        "sam31_gpu_setup_status",
+        lambda: {"ready": True, "reasons": [], "backend": "sam31_gpu"},
+    )
+    monkeypatch.setattr(
+        hosted_processor,
+        "pose_setup_status",
+        lambda backend: {"ready": True, "reasons": [], "backend": backend},
+    )
+    monkeypatch.setattr(
+        hosted_processor,
+        "densepose_setup_status",
+        lambda: {"ready": True, "reasons": [], "backend": "densepose"},
+    )
+
+    readiness = hosted_processor.processor_readiness()
+
+    assert readiness["ready_for_full_pipeline"] is True
+    assert readiness["parallel_mask_presentation"] is True
+    assert readiness["checks"]["execution_policy"] == {"ready": True, "reasons": []}
+
+
+def test_processor_readiness_rejects_mask_overlap_without_densepose(monkeypatch: Any) -> None:
+    from whodoirunlike import hosted_processor
+
+    monkeypatch.setenv("WHODOIRUNLIKE_PROCESSOR_SHARED_SECRET", "secret")
+    monkeypatch.setenv("WHODOIRUNLIKE_MASK_BACKEND", "sam31_gpu")
+    monkeypatch.setenv("WHODOIRUNLIKE_POSE_BACKEND", "mmpose_rtmpose_l_384")
+    monkeypatch.setenv("WHODOIRUNLIKE_SKIP_DENSEPOSE", "true")
+    monkeypatch.setenv("WHODOIRUNLIKE_PARALLEL_MASK_PRESENTATION", "true")
+    monkeypatch.setattr(
+        hosted_processor,
+        "identity_setup_status",
+        lambda backend=None: {"ready": True, "reasons": [], "backend": backend},
+    )
+    monkeypatch.setattr(
+        hosted_processor,
+        "sam31_gpu_setup_status",
+        lambda: {"ready": True, "reasons": [], "backend": "sam31_gpu"},
+    )
+    monkeypatch.setattr(
+        hosted_processor,
+        "pose_setup_status",
+        lambda backend: {"ready": True, "reasons": [], "backend": backend},
+    )
+
+    readiness = hosted_processor.processor_readiness()
+
+    assert readiness["ready_for_full_pipeline"] is False
+    assert readiness["checks"]["execution_policy"]["ready"] is False
+    assert "DensePose enabled" in readiness["checks"]["execution_policy"]["reasons"][0]
+
+
 def test_inline_yolo_mask_readiness_reuses_identity_dependency_check(
     monkeypatch: Any,
     tmp_path: Path,
@@ -1645,6 +2156,7 @@ def test_process_hosted_job_emits_complete_lifecycle_with_worker_attempt_id(
 
     def run_pipeline(**kwargs: Any) -> dict[str, Any]:
         assert kwargs["telemetry"] is created_telemetry[0]
+        assert kwargs["parallel_mask_presentation"] is False
         assert kwargs["parallel_pose_densepose"] is True
         assert kwargs["parallel_post_fusion"] is True
         assert kwargs["identity_detector_model"] == "runner-seg.engine"
@@ -1720,6 +2232,7 @@ def test_process_hosted_job_emits_complete_lifecycle_with_worker_attempt_id(
     assert events[0]["runtime"]["runpod_job_id"] == "runpod-job-99"
     assert events[0]["runtime"]["environment"] == "production"
     assert events[0]["runtime"]["processor_version"]
+    assert events[0]["runtime"]["parallel_mask_presentation"] is False
     assert events[0]["runtime"]["parallel_pose_densepose"] is True
     assert events[0]["runtime"]["parallel_post_fusion"] is True
     assert events[0]["runtime"]["identity_detector_model"] == "runner-seg.engine"

@@ -1777,6 +1777,80 @@ def test_processor_readiness_accepts_sam_mask_presentation_overlap(monkeypatch: 
     assert readiness["checks"]["execution_policy"] == {"ready": True, "reasons": []}
 
 
+def test_processor_readiness_accepts_analysis_model_prewarm(monkeypatch: Any) -> None:
+    from whodoirunlike import hosted_processor
+
+    monkeypatch.setenv("WHODOIRUNLIKE_PROCESSOR_SHARED_SECRET", "secret")
+    monkeypatch.setenv("WHODOIRUNLIKE_MASK_BACKEND", "sam31_gpu")
+    monkeypatch.setenv("WHODOIRUNLIKE_POSE_BACKEND", "mmpose_rtmpose_l_384")
+    monkeypatch.setenv("WHODOIRUNLIKE_SKIP_DENSEPOSE", "false")
+    monkeypatch.setenv("WHODOIRUNLIKE_PARALLEL_ANALYSIS_MODEL_PREWARM", "true")
+    monkeypatch.setattr(
+        hosted_processor,
+        "identity_setup_status",
+        lambda backend=None: {"ready": True, "reasons": [], "backend": backend},
+    )
+    monkeypatch.setattr(
+        hosted_processor,
+        "sam31_gpu_setup_status",
+        lambda: {"ready": True, "reasons": [], "backend": "sam31_gpu"},
+    )
+    monkeypatch.setattr(
+        hosted_processor,
+        "pose_setup_status",
+        lambda backend: {"ready": True, "reasons": [], "backend": backend},
+    )
+    monkeypatch.setattr(
+        hosted_processor,
+        "densepose_setup_status",
+        lambda: {"ready": True, "reasons": [], "backend": "densepose"},
+    )
+
+    readiness = hosted_processor.processor_readiness()
+
+    assert readiness["ready_for_full_pipeline"] is True
+    assert readiness["parallel_analysis_model_prewarm"] is True
+    assert readiness["checks"]["execution_policy"] == {"ready": True, "reasons": []}
+
+
+def test_processor_readiness_rejects_analysis_model_prewarm_without_sam_gpu(
+    monkeypatch: Any,
+) -> None:
+    from whodoirunlike import hosted_processor
+
+    monkeypatch.setenv("WHODOIRUNLIKE_PROCESSOR_SHARED_SECRET", "secret")
+    monkeypatch.setenv("WHODOIRUNLIKE_MASK_BACKEND", "sam31_mlx")
+    monkeypatch.setenv("WHODOIRUNLIKE_POSE_BACKEND", "mmpose_rtmpose_l_384")
+    monkeypatch.setenv("WHODOIRUNLIKE_SKIP_DENSEPOSE", "false")
+    monkeypatch.setenv("WHODOIRUNLIKE_PARALLEL_ANALYSIS_MODEL_PREWARM", "true")
+    monkeypatch.setattr(
+        hosted_processor,
+        "identity_setup_status",
+        lambda backend=None: {"ready": True, "reasons": [], "backend": backend},
+    )
+    monkeypatch.setattr(
+        hosted_processor,
+        "sam31_mlx_setup_status",
+        lambda: {"ready": True, "reasons": [], "backend": "sam31_mlx"},
+    )
+    monkeypatch.setattr(
+        hosted_processor,
+        "pose_setup_status",
+        lambda backend: {"ready": True, "reasons": [], "backend": backend},
+    )
+    monkeypatch.setattr(
+        hosted_processor,
+        "densepose_setup_status",
+        lambda: {"ready": True, "reasons": [], "backend": "densepose"},
+    )
+
+    readiness = hosted_processor.processor_readiness()
+
+    assert readiness["ready_for_full_pipeline"] is False
+    assert readiness["checks"]["execution_policy"]["ready"] is False
+    assert "sam31_gpu" in readiness["checks"]["execution_policy"]["reasons"][0]
+
+
 def test_processor_readiness_rejects_mask_overlap_without_densepose(monkeypatch: Any) -> None:
     from whodoirunlike import hosted_processor
 
@@ -2157,6 +2231,7 @@ def test_process_hosted_job_emits_complete_lifecycle_with_worker_attempt_id(
     def run_pipeline(**kwargs: Any) -> dict[str, Any]:
         assert kwargs["telemetry"] is created_telemetry[0]
         assert kwargs["parallel_mask_presentation"] is False
+        assert kwargs["parallel_analysis_model_prewarm"] is False
         assert kwargs["parallel_pose_densepose"] is True
         assert kwargs["parallel_post_fusion"] is True
         assert kwargs["identity_detector_model"] == "runner-seg.engine"
@@ -2233,6 +2308,7 @@ def test_process_hosted_job_emits_complete_lifecycle_with_worker_attempt_id(
     assert events[0]["runtime"]["environment"] == "production"
     assert events[0]["runtime"]["processor_version"]
     assert events[0]["runtime"]["parallel_mask_presentation"] is False
+    assert events[0]["runtime"]["parallel_analysis_model_prewarm"] is False
     assert events[0]["runtime"]["parallel_pose_densepose"] is True
     assert events[0]["runtime"]["parallel_post_fusion"] is True
     assert events[0]["runtime"]["identity_detector_model"] == "runner-seg.engine"

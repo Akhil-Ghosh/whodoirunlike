@@ -7,6 +7,7 @@ import sys
 import types
 
 import numpy as np
+import pytest
 
 import whodoirunlike.sam31_gpu_runner as sam31_gpu_runner
 from whodoirunlike.sam31_gpu_runner import (
@@ -196,10 +197,16 @@ def test_runner_mask_readiness_fires_after_fallback_and_before_presentation(
         lambda _predictor: {"applied": True},
     )
     initial_masks = {0: np.ones((8, 10), dtype=np.uint8)}
+    collect_kwargs: dict[str, object] = {}
+
+    def collect_masks(**kwargs: object):
+        collect_kwargs.update(kwargs)
+        return initial_masks, {"active_obj_id": 1}
+
     monkeypatch.setattr(
         sam31_gpu_runner,
         "_collect_sam31_masks",
-        lambda **_kwargs: (initial_masks, {"active_obj_id": 1}),
+        collect_masks,
     )
     monkeypatch.setattr(
         sam31_gpu_runner,
@@ -236,6 +243,9 @@ def test_runner_mask_readiness_fires_after_fallback_and_before_presentation(
         assert progress_phases[-1] == "analytical_mask_ready"
         events.append("ready")
 
+    def propagation_started() -> None:
+        events.append("prewarm")
+
     def write_presentation(**kwargs: object) -> None:
         assert kwargs["render_qa_overlay"] is False
         events.append("presentation")
@@ -258,6 +268,7 @@ def test_runner_mask_readiness_fires_after_fallback_and_before_presentation(
         run_dir=tmp_path,
         progress_callback=lambda payload: progress_phases.append(str(payload["phase"])),
         runner_mask_ready_callback=ready,
+        propagation_started_callback=propagation_started,
         render_qa_overlay=False,
     )
 
@@ -273,6 +284,7 @@ def test_runner_mask_readiness_fires_after_fallback_and_before_presentation(
     assert result["fallback"]["reason"] == "sam31_gpu_empty_mask"
     assert result["mask_summary"]["nonempty_frames"] == 2
     assert result["data_ready_seconds"] <= result["elapsed_seconds"]
+    assert collect_kwargs["propagation_started_callback"] is propagation_started
 
 
 def test_predictor_cache_is_invalidated_after_session_error(monkeypatch) -> None:
@@ -788,6 +800,9 @@ def test_collect_sam31_masks_preseeds_anchors_before_one_full_pass(
     boxes = {
         frame_index: np.array([0, 0, 2, 2], dtype=np.float32) for frame_index in range(6)
     }
+    def propagation_started() -> None:
+        predictor.events.append(("analysis_model_prewarm", None))
+
     masks, diagnostics = _collect_sam31_masks(
         predictor=predictor,
         video_path=tmp_path / "clip.mp4",
@@ -802,6 +817,7 @@ def test_collect_sam31_masks_preseeds_anchors_before_one_full_pass(
         frame_count=6,
         obj_id=1,
         track_boxes=boxes,
+        propagation_started_callback=propagation_started,
     )
 
     propagation_positions = [
@@ -815,10 +831,79 @@ def test_collect_sam31_masks_preseeds_anchors_before_one_full_pass(
     assert len(propagation_positions) == 1
     assert anchor_positions
     assert max(anchor_positions) < propagation_positions[0]
+    prewarm_positions = [
+        index
+        for index, event in enumerate(predictor.events)
+        if event[0] == "analysis_model_prewarm"
+    ]
+    assert len(prewarm_positions) == 1
+    assert max(anchor_positions) < prewarm_positions[0] < propagation_positions[0]
     assert diagnostics["preseed_anchor_frames"] == [0, 1, 2, 3, 4, 5]
     assert diagnostics["anchor_refinement_triggered"] is False
     assert [item["pass"] for item in diagnostics["propagation"]] == ["primary_prompt"]
     assert sorted(masks) == list(range(6))
+
+
+def test_collect_sam31_masks_closes_session_when_prewarm_callback_fails(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    class FakeInferenceMode:
+        def __enter__(self) -> None:
+            return None
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+    fake_torch = types.SimpleNamespace(
+        float32="float32",
+        int32="int32",
+        tensor=lambda data, **_kwargs: np.asarray(data),
+        inference_mode=lambda: FakeInferenceMode(),
+    )
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+
+    class FakePredictor:
+        closed = False
+        propagated = False
+
+        def handle_request(self, *, request: dict[str, object]) -> dict[str, object]:
+            if request["type"] == "start_session":
+                return {"session_id": "session-1"}
+            if request["type"] == "close_session":
+                self.closed = True
+                return {}
+            if request["type"] == "add_prompt":
+                return {"outputs": {}}
+            raise AssertionError(f"unexpected request: {request['type']}")
+
+        def handle_stream_request(self, *, request: dict[str, object]) -> list[dict[str, object]]:
+            self.propagated = True
+            return []
+
+    predictor = FakePredictor()
+
+    with pytest.raises(RuntimeError, match="prewarm callback failed"):
+        _collect_sam31_masks(
+            predictor=predictor,
+            video_path=tmp_path / "clip.mp4",
+            prompt={
+                "frame_index": 0,
+                "box": np.array([0, 0, 2, 2], dtype=np.float32),
+                "points": np.array([[1, 1]], dtype=np.float32),
+                "labels": np.array([1], dtype=np.int32),
+            },
+            width=2,
+            height=2,
+            frame_count=1,
+            obj_id=1,
+            propagation_started_callback=lambda: (_ for _ in ()).throw(
+                RuntimeError("prewarm callback failed")
+            ),
+        )
+
+    assert predictor.propagated is False
+    assert predictor.closed is True
 
 
 def test_collect_sam31_masks_retries_once_when_first_pass_is_sparse(

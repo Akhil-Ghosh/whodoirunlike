@@ -526,6 +526,7 @@ def _collect_sam31_masks(
     track_boxes: dict[int, np.ndarray] | None = None,
     progress_callback: Callable[[int, int, str], None] | None = None,
     preseed_track_anchors: bool = True,
+    propagation_started_callback: Callable[[], None] | None = None,
 ) -> tuple[dict[int, np.ndarray], dict[str, Any]]:
     import torch
 
@@ -674,6 +675,9 @@ def _collect_sam31_masks(
                 )
                 if anchor_mask is not None:
                     masks_by_frame[anchor_frame] = anchor_mask
+
+            if propagation_started_callback is not None:
+                propagation_started_callback()
 
             diagnostics["propagation"].extend(
                 _propagate_from_seed_frame(
@@ -1008,6 +1012,7 @@ def run_sam31_gpu_mask(
     obj_id: int = DEFAULT_SAM31_GPU_OBJ_ID,
     progress_callback: Sam31GpuProgressCallback | None = None,
     runner_mask_ready_callback: Callable[[], None] | None = None,
+    propagation_started_callback: Callable[[], None] | None = None,
     render_qa_overlay: bool = True,
 ) -> dict[str, Any]:
     try:
@@ -1126,6 +1131,7 @@ def run_sam31_gpu_mask(
                     direction=direction,
                 ),
                 preseed_track_anchors=preseed_track_anchors,
+                propagation_started_callback=propagation_started_callback,
             )
     prompt_summary["sam31_predictor_cache"] = predictor_cache
     prompt_summary["sam31"] = sam_prompt_diagnostics

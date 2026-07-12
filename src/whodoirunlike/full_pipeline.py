@@ -5,6 +5,7 @@ import os
 import shutil
 import tempfile
 import threading
+import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Callable
@@ -138,6 +139,7 @@ def _run_mask_stage(
     mask_quality_mode: str,
     progress_callback: Callable[[dict[str, Any]], None] | None = None,
     runner_mask_ready_callback: Callable[[], None] | None = None,
+    propagation_started_callback: Callable[[], None] | None = None,
     render_qa_overlay: bool = True,
 ) -> dict[str, Any]:
     normalized = mask_backend.strip().lower()
@@ -154,6 +156,7 @@ def _run_mask_stage(
             run_dir=run_dir,
             progress_callback=progress_callback,
             runner_mask_ready_callback=runner_mask_ready_callback,
+            propagation_started_callback=propagation_started_callback,
             render_qa_overlay=render_qa_overlay,
         )
     raise ValueError("mask_backend must be one of: sam31_mlx, sam31_gpu")
@@ -168,6 +171,176 @@ _MASK_ARTIFACT_KEYS = (
     "masks_jsonl",
 )
 _SAM31_GPU_BACKENDS = frozenset({"sam31_gpu", "sam3.1_gpu", "sam31_cuda", "sam3.1_cuda"})
+
+
+def _prewarm_mmpose_model(pose_backend: str) -> None:
+    from whodoirunlike.mmpose_runner import (
+        build_rtmlib_model,
+        mmpose_model_spec,
+        mmpose_setup_status,
+    )
+
+    setup = mmpose_setup_status(pose_backend)
+    if not setup.get("ready"):
+        reasons = "; ".join(str(reason) for reason in setup.get("reasons") or [])
+        raise RuntimeError(reasons or "MMPose prewarm is unavailable")
+    build_rtmlib_model(
+        mmpose_model_spec(pose_backend),
+        device=str(setup.get("device") or "cpu"),
+        runtime_backend=str(setup.get("runtime_backend") or "onnxruntime"),
+        use_detector=bool(setup.get("use_detector", True)),
+    )
+
+
+def _prewarm_densepose_model(runtime_kwargs: dict[str, Any]) -> None:
+    from whodoirunlike.densepose_runner import load_densepose_backend
+
+    load_densepose_backend(
+        config_path=runtime_kwargs["config_path"],
+        weights_path=runtime_kwargs["weights_path"],
+        device=runtime_kwargs["device"],
+        input_min_size_test=runtime_kwargs["input_min_size_test"],
+        input_max_size_test=runtime_kwargs["input_max_size_test"],
+    )
+
+
+class _AnalysisModelPrewarm:
+    """Opportunistically populate the existing pose/DensePose model caches."""
+
+    def __init__(
+        self,
+        *,
+        enabled: bool,
+        pose_backend: str,
+        densepose_runtime_kwargs: dict[str, Any] | None,
+        telemetry: ProcessingTelemetry | None,
+    ) -> None:
+        self.enabled = bool(enabled)
+        self.pose_backend = pose_backend
+        self.densepose_runtime_kwargs = densepose_runtime_kwargs
+        self.telemetry = telemetry
+        self._lock = threading.Lock()
+        self._executor: ThreadPoolExecutor | None = None
+        self._futures: dict[str, Future[dict[str, Any]]] = {}
+        self._started_at: float | None = None
+        self._completed_at: float | None = None
+        self._models: dict[str, dict[str, Any]] = {}
+
+    def _invoke(self, name: str, action: Callable[[], None]) -> dict[str, Any]:
+        started_at = time.perf_counter()
+        owner_stage = {
+            "pose": "pose_sequence",
+            "densepose": "densepose_body_map",
+        }[name]
+        span_boundary = (
+            self.telemetry.span(
+                owner_stage,
+                "model_load",
+                runtime={
+                    "model": name,
+                    "operation": "analysis_model_prewarm",
+                },
+            )
+            if self.telemetry is not None
+            else None
+        )
+        if span_boundary is not None:
+            span_boundary.__enter__()
+        try:
+            action()
+        except Exception as exc:  # The normal stage gets one clean retry.
+            diagnostic = {
+                "status": "failed",
+                "error_type": type(exc).__name__,
+                "elapsed_seconds": round(time.perf_counter() - started_at, 6),
+            }
+        else:
+            diagnostic = {
+                "status": "complete",
+                "elapsed_seconds": round(time.perf_counter() - started_at, 6),
+            }
+        if span_boundary is not None:
+            span_boundary.add_measurements(
+                {
+                    "model": name,
+                    "model_status": diagnostic["status"],
+                    "model_elapsed_seconds": diagnostic["elapsed_seconds"],
+                }
+            )
+            span_boundary.close()
+        return diagnostic
+
+    def start(self) -> None:
+        if not self.enabled:
+            return
+        with self._lock:
+            if self._executor is not None:
+                return
+            if self.densepose_runtime_kwargs is None:
+                raise RuntimeError("DensePose runtime configuration is required for prewarm")
+            self._started_at = time.perf_counter()
+            try:
+                self._executor = ThreadPoolExecutor(
+                    max_workers=2,
+                    thread_name_prefix="analysis-model-prewarm",
+                )
+                self._futures = {
+                    "pose": self._executor.submit(
+                        self._invoke,
+                        "pose",
+                        lambda: _prewarm_mmpose_model(self.pose_backend),
+                    ),
+                    "densepose": self._executor.submit(
+                        self._invoke,
+                        "densepose",
+                        lambda: _prewarm_densepose_model(
+                            self.densepose_runtime_kwargs or {}
+                        ),
+                    ),
+                }
+            except Exception as exc:
+                self._models["coordinator"] = {
+                    "status": "failed",
+                    "error_type": type(exc).__name__,
+                }
+                self._completed_at = time.perf_counter()
+                if self._executor is not None:
+                    self._executor.shutdown(wait=False, cancel_futures=True)
+                    self._executor = None
+
+    def wait(self) -> None:
+        if not self.enabled:
+            return
+        self.start()
+        self._models = {
+            name: future.result()
+            for name, future in self._futures.items()
+        }
+        self._completed_at = time.perf_counter()
+
+    def close(self) -> None:
+        executor = self._executor
+        if executor is not None:
+            executor.shutdown(wait=True, cancel_futures=False)
+            self._executor = None
+        if self._futures and not self._models:
+            self._models = {
+                name: future.result()
+                for name, future in self._futures.items()
+            }
+        self._completed_at = time.perf_counter()
+
+    def diagnostics(self) -> dict[str, Any]:
+        elapsed_seconds = None
+        if self._started_at is not None:
+            end = self._completed_at or time.perf_counter()
+            elapsed_seconds = round(max(0.0, end - self._started_at), 6)
+        return {
+            "enabled": self.enabled,
+            "started": self._started_at is not None,
+            "elapsed_seconds": elapsed_seconds,
+            "models": dict(self._models),
+        }
 
 
 def _wait_for_runner_mask_readiness(
@@ -477,6 +650,7 @@ def run_full_cv_pipeline(
     inline_mask_sam_fallback: bool = True,
     inline_mask_fallback_backend: str = "sam31_gpu",
     parallel_mask_presentation: bool = False,
+    parallel_analysis_model_prewarm: bool = False,
     parallel_pose_densepose: bool = False,
     parallel_post_fusion: bool = False,
     telemetry: ProcessingTelemetry | None = None,
@@ -495,10 +669,26 @@ def run_full_cv_pipeline(
             "parallel_mask_presentation requires sam31_gpu, an mmpose backend, "
             "and DensePose enabled"
         )
+    if parallel_analysis_model_prewarm and (
+        normalized_mask_backend not in _SAM31_GPU_BACKENDS
+        or not pose_backend.startswith("mmpose_")
+        or skip_densepose
+    ):
+        raise ValueError(
+            "parallel_analysis_model_prewarm requires sam31_gpu, an mmpose backend, "
+            "and DensePose enabled"
+        )
     result: dict[str, Any] = {"run_dir": str(run_dir), "steps": []}
     inline_segmentation = _uses_inline_segmentation(mask_backend)
     selected_detector_model = identity_detector_model or (
         DEFAULT_INLINE_SEGMENTATION_MODEL if inline_segmentation else None
+    )
+    densepose_kwargs = _densepose_runtime_kwargs() if not skip_densepose else None
+    analysis_model_prewarm = _AnalysisModelPrewarm(
+        enabled=parallel_analysis_model_prewarm,
+        pose_backend=pose_backend,
+        densepose_runtime_kwargs=densepose_kwargs,
+        telemetry=telemetry,
     )
 
     def run_identity_stage(
@@ -550,6 +740,7 @@ def run_full_cv_pipeline(
         "backend": mask_backend,
         "quality_mode": mask_quality_mode,
         "parallel_presentation": parallel_mask_presentation,
+        "analysis_model_prewarm": parallel_analysis_model_prewarm,
     }
     mask_phase_spans: dict[str, str | None] | None = _MASK_PHASE_SPANS
     mask_default_span: str | None = "inference"
@@ -608,6 +799,11 @@ def run_full_cv_pipeline(
                 runner_mask_ready_callback=(
                     runner_mask_ready.set if runner_mask_ready is not None else None
                 ),
+                propagation_started_callback=(
+                    analysis_model_prewarm.start
+                    if parallel_analysis_model_prewarm
+                    else None
+                ),
                 render_qa_overlay=not parallel_mask_presentation,
             )
 
@@ -626,16 +822,25 @@ def run_full_cv_pipeline(
     mask_executor: ThreadPoolExecutor | None = None
     mask_future: Future[dict[str, Any]] | None = None
     mask: dict[str, Any] | None = None
-    if runner_mask_ready is not None:
-        mask_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="mask-presentation")
-        mask_future = mask_executor.submit(run_observed_mask_stage)
-        try:
+    try:
+        if runner_mask_ready is not None:
+            mask_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="mask-presentation")
+            mask_future = mask_executor.submit(run_observed_mask_stage)
             _wait_for_runner_mask_readiness(runner_mask_ready, mask_future)
-        except BaseException:
+        else:
+            mask = run_observed_mask_stage()
+    except BaseException:
+        if mask_executor is not None:
             mask_executor.shutdown(wait=True)
-            raise
-    else:
-        mask = run_observed_mask_stage()
+        analysis_model_prewarm.close()
+        raise
+
+    try:
+        analysis_model_prewarm.wait()
+    finally:
+        analysis_model_prewarm.close()
+    if parallel_analysis_model_prewarm:
+        result["analysis_model_prewarm"] = analysis_model_prewarm.diagnostics()
 
     if inline_segmentation and mask is not None and mask.get("fallback_from"):
         inline_identity_mask = identity.get("inline_mask")
@@ -699,7 +904,7 @@ def run_full_cv_pipeline(
     if not skip_densepose:
         from whodoirunlike.densepose_runner import run_densepose
 
-        densepose_kwargs = _densepose_runtime_kwargs()
+        assert densepose_kwargs is not None
 
         def run_densepose_stage() -> dict[str, Any]:
             return _run_observed_stage(

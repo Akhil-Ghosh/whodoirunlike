@@ -1774,6 +1774,9 @@ def processor_readiness() -> dict[str, Any]:
     mask_backend = _mask_backend()
     skip_densepose = _env_bool("WHODOIRUNLIKE_SKIP_DENSEPOSE")
     parallel_mask_presentation = _env_bool("WHODOIRUNLIKE_PARALLEL_MASK_PRESENTATION")
+    parallel_analysis_model_prewarm = _env_bool(
+        "WHODOIRUNLIKE_PARALLEL_ANALYSIS_MODEL_PREWARM"
+    )
     parallel_pose_densepose = _env_bool("WHODOIRUNLIKE_PARALLEL_POSE_DENSEPOSE")
     parallel_post_fusion = _env_bool("WHODOIRUNLIKE_PARALLEL_POST_FUSION")
     inline_mask_settings = _inline_mask_settings()
@@ -1795,6 +1798,16 @@ def processor_readiness() -> dict[str, Any]:
     ):
         execution_policy_reasons.append(
             "WHODOIRUNLIKE_PARALLEL_MASK_PRESENTATION requires sam31_gpu, "
+            "an mmpose backend, and DensePose enabled."
+        )
+    if parallel_analysis_model_prewarm and (
+        mask_backend.strip().lower()
+        not in {"sam31_gpu", "sam3.1_gpu", "sam31_cuda", "sam3.1_cuda"}
+        or not pose_backend.startswith("mmpose_")
+        or skip_densepose
+    ):
+        execution_policy_reasons.append(
+            "WHODOIRUNLIKE_PARALLEL_ANALYSIS_MODEL_PREWARM requires sam31_gpu, "
             "an mmpose backend, and DensePose enabled."
         )
     checks = {
@@ -1824,6 +1837,7 @@ def processor_readiness() -> dict[str, Any]:
         "mask_backend": mask_backend,
         "skip_densepose": skip_densepose,
         "parallel_mask_presentation": parallel_mask_presentation,
+        "parallel_analysis_model_prewarm": parallel_analysis_model_prewarm,
         "parallel_pose_densepose": parallel_pose_densepose,
         "parallel_post_fusion": parallel_post_fusion,
         "inline_mask": inline_mask_settings,
@@ -1845,6 +1859,9 @@ def process_hosted_job(payload: WorkerJobRequest, *, raise_on_error: bool = Fals
     mask_backend = _mask_backend()
     skip_densepose = _env_bool("WHODOIRUNLIKE_SKIP_DENSEPOSE")
     parallel_mask_presentation = _env_bool("WHODOIRUNLIKE_PARALLEL_MASK_PRESENTATION")
+    parallel_analysis_model_prewarm = _env_bool(
+        "WHODOIRUNLIKE_PARALLEL_ANALYSIS_MODEL_PREWARM"
+    )
     parallel_pose_densepose = _env_bool("WHODOIRUNLIKE_PARALLEL_POSE_DENSEPOSE")
     parallel_post_fusion = _env_bool("WHODOIRUNLIKE_PARALLEL_POST_FUSION")
     inline_mask_settings = _inline_mask_settings()
@@ -1869,6 +1886,7 @@ def process_hosted_job(payload: WorkerJobRequest, *, raise_on_error: bool = Fals
             "mask_backend": mask_backend,
             "skip_densepose": skip_densepose,
             "parallel_mask_presentation": parallel_mask_presentation,
+            "parallel_analysis_model_prewarm": parallel_analysis_model_prewarm,
             "parallel_pose_densepose": parallel_pose_densepose,
             "parallel_post_fusion": parallel_post_fusion,
             **inline_mask_settings,
@@ -1944,6 +1962,7 @@ def process_hosted_job(payload: WorkerJobRequest, *, raise_on_error: bool = Fals
             mask_quality_mode=os.getenv("WHODOIRUNLIKE_MASK_QUALITY_MODE", "native"),
             skip_densepose=skip_densepose,
             parallel_mask_presentation=parallel_mask_presentation,
+            parallel_analysis_model_prewarm=parallel_analysis_model_prewarm,
             parallel_pose_densepose=parallel_pose_densepose,
             parallel_post_fusion=parallel_post_fusion,
             **inline_mask_settings,

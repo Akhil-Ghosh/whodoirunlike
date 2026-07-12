@@ -310,6 +310,170 @@ def test_full_pipeline_overlaps_sam_presentation_with_pose_and_densepose(
     ]
 
 
+def test_full_pipeline_prewarms_analysis_models_during_sam_propagation(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    pose_prewarm_started = threading.Event()
+    densepose_prewarm_started = threading.Event()
+    prewarm_release = threading.Event()
+    prewarm_finished = {"pose": threading.Event(), "densepose": threading.Event()}
+
+    monkeypatch.setattr(full_pipeline, "run_identity_tracking", lambda **_: {"status": "complete"})
+
+    def prewarm_pose(_pose_backend: str) -> None:
+        pose_prewarm_started.set()
+        assert densepose_prewarm_started.wait(timeout=1.0)
+        assert prewarm_release.wait(timeout=1.0)
+        prewarm_finished["pose"].set()
+
+    def prewarm_densepose(_runtime_kwargs: dict[str, Any]) -> None:
+        densepose_prewarm_started.set()
+        assert pose_prewarm_started.wait(timeout=1.0)
+        assert prewarm_release.wait(timeout=1.0)
+        prewarm_finished["densepose"].set()
+
+    def run_mask(**kwargs: Any) -> dict[str, Any]:
+        start_prewarm = kwargs["propagation_started_callback"]
+        assert callable(start_prewarm)
+        start_prewarm()
+        assert pose_prewarm_started.wait(timeout=1.0)
+        assert densepose_prewarm_started.wait(timeout=1.0)
+        prewarm_release.set()
+        return {"status": "complete", "backend": "sam31_gpu"}
+
+    def run_pose(**_: Any) -> dict[str, Any]:
+        assert prewarm_finished["pose"].is_set()
+        return {"status": "complete"}
+
+    def run_densepose(**_: Any) -> dict[str, Any]:
+        assert prewarm_finished["densepose"].is_set()
+        return {"status": "complete"}
+
+    monkeypatch.setattr(full_pipeline, "_prewarm_mmpose_model", prewarm_pose)
+    monkeypatch.setattr(full_pipeline, "_prewarm_densepose_model", prewarm_densepose)
+    monkeypatch.setattr(full_pipeline, "_run_mask_stage", run_mask)
+    monkeypatch.setattr("whodoirunlike.mmpose_runner.run_mmpose_pose", run_pose)
+    monkeypatch.setattr("whodoirunlike.densepose_runner.run_densepose", run_densepose)
+    monkeypatch.setattr(full_pipeline, "run_fused_form", lambda **_: {"status": "complete"})
+    monkeypatch.setattr(full_pipeline, "compile_form_features", lambda **_: {"status": "complete"})
+    monkeypatch.setattr(full_pipeline, "export_cv_tables", lambda *_: {"status": "complete"})
+    monkeypatch.setattr(full_pipeline, "run_qc_metrics", lambda *_: {"status": "complete"})
+
+    telemetry = ProcessingTelemetry(
+        run_id="12345678-1234-4234-9234-123456789abc",
+        attempt_id="22222222-2222-4222-8222-222222222222",
+        local_path=tmp_path / "prewarm-events.jsonl",
+        resource_sampler=lambda: {},
+        asynchronous_delivery=False,
+    )
+    result = full_pipeline.run_full_cv_pipeline(
+        run_dir=tmp_path,
+        mask_backend="sam31_gpu",
+        pose_backend="mmpose_rtmpose_l_384",
+        parallel_analysis_model_prewarm=True,
+        telemetry=telemetry,
+    )
+
+    diagnostics = result["analysis_model_prewarm"]
+    assert diagnostics["enabled"] is True
+    assert diagnostics["started"] is True
+    assert diagnostics["models"]["pose"]["status"] == "complete"
+    assert diagnostics["models"]["densepose"]["status"] == "complete"
+    events = [
+        json.loads(line)
+        for line in telemetry.local_path.read_text(encoding="utf-8").splitlines()
+    ]
+    prewarm_spans = [
+        event
+        for event in events
+        if event["event_type"] == "span_completed"
+        and event["span"] == "model_load"
+        and event["runtime"].get("operation") == "analysis_model_prewarm"
+    ]
+    assert len(prewarm_spans) == 2
+    assert {event["runtime"]["model"] for event in prewarm_spans} == {
+        "pose",
+        "densepose",
+    }
+    assert {event["stage"] for event in prewarm_spans} == {
+        "pose_sequence",
+        "densepose_body_map",
+    }
+    assert all(event["measurements"]["model_status"] == "complete" for event in prewarm_spans)
+
+
+def test_analysis_model_prewarm_is_opportunistic_and_retries_in_normal_stages(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    pose_called = False
+    densepose_called = False
+    monkeypatch.setattr(full_pipeline, "run_identity_tracking", lambda **_: {"status": "complete"})
+
+    def run_mask(**kwargs: Any) -> dict[str, Any]:
+        kwargs["propagation_started_callback"]()
+        return {"status": "complete", "backend": "sam31_gpu"}
+
+    def fail_prewarm(_value: Any) -> None:
+        raise RuntimeError("transient prewarm failure")
+
+    def run_pose(**_: Any) -> dict[str, Any]:
+        nonlocal pose_called
+        pose_called = True
+        return {"status": "complete"}
+
+    def run_densepose(**_: Any) -> dict[str, Any]:
+        nonlocal densepose_called
+        densepose_called = True
+        return {"status": "complete"}
+
+    monkeypatch.setattr(full_pipeline, "_prewarm_mmpose_model", fail_prewarm)
+    monkeypatch.setattr(full_pipeline, "_prewarm_densepose_model", fail_prewarm)
+    monkeypatch.setattr(full_pipeline, "_run_mask_stage", run_mask)
+    monkeypatch.setattr("whodoirunlike.mmpose_runner.run_mmpose_pose", run_pose)
+    monkeypatch.setattr("whodoirunlike.densepose_runner.run_densepose", run_densepose)
+    monkeypatch.setattr(full_pipeline, "run_fused_form", lambda **_: {"status": "complete"})
+    monkeypatch.setattr(full_pipeline, "compile_form_features", lambda **_: {"status": "complete"})
+    monkeypatch.setattr(full_pipeline, "export_cv_tables", lambda *_: {"status": "complete"})
+    monkeypatch.setattr(full_pipeline, "run_qc_metrics", lambda *_: {"status": "complete"})
+
+    result = full_pipeline.run_full_cv_pipeline(
+        run_dir=tmp_path,
+        mask_backend="sam31_gpu",
+        pose_backend="mmpose_rtmpose_l_384",
+        parallel_analysis_model_prewarm=True,
+    )
+
+    assert pose_called is True
+    assert densepose_called is True
+    diagnostics = result["analysis_model_prewarm"]
+    assert diagnostics["models"]["pose"]["status"] == "failed"
+    assert diagnostics["models"]["pose"]["error_type"] == "RuntimeError"
+    assert diagnostics["models"]["densepose"]["status"] == "failed"
+    assert diagnostics["models"]["densepose"]["error_type"] == "RuntimeError"
+
+
+def test_analysis_model_prewarm_requires_sam_gpu_mmpose_and_densepose(
+    tmp_path: Path,
+) -> None:
+    for kwargs in (
+        {"mask_backend": "sam31_mlx", "pose_backend": "mmpose_rtmpose_l_384"},
+        {"mask_backend": "sam31_gpu", "pose_backend": "mediapipe"},
+        {
+            "mask_backend": "sam31_gpu",
+            "pose_backend": "mmpose_rtmpose_l_384",
+            "skip_densepose": True,
+        },
+    ):
+        with pytest.raises(ValueError, match="parallel_analysis_model_prewarm requires"):
+            full_pipeline.run_full_cv_pipeline(
+                run_dir=tmp_path,
+                parallel_analysis_model_prewarm=True,
+                **kwargs,
+            )
+
+
 def test_parallel_mask_presentation_requires_sam_gpu_mmpose_and_densepose(
     tmp_path: Path,
 ) -> None:

@@ -1329,6 +1329,16 @@ def _sam31_input_loader_settings() -> dict[str, Any]:
     return sam31_exact_cv2_loader_settings().to_dict()
 
 
+def _sam31_input_loader_policy_reason(settings: dict[str, Any]) -> str | None:
+    if not settings["enabled"] or settings["concurrency_ready"]:
+        return None
+    return (
+        "WHODOIRUNLIKE_SAM31_GPU_EXACT_CV2_LOADER requires "
+        "WHODOIRUNLIKE_PROCESSOR_CONCURRENCY=1; configured concurrency is "
+        f"{settings['configured_concurrency']}."
+    )
+
+
 def _inline_mask_settings() -> dict[str, Any]:
     return {
         "identity_detector_model": os.getenv(
@@ -1803,15 +1813,11 @@ def processor_readiness() -> dict[str, Any]:
             "WHODOIRUNLIKE_PARALLEL_MASK_PRESENTATION requires sam31_gpu, "
             "an mmpose backend, and DensePose enabled."
         )
-    if (
-        sam31_input_loader["enabled"]
-        and not sam31_input_loader["concurrency_ready"]
-    ):
-        execution_policy_reasons.append(
-            "WHODOIRUNLIKE_SAM31_GPU_EXACT_CV2_LOADER requires "
-            "WHODOIRUNLIKE_PROCESSOR_CONCURRENCY=1; configured concurrency is "
-            f"{sam31_input_loader['configured_concurrency']}."
-        )
+    sam31_input_loader_policy_reason = _sam31_input_loader_policy_reason(
+        sam31_input_loader
+    )
+    if sam31_input_loader_policy_reason is not None:
+        execution_policy_reasons.append(sam31_input_loader_policy_reason)
     checks = {
         "processor_secret": _readiness_check("processor_secret", _secret_status),
         "identity": _readiness_check(
@@ -1913,6 +1919,14 @@ def process_hosted_job(payload: WorkerJobRequest, *, raise_on_error: bool = Fals
         ),
     )
     try:
+        sam31_input_loader_policy_reason = _sam31_input_loader_policy_reason(
+            sam31_input_loader
+        )
+        if sam31_input_loader_policy_reason is not None:
+            raise RuntimeError(
+                "SAM exact CV2 loader execution policy is not ready: "
+                f"{sam31_input_loader_policy_reason}"
+            )
         speed_profile_status = _speed_profile_status()
         if speed_profile_status["active"] and not speed_profile_status["ready"]:
             reasons = "; ".join(speed_profile_status["reasons"])

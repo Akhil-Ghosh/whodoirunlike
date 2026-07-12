@@ -269,6 +269,23 @@ def _verify_dependency_baseline(
     baseline: dict[str, Any],
     current: dict[str, Any],
 ) -> list[str]:
+    def distribution_labels(value: Any) -> set[str]:
+        if not isinstance(value, list):
+            return set()
+        return {
+            f"{item['name']}=={item['version']}"
+            for item in value
+            if isinstance(item, dict)
+            and isinstance(item.get("name"), str)
+            and isinstance(item.get("version"), str)
+        }
+
+    def summarize(labels: set[str]) -> str:
+        ordered = sorted(labels)
+        visible = ordered[:20]
+        suffix = f", +{len(ordered) - len(visible)} more" if len(ordered) > len(visible) else ""
+        return ",".join(visible) + suffix if visible else "none"
+
     errors: list[str] = []
     for key in (
         "schema",
@@ -282,7 +299,17 @@ def _verify_dependency_baseline(
         "trees",
         "revisions",
     ):
-        if current.get(key) != baseline.get(key):
+        if current.get(key) == baseline.get(key):
+            continue
+        if key == "distributions":
+            expected = distribution_labels(baseline.get(key))
+            observed = distribution_labels(current.get(key))
+            errors.append(
+                "dependency contract changed for distributions "
+                f"(missing={summarize(expected - observed)}; "
+                f"unexpected={summarize(observed - expected)})"
+            )
+        else:
             errors.append(f"dependency contract changed for {key}")
     return errors
 

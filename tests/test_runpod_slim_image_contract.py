@@ -157,6 +157,15 @@ def test_contract_detects_dependency_and_application_drift() -> None:
         "dependency contract changed for distribution_fingerprint"
     ]
 
+    distribution_drift = dict(baseline)
+    distribution_drift["distributions"] = [
+        {"name": "runtime-only", "version": "2.0"},
+    ]
+    assert contract._verify_dependency_baseline(baseline, distribution_drift) == [
+        "dependency contract changed for distributions "
+        "(missing=none; unexpected=runtime-only==2.0)"
+    ]
+
     application = {
         "module_origin": "/app/src/whodoirunlike/__init__.py",
         "processor_version": "test-sha",

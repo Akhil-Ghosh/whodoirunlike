@@ -67,15 +67,18 @@ RUN export DEBIAN_FRONTEND=noninteractive \
     && rm -rf \
         /usr/local/lib/python3.12 \
         /usr/lib/python3/dist-packages \
+        /usr/lib/python3.12/dist-packages \
     && mkdir -p \
         /usr/local/lib/python3.12 \
-        /usr/lib/python3/dist-packages
+        /usr/lib/python3/dist-packages \
+        /usr/lib/python3.12/dist-packages
 
 # Copy the complete Python directory layouts. Splitting these paths with shell
 # globs previously omitted valid packages and changed import precedence.
 COPY --from=dependency-runtime /usr/local/bin/ /usr/local/bin/
 COPY --from=dependency-runtime /usr/local/lib/python3.12/ /usr/local/lib/python3.12/
 COPY --from=dependency-runtime /usr/lib/python3/dist-packages/ /usr/lib/python3/dist-packages/
+COPY --from=dependency-runtime /usr/lib/python3.12/dist-packages/ /usr/lib/python3.12/dist-packages/
 COPY --from=dependency-runtime /opt/detectron2/ /opt/detectron2/
 COPY --from=dependency-runtime /opt/sam3/ /opt/sam3/
 COPY --from=dependency-runtime /opt/rtmlib-cache/ /opt/rtmlib-cache/

@@ -31,7 +31,7 @@
     "PROCESSOR_URL": "",
     "RUNPOD_RUNSYNC": "0",
     "AWS_ANALYTICS_INGEST_URL": "https://rn796ozrld.execute-api.us-east-1.amazonaws.com/v1/events",
-    "RUNPOD_ENDPOINT_ID": "svprmmu0v65w7r"
+    "RUNPOD_ENDPOINT_ID": "qd6evmmdr19wao"
   },
   "env": {
     "preview": {

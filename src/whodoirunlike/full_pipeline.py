@@ -30,6 +30,7 @@ DENSEPOSE_INPUT_MAX_SIZE_TEST_ENV = "DENSEPOSE_INPUT_MAX_SIZE_TEST"
 DENSEPOSE_TARGET_CROP_ENABLED_ENV = "DENSEPOSE_TARGET_CROP_ENABLED"
 DENSEPOSE_TARGET_CROP_PADDING_RATIO_ENV = "DENSEPOSE_TARGET_CROP_PADDING_RATIO"
 DENSEPOSE_TARGET_CROP_PADDING_PIXELS_ENV = "DENSEPOSE_TARGET_CROP_PADDING_PIXELS"
+DENSEPOSE_BATCH_SIZE_ENV = "DENSEPOSE_BATCH_SIZE"
 DENSEPOSE_DEFAULT_CONFIG = (
     REPO_ROOT / "models/densepose/detectron2/projects/DensePose/configs/densepose_rcnn_R_50_FPN_s1x.yaml"
 )
@@ -107,6 +108,11 @@ def _densepose_runtime_kwargs() -> dict[str, Any]:
     else:
         weights_path = str(DENSEPOSE_DEFAULT_WEIGHTS)
 
+    batch_size = max(
+        1,
+        min(8, _env_nonnegative_int(DENSEPOSE_BATCH_SIZE_ENV, 1)),
+    )
+
     return {
         "config_path": config_path,
         "weights_path": weights_path,
@@ -128,6 +134,7 @@ def _densepose_runtime_kwargs() -> dict[str, Any]:
             DENSEPOSE_TARGET_CROP_PADDING_PIXELS_ENV,
             16,
         ),
+        "batch_size": batch_size,
     }
 
 
@@ -717,6 +724,8 @@ def run_full_cv_pipeline(
                     "target_crop_padding_pixels": densepose_kwargs[
                         "target_crop_padding_pixels"
                     ],
+                    "batch_size": densepose_kwargs["batch_size"],
+                    "batched_inference_enabled": densepose_kwargs["batch_size"] > 1,
                 },
                 phase_spans=_DENSEPOSE_PHASE_SPANS,
                 action=lambda progress: run_densepose(

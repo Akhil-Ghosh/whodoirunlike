@@ -6,7 +6,7 @@ import time
 from dataclasses import dataclass, field
 from importlib import import_module
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Sequence
 
 import cv2
 import numpy as np
@@ -25,6 +25,9 @@ DENSEPOSE_SETUP_INSTRUCTIONS = (
     "Then run this adapter with --config path/to/densepose_rcnn_*.yaml and "
     "--weights path-or-url-to-densepose-model.pkl."
 )
+DENSEPOSE_BATCH_SIZE_ENV = "DENSEPOSE_BATCH_SIZE"
+DEFAULT_DENSEPOSE_BATCH_SIZE = 1
+MAX_DENSEPOSE_BATCH_SIZE = 8
 
 
 class DensePoseSetupError(RuntimeError):
@@ -50,6 +53,16 @@ class DensePoseBackend:
 class DensePoseFrameOutput:
     row: dict[str, Any]
     labels: np.ndarray | None = None
+
+
+@dataclass(frozen=True)
+class _DensePosePreparedFrame:
+    frame_bgr: np.ndarray
+    runner_mask: np.ndarray
+    inference_frame: np.ndarray
+    inference_input: dict[str, Any]
+    crop_x: int
+    crop_y: int
 
 
 _DENSEPOSE_BACKEND_CACHE: dict[tuple[Any, ...], DensePoseBackend] = {}
@@ -343,17 +356,14 @@ def _summarize_chart_result(
     return summary
 
 
-def apply_densepose_to_frame(
+def _prepare_densepose_frame(
     frame_bgr: np.ndarray,
     runner_mask: np.ndarray,
-    backend: DensePoseBackend,
     *,
-    frame_index: int,
-    min_mask_overlap: float = 0.1,
-    target_crop_enabled: bool = False,
-    target_crop_padding_ratio: float = 0.2,
-    target_crop_padding_pixels: int = 16,
-) -> DensePoseFrameOutput:
+    target_crop_enabled: bool,
+    target_crop_padding_ratio: float,
+    target_crop_padding_pixels: int,
+) -> _DensePosePreparedFrame | DensePoseFrameOutput:
     frame_height, frame_width = frame_bgr.shape[:2]
     runner_bbox = mask_bbox(runner_mask)
     if runner_bbox is None:
@@ -369,6 +379,7 @@ def apply_densepose_to_frame(
                 },
             }
         )
+
     crop_bbox = [0, 0, frame_width, frame_height]
     if target_crop_enabled:
         crop_bbox = _target_crop_bbox(
@@ -378,27 +389,43 @@ def apply_densepose_to_frame(
             padding_pixels=target_crop_padding_pixels,
         )
     crop_x, crop_y, crop_width, crop_height = crop_bbox
-    inference_frame = frame_bgr[crop_y : crop_y + crop_height, crop_x : crop_x + crop_width].copy()
+    inference_frame = frame_bgr[
+        crop_y : crop_y + crop_height,
+        crop_x : crop_x + crop_width,
+    ].copy()
     inference_mask = runner_mask[
         crop_y : crop_y + crop_height,
         crop_x : crop_x + crop_width,
     ]
     inference_frame[inference_mask <= 0] = 0
-    inference_input = {
-        "target_crop_enabled": bool(target_crop_enabled),
-        "crop_bbox": crop_bbox,
-        "width": int(inference_frame.shape[1]),
-        "height": int(inference_frame.shape[0]),
-    }
-    with backend.inference_lock:
-        outputs = backend.predictor(inference_frame)
+    return _DensePosePreparedFrame(
+        frame_bgr=frame_bgr,
+        runner_mask=runner_mask,
+        inference_frame=inference_frame,
+        inference_input={
+            "target_crop_enabled": bool(target_crop_enabled),
+            "crop_bbox": crop_bbox,
+            "width": int(inference_frame.shape[1]),
+            "height": int(inference_frame.shape[0]),
+        },
+        crop_x=crop_x,
+        crop_y=crop_y,
+    )
+
+
+def _densepose_output_from_predictions(
+    prepared: _DensePosePreparedFrame,
+    outputs: dict[str, Any],
+    *,
+    min_mask_overlap: float,
+) -> DensePoseFrameOutput:
     instances = _instances_to_cpu(outputs.get("instances"))
     if instances is None or len(instances) == 0:
         return DensePoseFrameOutput(
             {
                 "usable": False,
                 "drop_reason": "densepose_missing",
-                "inference_input": inference_input,
+                "inference_input": prepared.inference_input,
             }
         )
 
@@ -410,10 +437,10 @@ def apply_densepose_to_frame(
     best_overlap = 0.0
     for index, raw_box in enumerate(local_boxes):
         full_frame_box = np.asarray(raw_box, dtype=np.float32).copy()
-        full_frame_box[[0, 2]] += crop_x
-        full_frame_box[[1, 3]] += crop_y
+        full_frame_box[[0, 2]] += prepared.crop_x
+        full_frame_box[[1, 3]] += prepared.crop_y
         bbox = _box_xyxy_to_xywh(full_frame_box)
-        overlap = _box_mask_overlap(bbox, runner_mask)
+        overlap = _box_mask_overlap(bbox, prepared.runner_mask)
         if overlap > best_overlap:
             best_overlap = overlap
             best_index = index
@@ -423,31 +450,32 @@ def apply_densepose_to_frame(
             {
                 "usable": False,
                 "drop_reason": "no_detection_on_runner_mask",
-                "inference_input": inference_input,
+                "inference_input": prepared.inference_input,
             }
         )
 
     selected_box = np.asarray(local_boxes[best_index], dtype=np.float32).copy()
-    selected_box[[0, 2]] += crop_x
-    selected_box[[1, 3]] += crop_y
-
+    selected_box[[0, 2]] += prepared.crop_x
+    selected_box[[1, 3]] += prepared.crop_y
     row = {
         "usable": True,
         "score": round(float(scores[best_index]), 4),
         "bbox": _box_xyxy_to_xywh(selected_box),
         "mask_overlap": round(best_overlap, 4),
         "drop_reason": None,
-        "inference_input": inference_input,
+        "inference_input": prepared.inference_input,
     }
-    chart_result = _chart_result_for_instance(instances, best_index) if densepose is not None else None
+    chart_result = (
+        _chart_result_for_instance(instances, best_index) if densepose is not None else None
+    )
     labels = None
     if chart_result is not None:
         row.update(
             _summarize_chart_result(
                 chart_result,
                 bbox=row["bbox"],
-                frame_width=frame_bgr.shape[1],
-                frame_height=frame_bgr.shape[0],
+                frame_width=prepared.frame_bgr.shape[1],
+                frame_height=prepared.frame_bgr.shape[0],
             )
         )
         labels = chart_result.labels.detach().cpu().numpy().astype("uint8")
@@ -455,6 +483,136 @@ def apply_densepose_to_frame(
         row["part_count"] = None
         row["part_ids"] = []
     return DensePoseFrameOutput(row=row, labels=labels)
+
+
+def _default_predictor_batch(
+    predictor: Any,
+    images: Sequence[np.ndarray],
+) -> list[dict[str, Any]]:
+    """Run DefaultPredictor's exact augmentation/input contract as one model call."""
+    import torch
+
+    batched_inputs: list[dict[str, Any]] = []
+    with torch.no_grad():
+        for source_image in images:
+            original_image = source_image
+            if predictor.input_format == "RGB":
+                original_image = original_image[:, :, ::-1]
+            height, width = original_image.shape[:2]
+            image = predictor.aug.get_transform(original_image).apply_image(original_image)
+            image = torch.as_tensor(image.astype("float32").transpose(2, 0, 1))
+            # Preserve DefaultPredictor's exact call contract. Detectron2's model
+            # performs its own device transfer from the input dictionary.
+            image.to(predictor.cfg.MODEL.DEVICE)
+            batched_inputs.append({"image": image, "height": height, "width": width})
+        predictions = predictor.model(batched_inputs)
+
+    if not isinstance(predictions, (list, tuple)) or len(predictions) != len(images):
+        raise RuntimeError(
+            "DensePose batched predictor returned a different number of outputs than inputs"
+        )
+    return list(predictions)
+
+
+def apply_densepose_to_frames_batched(
+    frames_bgr: Sequence[np.ndarray],
+    runner_masks: Sequence[np.ndarray],
+    backend: DensePoseBackend,
+    *,
+    frame_indices: Sequence[int],
+    min_mask_overlap: float = 0.1,
+    target_crop_enabled: bool = False,
+    target_crop_padding_ratio: float = 0.2,
+    target_crop_padding_pixels: int = 16,
+) -> list[DensePoseFrameOutput]:
+    """PROTOTYPE: microbatch valid frames without changing per-frame semantics."""
+    if not (len(frames_bgr) == len(runner_masks) == len(frame_indices)):
+        raise ValueError("DensePose batched inputs must have matching lengths")
+    if len(frames_bgr) <= 1:
+        return [
+            apply_densepose_to_frame(
+                frame_bgr,
+                runner_mask,
+                backend,
+                frame_index=int(frame_index),
+                min_mask_overlap=min_mask_overlap,
+                target_crop_enabled=target_crop_enabled,
+                target_crop_padding_ratio=target_crop_padding_ratio,
+                target_crop_padding_pixels=target_crop_padding_pixels,
+            )
+            for frame_bgr, runner_mask, frame_index in zip(
+                frames_bgr,
+                runner_masks,
+                frame_indices,
+            )
+        ]
+
+    prepared_frames: list[_DensePosePreparedFrame] = []
+    prepared_positions: list[int] = []
+    results: list[DensePoseFrameOutput | None] = [None] * len(frames_bgr)
+    for position, (frame_bgr, runner_mask) in enumerate(zip(frames_bgr, runner_masks)):
+        prepared = _prepare_densepose_frame(
+            frame_bgr,
+            runner_mask,
+            target_crop_enabled=target_crop_enabled,
+            target_crop_padding_ratio=target_crop_padding_ratio,
+            target_crop_padding_pixels=target_crop_padding_pixels,
+        )
+        if isinstance(prepared, DensePoseFrameOutput):
+            results[position] = prepared
+        else:
+            prepared_frames.append(prepared)
+            prepared_positions.append(position)
+
+    if prepared_frames:
+        with backend.inference_lock:
+            predictions = _default_predictor_batch(
+                backend.predictor,
+                [prepared.inference_frame for prepared in prepared_frames],
+            )
+        for position, prepared, prediction in zip(
+            prepared_positions,
+            prepared_frames,
+            predictions,
+        ):
+            results[position] = _densepose_output_from_predictions(
+                prepared,
+                prediction,
+                min_mask_overlap=min_mask_overlap,
+            )
+
+    if any(result is None for result in results):
+        raise RuntimeError("DensePose batched inference did not resolve every input frame")
+    return [result for result in results if result is not None]
+
+
+def apply_densepose_to_frame(
+    frame_bgr: np.ndarray,
+    runner_mask: np.ndarray,
+    backend: DensePoseBackend,
+    *,
+    frame_index: int,
+    min_mask_overlap: float = 0.1,
+    target_crop_enabled: bool = False,
+    target_crop_padding_ratio: float = 0.2,
+    target_crop_padding_pixels: int = 16,
+) -> DensePoseFrameOutput:
+    prepared = _prepare_densepose_frame(
+        frame_bgr,
+        runner_mask,
+        target_crop_enabled=target_crop_enabled,
+        target_crop_padding_ratio=target_crop_padding_ratio,
+        target_crop_padding_pixels=target_crop_padding_pixels,
+    )
+    if isinstance(prepared, DensePoseFrameOutput):
+        return prepared
+    with backend.inference_lock:
+        outputs = backend.predictor(prepared.inference_frame)
+    return _densepose_output_from_predictions(
+        prepared,
+        outputs,
+        min_mask_overlap=min_mask_overlap,
+    )
 
 
 def _read_mask_frame(mask_capture: cv2.VideoCapture, width: int, height: int) -> np.ndarray | None:
@@ -540,6 +698,7 @@ def run_densepose(
     target_crop_enabled: bool = False,
     target_crop_padding_ratio: float = 0.2,
     target_crop_padding_pixels: int = 16,
+    batch_size: int = DEFAULT_DENSEPOSE_BATCH_SIZE,
     write_qa_overlay: bool = True,
     progress_callback: DensePoseProgressCallback | None = None,
 ) -> dict[str, Any]:
@@ -553,6 +712,7 @@ def run_densepose(
     qa_overlay_path = run.artifact_path("qa_overlay", manifest)
     effective_padding_ratio = max(0.0, float(target_crop_padding_ratio))
     effective_padding_pixels = max(0, int(target_crop_padding_pixels))
+    effective_batch_size = max(1, min(MAX_DENSEPOSE_BATCH_SIZE, int(batch_size)))
 
     if progress_callback:
         progress_callback(
@@ -596,6 +756,8 @@ def run_densepose(
         "target_crop_padding_pixels": effective_padding_pixels,
         "input_min_size_test": backend.input_min_size_test,
         "input_max_size_test": backend.input_max_size_test,
+        "batch_size": effective_batch_size,
+        "batched_inference_enabled": effective_batch_size > 1,
     }
 
     if not source_segment.exists():
@@ -647,30 +809,18 @@ def run_densepose(
     rows: list[dict[str, Any]] = []
     frame_index = 0
     try:
-        while True:
-            ok, frame = source_capture.read()
-            if not ok:
-                break
-            labels = None
-            mask = _read_mask_frame(mask_capture, width, height)
-            if mask is None:
-                row = {
-                    "usable": False,
-                    "drop_reason": "runner_mask_frame_missing",
-                    "inference_input": {
-                        "target_crop_enabled": bool(target_crop_enabled),
-                        "crop_bbox": None,
-                        "width": 0,
-                        "height": 0,
-                    },
-                }
-            else:
-                bbox = mask_bbox(mask)
-                mask_area_ratio = float((mask > 0).sum()) / float(max(width * height, 1))
-                if bbox is None:
+        if effective_batch_size == 1:
+            # Keep the existing production path literal when batching is disabled.
+            while True:
+                ok, frame = source_capture.read()
+                if not ok:
+                    break
+                labels = None
+                mask = _read_mask_frame(mask_capture, width, height)
+                if mask is None:
                     row = {
                         "usable": False,
-                        "drop_reason": "runner_mask_empty",
+                        "drop_reason": "runner_mask_frame_missing",
                         "inference_input": {
                             "target_crop_enabled": bool(target_crop_enabled),
                             "crop_bbox": None,
@@ -679,57 +829,181 @@ def run_densepose(
                         },
                     }
                 else:
-                    apply_kwargs: dict[str, Any] = {"frame_index": frame_index}
-                    if target_crop_enabled:
-                        apply_kwargs.update(
-                            {
-                                "target_crop_enabled": True,
-                                "target_crop_padding_ratio": effective_padding_ratio,
-                                "target_crop_padding_pixels": effective_padding_pixels,
-                            }
-                        )
-                    densepose_output = apply_densepose_to_frame(
-                        frame,
-                        mask,
-                        backend,
-                        **apply_kwargs,
-                    )
-                    if isinstance(densepose_output, DensePoseFrameOutput):
-                        row = densepose_output.row
-                        labels = densepose_output.labels
+                    bbox = mask_bbox(mask)
+                    mask_area_ratio = float((mask > 0).sum()) / float(max(width * height, 1))
+                    if bbox is None:
+                        row = {
+                            "usable": False,
+                            "drop_reason": "runner_mask_empty",
+                            "inference_input": {
+                                "target_crop_enabled": bool(target_crop_enabled),
+                                "crop_bbox": None,
+                                "width": 0,
+                                "height": 0,
+                            },
+                        }
                     else:
-                        row = densepose_output
-                    row.setdefault(
-                        "inference_input",
-                        {
-                            "target_crop_enabled": False,
-                            "crop_bbox": [0, 0, width, height],
-                            "width": width,
-                            "height": height,
-                        },
-                    )
-                row["mask_area_ratio"] = round(mask_area_ratio, 6)
-                row.setdefault("runner_bbox", bbox)
-                if writer is not None:
-                    writer.write(_draw_densepose_overlay(frame, mask, row, labels=labels))
+                        apply_kwargs: dict[str, Any] = {"frame_index": frame_index}
+                        if target_crop_enabled:
+                            apply_kwargs.update(
+                                {
+                                    "target_crop_enabled": True,
+                                    "target_crop_padding_ratio": effective_padding_ratio,
+                                    "target_crop_padding_pixels": effective_padding_pixels,
+                                }
+                            )
+                        densepose_output = apply_densepose_to_frame(
+                            frame,
+                            mask,
+                            backend,
+                            **apply_kwargs,
+                        )
+                        if isinstance(densepose_output, DensePoseFrameOutput):
+                            row = densepose_output.row
+                            labels = densepose_output.labels
+                        else:
+                            row = densepose_output
+                        row.setdefault(
+                            "inference_input",
+                            {
+                                "target_crop_enabled": False,
+                                "crop_bbox": [0, 0, width, height],
+                                "width": width,
+                                "height": height,
+                            },
+                        )
+                    row["mask_area_ratio"] = round(mask_area_ratio, 6)
+                    row.setdefault("runner_bbox", bbox)
+                    if writer is not None:
+                        writer.write(_draw_densepose_overlay(frame, mask, row, labels=labels))
 
-            row["frame_index"] = frame_index
-            row.setdefault("usable", False)
-            row.setdefault("drop_reason", None if row["usable"] else "densepose_missing")
-            rows.append(row)
-            if progress_callback and (frame_index == 0 or (frame_index + 1) % 10 == 0):
-                progress_callback(
-                    build_densepose_progress(
-                        phase="running_densepose",
-                        processed_frames=frame_index + 1,
-                        total_frames=total_frames,
-                        elapsed_seconds=time.monotonic() - started_at,
-                        frame_index=frame_index,
-                        usable=bool(row.get("usable")),
-                        inference_input=row.get("inference_input"),
+                row["frame_index"] = frame_index
+                row.setdefault("usable", False)
+                row.setdefault("drop_reason", None if row["usable"] else "densepose_missing")
+                rows.append(row)
+                if progress_callback and (frame_index == 0 or (frame_index + 1) % 10 == 0):
+                    progress_callback(
+                        build_densepose_progress(
+                            phase="running_densepose",
+                            processed_frames=frame_index + 1,
+                            total_frames=total_frames,
+                            elapsed_seconds=time.monotonic() - started_at,
+                            frame_index=frame_index,
+                            usable=bool(row.get("usable")),
+                            inference_input=row.get("inference_input"),
+                        )
                     )
-                )
-            frame_index += 1
+                frame_index += 1
+        else:
+            while True:
+                batch_records: list[dict[str, Any]] = []
+                for _ in range(effective_batch_size):
+                    ok, frame = source_capture.read()
+                    if not ok:
+                        break
+                    current_frame_index = frame_index + len(batch_records)
+                    mask = _read_mask_frame(mask_capture, width, height)
+                    batch_records.append(
+                        {
+                            "frame": frame,
+                            "frame_index": current_frame_index,
+                            "mask": mask,
+                            "bbox": mask_bbox(mask) if mask is not None else None,
+                        }
+                    )
+                if not batch_records:
+                    break
+
+                valid_positions = [
+                    position
+                    for position, record in enumerate(batch_records)
+                    if record["mask"] is not None and record["bbox"] is not None
+                ]
+                if valid_positions:
+                    outputs = apply_densepose_to_frames_batched(
+                        [batch_records[position]["frame"] for position in valid_positions],
+                        [batch_records[position]["mask"] for position in valid_positions],
+                        backend,
+                        frame_indices=[
+                            batch_records[position]["frame_index"] for position in valid_positions
+                        ],
+                        target_crop_enabled=target_crop_enabled,
+                        target_crop_padding_ratio=effective_padding_ratio,
+                        target_crop_padding_pixels=effective_padding_pixels,
+                    )
+                    for position, output in zip(valid_positions, outputs):
+                        batch_records[position]["densepose_output"] = output
+
+                for record in batch_records:
+                    frame = record["frame"]
+                    current_frame_index = int(record["frame_index"])
+                    mask = record["mask"]
+                    bbox = record["bbox"]
+                    labels = None
+                    if mask is None:
+                        row = {
+                            "usable": False,
+                            "drop_reason": "runner_mask_frame_missing",
+                            "inference_input": {
+                                "target_crop_enabled": bool(target_crop_enabled),
+                                "crop_bbox": None,
+                                "width": 0,
+                                "height": 0,
+                            },
+                        }
+                    else:
+                        mask_area_ratio = float((mask > 0).sum()) / float(max(width * height, 1))
+                        if bbox is None:
+                            row = {
+                                "usable": False,
+                                "drop_reason": "runner_mask_empty",
+                                "inference_input": {
+                                    "target_crop_enabled": bool(target_crop_enabled),
+                                    "crop_bbox": None,
+                                    "width": 0,
+                                    "height": 0,
+                                },
+                            }
+                        else:
+                            densepose_output = record["densepose_output"]
+                            if isinstance(densepose_output, DensePoseFrameOutput):
+                                row = densepose_output.row
+                                labels = densepose_output.labels
+                            else:
+                                row = densepose_output
+                            row.setdefault(
+                                "inference_input",
+                                {
+                                    "target_crop_enabled": False,
+                                    "crop_bbox": [0, 0, width, height],
+                                    "width": width,
+                                    "height": height,
+                                },
+                            )
+                        row["mask_area_ratio"] = round(mask_area_ratio, 6)
+                        row.setdefault("runner_bbox", bbox)
+                        if writer is not None:
+                            writer.write(_draw_densepose_overlay(frame, mask, row, labels=labels))
+
+                    row["frame_index"] = current_frame_index
+                    row.setdefault("usable", False)
+                    row.setdefault("drop_reason", None if row["usable"] else "densepose_missing")
+                    rows.append(row)
+                    if progress_callback and (
+                        current_frame_index == 0 or (current_frame_index + 1) % 10 == 0
+                    ):
+                        progress_callback(
+                            build_densepose_progress(
+                                phase="running_densepose",
+                                processed_frames=current_frame_index + 1,
+                                total_frames=total_frames,
+                                elapsed_seconds=time.monotonic() - started_at,
+                                frame_index=current_frame_index,
+                                usable=bool(row.get("usable")),
+                                inference_input=row.get("inference_input"),
+                            )
+                        )
+                    frame_index = current_frame_index + 1
     finally:
         source_capture.release()
         mask_capture.release()

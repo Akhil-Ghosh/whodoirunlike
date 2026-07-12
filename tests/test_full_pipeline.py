@@ -698,6 +698,7 @@ def test_densepose_runtime_kwargs_resolve_env_paths(monkeypatch: pytest.MonkeyPa
     monkeypatch.setenv("DENSEPOSE_TARGET_CROP_ENABLED", "true")
     monkeypatch.setenv("DENSEPOSE_TARGET_CROP_PADDING_RATIO", "0.25")
     monkeypatch.setenv("DENSEPOSE_TARGET_CROP_PADDING_PIXELS", "24")
+    monkeypatch.setenv("DENSEPOSE_BATCH_SIZE", "4")
 
     kwargs = full_pipeline._densepose_runtime_kwargs()
 
@@ -710,7 +711,21 @@ def test_densepose_runtime_kwargs_resolve_env_paths(monkeypatch: pytest.MonkeyPa
         "target_crop_enabled": True,
         "target_crop_padding_ratio": 0.25,
         "target_crop_padding_pixels": 24,
+        "batch_size": 4,
     }
+
+
+def test_densepose_batch_size_defaults_off_and_is_bounded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("DENSEPOSE_BATCH_SIZE", raising=False)
+    assert full_pipeline._densepose_runtime_kwargs()["batch_size"] == 1
+
+    monkeypatch.setenv("DENSEPOSE_BATCH_SIZE", "0")
+    assert full_pipeline._densepose_runtime_kwargs()["batch_size"] == 1
+
+    monkeypatch.setenv("DENSEPOSE_BATCH_SIZE", "99")
+    assert full_pipeline._densepose_runtime_kwargs()["batch_size"] == 8
 
 
 def test_full_pipeline_passes_densepose_runtime_and_stops_on_densepose_failure(
@@ -825,6 +840,7 @@ def test_full_pipeline_emits_canonical_stage_and_subspan_timeline(
     monkeypatch.setenv("MMPOSE_DEVICE", "cuda")
     monkeypatch.setenv("RTMW_RUNTIME_BACKEND", "onnxruntime")
     monkeypatch.setenv("MMPOSE_USE_DETECTOR", "false")
+    monkeypatch.setenv("DENSEPOSE_BATCH_SIZE", "4")
     current = [10.0]
 
     def clock() -> float:
@@ -937,6 +953,13 @@ def test_full_pipeline_emits_canonical_stage_and_subspan_timeline(
     assert pose_span["runtime"]["device"] == "cuda"
     assert pose_span["runtime"]["runtime_backend"] == "onnxruntime"
     assert pose_span["runtime"]["use_detector"] is False
+    densepose_span = next(
+        event
+        for event in events
+        if event["event_type"] == "span_started" and event["stage"] == "densepose_body_map"
+    )
+    assert densepose_span["runtime"]["batch_size"] == 4
+    assert densepose_span["runtime"]["batched_inference_enabled"] is True
     target_complete = next(
         event
         for event in events

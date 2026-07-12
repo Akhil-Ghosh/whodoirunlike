@@ -11,6 +11,7 @@ from typing import Any
 
 import cv2
 import numpy as np
+import pytest
 
 from whodoirunlike import densepose_runner
 from whodoirunlike.densepose_runner import (
@@ -106,6 +107,85 @@ class _FakeChartResult:
             dtype=np.float32,
         )
     )
+
+
+class _BatchModelTensor:
+    def __init__(self, value: np.ndarray) -> None:
+        self.value = value
+        self.devices: list[str] = []
+
+    def to(self, device: str) -> _BatchModelTensor:
+        self.devices.append(device)
+        return self
+
+
+class _NoGrad:
+    def __enter__(self) -> None:
+        return None
+
+    def __exit__(self, *_args: object) -> None:
+        return None
+
+
+class _BatchAugmentation:
+    def __init__(self) -> None:
+        self.seen: list[np.ndarray] = []
+
+    def get_transform(self, image: np.ndarray) -> Any:
+        self.seen.append(image.copy())
+        return SimpleNamespace(apply_image=lambda source: source.copy())
+
+
+class _BatchInstances:
+    def __init__(
+        self,
+        *,
+        box: list[float],
+        score: float,
+        chart_result: Any | None = None,
+    ) -> None:
+        self.pred_boxes = SimpleNamespace(tensor=_FakeTensor(np.asarray([box], dtype=np.float32)))
+        self.scores = _FakeTensor(np.asarray([score], dtype=np.float32))
+        self.pred_densepose = object() if chart_result is not None else None
+        self.chart_result = chart_result
+
+    def __len__(self) -> int:
+        return 1
+
+    def to(self, device: str) -> _BatchInstances:
+        assert device == "cpu"
+        return self
+
+    def has(self, name: str) -> bool:
+        return name == "pred_boxes"
+
+
+class _BatchPredictor:
+    def __init__(self, outputs: list[dict[str, Any]]) -> None:
+        self.input_format = "BGR"
+        self.aug = _BatchAugmentation()
+        self.cfg = SimpleNamespace(MODEL=SimpleNamespace(DEVICE="cuda"))
+        self.outputs = outputs
+        self.model_calls: list[list[dict[str, Any]]] = []
+
+    def model(self, batched_inputs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        self.model_calls.append(batched_inputs)
+        return self.outputs
+
+
+def _install_fake_torch(monkeypatch: Any) -> list[_BatchModelTensor]:
+    tensors: list[_BatchModelTensor] = []
+    torch_module = ModuleType("torch")
+
+    def as_tensor(value: np.ndarray) -> _BatchModelTensor:
+        tensor = _BatchModelTensor(value)
+        tensors.append(tensor)
+        return tensor
+
+    torch_module.as_tensor = as_tensor  # type: ignore[attr-defined]
+    torch_module.no_grad = _NoGrad  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "torch", torch_module)
+    return tensors
 
 
 def test_summarize_chart_result_keeps_compact_part_and_uv_stats() -> None:
@@ -396,6 +476,156 @@ def test_apply_densepose_default_still_infers_on_full_masked_frame() -> None:
     }
 
 
+def test_batched_densepose_preserves_variable_crop_order_rows_and_labels(
+    monkeypatch: Any,
+) -> None:
+    tensors = _install_fake_torch(monkeypatch)
+    first_chart = SimpleNamespace(
+        labels=_FakeTensor(np.asarray([[1, 0], [0, 1]], dtype=np.uint8)),
+        uv=_FakeTensor(np.zeros((2, 2, 2), dtype=np.float32)),
+    )
+    second_chart = SimpleNamespace(
+        labels=_FakeTensor(np.asarray([[2, 2], [0, 0]], dtype=np.uint8)),
+        uv=_FakeTensor(np.zeros((2, 2, 2), dtype=np.float32)),
+    )
+    predictor = _BatchPredictor(
+        [
+            {
+                "instances": _BatchInstances(
+                    box=[10, 10, 70, 50],
+                    score=0.91,
+                    chart_result=first_chart,
+                )
+            },
+            {
+                "instances": _BatchInstances(
+                    box=[10, 10, 40, 50],
+                    score=0.82,
+                    chart_result=second_chart,
+                )
+            },
+        ]
+    )
+    monkeypatch.setattr(
+        densepose_runner,
+        "_chart_result_for_instance",
+        lambda instances, _index: instances.chart_result,
+    )
+
+    first_frame = np.full((100, 200, 3), 11, dtype=np.uint8)
+    first_mask = np.zeros((100, 200), dtype=np.uint8)
+    first_mask[30:70, 60:120] = 255
+    empty_frame = np.full((40, 60, 3), 99, dtype=np.uint8)
+    empty_mask = np.zeros((40, 60), dtype=np.uint8)
+    second_frame = np.full((80, 120, 3), 22, dtype=np.uint8)
+    second_mask = np.zeros((80, 120), dtype=np.uint8)
+    second_mask[10:50, 20:50] = 255
+
+    outputs = densepose_runner.apply_densepose_to_frames_batched(
+        [first_frame, empty_frame, second_frame],
+        [first_mask, empty_mask, second_mask],
+        DensePoseBackend(predictor=predictor),
+        frame_indices=[17, 9, 3],
+        target_crop_enabled=True,
+        target_crop_padding_ratio=0.0,
+        target_crop_padding_pixels=10,
+    )
+
+    assert len(predictor.model_calls) == 1
+    model_inputs = predictor.model_calls[0]
+    assert [(item["height"], item["width"]) for item in model_inputs] == [
+        (60, 80),
+        (60, 50),
+    ]
+    assert [tensor.value.shape for tensor in tensors] == [(3, 60, 80), (3, 60, 50)]
+    assert [float(tensor.value.max()) for tensor in tensors] == [11.0, 22.0]
+    assert [tensor.devices for tensor in tensors] == [["cuda"], ["cuda"]]
+    assert [image.shape for image in predictor.aug.seen] == [(60, 80, 3), (60, 50, 3)]
+    assert [output.row["drop_reason"] for output in outputs] == [
+        None,
+        "runner_mask_empty",
+        None,
+    ]
+    assert outputs[0].row["bbox"] == [60, 30, 60, 40]
+    assert outputs[0].row["score"] == 0.91
+    assert outputs[0].row["mask_overlap"] == 1.0
+    assert outputs[0].row["inference_input"]["crop_bbox"] == [50, 20, 80, 60]
+    assert np.array_equal(outputs[0].labels, first_chart.labels.value)
+    assert outputs[2].row["bbox"] == [20, 10, 30, 40]
+    assert outputs[2].row["score"] == 0.82
+    assert outputs[2].row["mask_overlap"] == 1.0
+    assert outputs[2].row["inference_input"]["crop_bbox"] == [10, 0, 50, 60]
+    assert np.array_equal(outputs[2].labels, second_chart.labels.value)
+
+
+def test_batched_densepose_size_one_uses_identical_single_frame_path() -> None:
+    instances = _BatchInstances(box=[10, 8, 30, 28], score=0.9)
+
+    class SinglePathPredictor:
+        def __init__(self) -> None:
+            self.calls = 0
+            self.model_calls = 0
+
+        def __call__(self, _image: np.ndarray) -> dict[str, Any]:
+            self.calls += 1
+            return {"instances": instances}
+
+        def model(self, _inputs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+            self.model_calls += 1
+            raise AssertionError("batch model path must not run for one frame")
+
+    predictor = SinglePathPredictor()
+    backend = DensePoseBackend(predictor=predictor)
+    frame = np.full((40, 60, 3), 100, dtype=np.uint8)
+    mask = np.zeros((40, 60), dtype=np.uint8)
+    mask[5:35, 5:35] = 255
+
+    direct = densepose_runner.apply_densepose_to_frame(
+        frame,
+        mask,
+        backend,
+        frame_index=4,
+    )
+    batched = densepose_runner.apply_densepose_to_frames_batched(
+        [frame],
+        [mask],
+        backend,
+        frame_indices=[4],
+    )[0]
+
+    assert batched.row == direct.row
+    assert np.array_equal(batched.labels, direct.labels)
+    assert predictor.calls == 2
+    assert predictor.model_calls == 0
+
+
+def test_batched_densepose_propagates_model_failure_and_releases_lock(
+    monkeypatch: Any,
+) -> None:
+    _install_fake_torch(monkeypatch)
+
+    class FailingPredictor(_BatchPredictor):
+        def model(self, batched_inputs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+            self.model_calls.append(batched_inputs)
+            raise RuntimeError("batch failed")
+
+    predictor = FailingPredictor([])
+    backend = DensePoseBackend(predictor=predictor)
+    frame = np.full((32, 48, 3), 100, dtype=np.uint8)
+    mask = np.ones((32, 48), dtype=np.uint8) * 255
+
+    with pytest.raises(RuntimeError, match="batch failed"):
+        densepose_runner.apply_densepose_to_frames_batched(
+            [frame, frame],
+            [mask, mask],
+            backend,
+            frame_indices=[0, 1],
+        )
+
+    assert backend.inference_lock.acquire(blocking=False)
+    backend.inference_lock.release()
+
+
 def test_run_densepose_exposes_effective_resize_and_crop_measurements(
     tmp_path: Path,
     monkeypatch: Any,
@@ -464,6 +694,8 @@ def test_run_densepose_exposes_effective_resize_and_crop_measurements(
         "target_crop_padding_pixels": 12,
         "input_min_size_test": 512,
         "input_max_size_test": 768,
+        "batch_size": 1,
+        "batched_inference_enabled": False,
     }
     row = _read_jsonl(run_dir / "densepose.jsonl")[0]
     assert row["inference_input"]["width"] == 40
@@ -474,6 +706,87 @@ def test_run_densepose_exposes_effective_resize_and_crop_measurements(
     assert manifest["stages"]["densepose"]["inference_settings"] == result[
         "inference_settings"
     ]
+
+
+def test_run_densepose_microbatches_and_reassembles_rows_and_qa_in_frame_order(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    run_dir = _make_run_dir(tmp_path, frame_count=5)
+    batch_calls: list[list[int]] = []
+    overlay_calls: list[tuple[int, int]] = []
+
+    monkeypatch.setattr(
+        densepose_runner,
+        "load_densepose_backend",
+        lambda **_: DensePoseBackend(
+            predictor=object(),
+            input_min_size_test=512,
+            input_max_size_test=768,
+        ),
+    )
+
+    def apply_batch(
+        frames: list[np.ndarray],
+        masks: list[np.ndarray],
+        _backend: DensePoseBackend,
+        *,
+        frame_indices: list[int],
+        **_kwargs: Any,
+    ) -> list[DensePoseFrameOutput]:
+        assert len(frames) == len(masks) == len(frame_indices)
+        batch_calls.append(list(frame_indices))
+        return [
+            DensePoseFrameOutput(
+                row={
+                    "usable": True,
+                    "score": frame_index,
+                    "bbox": [12, 8, 18, 16],
+                    "drop_reason": None,
+                    "inference_input": {
+                        "target_crop_enabled": True,
+                        "crop_bbox": [4, 2, 40, 28],
+                        "width": 40,
+                        "height": 28,
+                    },
+                },
+                labels=np.full((2, 2), frame_index + 1, dtype=np.uint8),
+            )
+            for frame_index in frame_indices
+        ]
+
+    def draw_overlay(
+        frame: np.ndarray,
+        _mask: np.ndarray,
+        row: dict[str, Any],
+        *,
+        labels: np.ndarray | None = None,
+    ) -> np.ndarray:
+        assert labels is not None
+        overlay_calls.append((int(row["score"]), int(labels[0, 0])))
+        return frame
+
+    monkeypatch.setattr(densepose_runner, "apply_densepose_to_frames_batched", apply_batch)
+    monkeypatch.setattr(densepose_runner, "_draw_densepose_overlay", draw_overlay)
+    monkeypatch.setattr(densepose_runner, "make_browser_playable_mp4", lambda _path: None)
+
+    result = run_densepose(
+        run_dir=run_dir,
+        config_path=Path("cfg.yaml"),
+        weights_path="weights.pkl",
+        batch_size=3,
+        target_crop_enabled=True,
+    )
+
+    assert batch_calls == [[0, 1, 2], [3, 4]]
+    assert overlay_calls == [(0, 1), (1, 2), (2, 3), (3, 4), (4, 5)]
+    rows = _read_jsonl(run_dir / "densepose.jsonl")
+    assert [row["frame_index"] for row in rows] == [0, 1, 2, 3, 4]
+    assert [row["score"] for row in rows] == [0, 1, 2, 3, 4]
+    assert result["inference_settings"]["batch_size"] == 3
+    assert result["inference_settings"]["batched_inference_enabled"] is True
+    manifest = json.loads((run_dir / "cv_run_manifest.json").read_text(encoding="utf-8"))
+    assert manifest["stages"]["densepose"]["inference_settings"] == result["inference_settings"]
 
 
 def test_run_densepose_writes_compact_rows_and_updates_manifest(tmp_path: Path, monkeypatch: Any) -> None:

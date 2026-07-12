@@ -25,6 +25,10 @@ DEPENDENCY_TREE_ROOTS = {
 }
 IGNORED_TREE_PARTS = {".git", "__pycache__"}
 MODEL_ASSETS = {
+    "/opt/densepose-weights/model_final_162be9.pkl": {
+        "size": 255_757_821,
+        "sha256": "b8a7382001b16e453bad95ca9dbc68ae8f2b839b304cf90eaf5c27fbdb4dae91",
+    },
     (
         "/opt/rtmlib-cache/hub/checkpoints/"
         "yolox_m_8xb8-300e_humanart-c2c7a14a.onnx"
@@ -59,6 +63,7 @@ EXPECTED_ENVIRONMENT = {
     "WHODOIRUNLIKE_SKIP_DENSEPOSE": "false",
     "MMPOSE_DEVICE": "cpu",
     "RTMW_RUNTIME_BACKEND": "onnxruntime",
+    "DENSEPOSE_WEIGHTS": "/opt/densepose-weights/model_final_162be9.pkl",
     "DENSEPOSE_DEVICE": "cuda",
 }
 FORBIDDEN_ENVIRONMENT = (

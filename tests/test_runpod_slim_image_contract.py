@@ -10,6 +10,8 @@ CONTRACT_SCRIPT = ROOT / "scripts/runpod_runtime_contract.py"
 WORKFLOW = ROOT / ".github/workflows/build-runpod-slim-lab.yml"
 DONOR_DIGEST = "sha256:47d776f83ae3e2e1c7f1fa935b0019a9abd82a324ada4ab3d98746b3d75216fc"
 RUNTIME_DIGEST = "sha256:9175fa92f96de35a8cfb9493f0dfcf9435c7a597e9d95ad41d2cae382a95e3f9"
+DENSEPOSE_WEIGHTS_PATH = "/opt/densepose-weights/model_final_162be9.pkl"
+DENSEPOSE_WEIGHTS_SHA256 = "b8a7382001b16e453bad95ca9dbc68ae8f2b839b304cf90eaf5c27fbdb4dae91"
 
 
 def _text(path: Path) -> str:
@@ -44,6 +46,7 @@ def test_slim_image_copies_dependencies_but_not_donor_application() -> None:
         "/opt/detectron2/ /opt/detectron2/",
         "/opt/sam3/ /opt/sam3/",
         "/opt/rtmlib-cache/ /opt/rtmlib-cache/",
+        "/opt/densepose-weights/ /opt/densepose-weights/",
         "COPY pyproject.toml README.md ./",
         "COPY src ./src",
         "COPY site/public/assets/demos ./site/public/assets/demos",
@@ -64,6 +67,13 @@ def test_slim_image_preserves_quality_environment_without_override_knobs() -> No
     assert "MMPOSE_DEVICE=cpu" in dockerfile
     assert "RTMW_RUNTIME_BACKEND=onnxruntime" in dockerfile
     assert "DENSEPOSE_DEVICE=cuda" in dockerfile
+    assert f"DENSEPOSE_WEIGHTS={DENSEPOSE_WEIGHTS_PATH}" in dockerfile
+    assert (
+        f"ADD --checksum=sha256:{DENSEPOSE_WEIGHTS_SHA256} "
+        "https://dl.fbaipublicfiles.com/densepose/"
+        "densepose_rcnn_R_50_FPN_s1x/165712039/model_final_162be9.pkl "
+        f"{DENSEPOSE_WEIGHTS_PATH}"
+    ) in dockerfile
     for required in (
         "WHODOIRUNLIKE_SAM31_GPU_EXACT_CV2_LOADER=true",
         "WHODOIRUNLIKE_SAM31_GPU_EXACT_CV2_CHUNK_FRAMES=8",
@@ -113,6 +123,11 @@ def test_slim_final_stage_has_runtime_libraries_without_build_toolchain() -> Non
 
 def test_contract_detects_dependency_and_application_drift() -> None:
     contract = _load_contract_module()
+    assert contract.MODEL_ASSETS[DENSEPOSE_WEIGHTS_PATH] == {
+        "size": 255_757_821,
+        "sha256": DENSEPOSE_WEIGHTS_SHA256,
+    }
+    assert contract.EXPECTED_ENVIRONMENT["DENSEPOSE_WEIGHTS"] == DENSEPOSE_WEIGHTS_PATH
     baseline = {
         "schema": 2,
         "platform": {"python_major_minor": "3.12"},

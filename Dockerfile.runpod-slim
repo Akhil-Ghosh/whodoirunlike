@@ -8,6 +8,8 @@ FROM --platform=linux/amd64 ${DEPENDENCY_IMAGE} AS dependency-runtime
 
 COPY scripts/runpod_runtime_contract.py /opt/whodoirunlike/runtime-contract.py
 
+ADD --checksum=sha256:b8a7382001b16e453bad95ca9dbc68ae8f2b839b304cf90eaf5c27fbdb4dae91 https://dl.fbaipublicfiles.com/densepose/densepose_rcnn_R_50_FPN_s1x/165712039/model_final_162be9.pkl /opt/densepose-weights/model_final_162be9.pkl
+
 RUN mkdir -p /opt/whodoirunlike-provenance \
     && git -C /opt/detectron2 rev-parse HEAD \
         > /opt/whodoirunlike-provenance/detectron2.revision \
@@ -47,7 +49,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     MMPOSE_DEVICE=cpu \
     RTMW_RUNTIME_BACKEND=onnxruntime \
     DENSEPOSE_CONFIG=/opt/detectron2/projects/DensePose/configs/densepose_rcnn_R_50_FPN_s1x.yaml \
-    DENSEPOSE_WEIGHTS=https://dl.fbaipublicfiles.com/densepose/densepose_rcnn_R_50_FPN_s1x/165712039/model_final_162be9.pkl \
+    DENSEPOSE_WEIGHTS=/opt/densepose-weights/model_final_162be9.pkl \
     DENSEPOSE_DEVICE=cuda
 
 WORKDIR /app
@@ -77,6 +79,7 @@ COPY --from=dependency-runtime /usr/lib/python3/dist-packages/ /usr/lib/python3/
 COPY --from=dependency-runtime /opt/detectron2/ /opt/detectron2/
 COPY --from=dependency-runtime /opt/sam3/ /opt/sam3/
 COPY --from=dependency-runtime /opt/rtmlib-cache/ /opt/rtmlib-cache/
+COPY --from=dependency-runtime /opt/densepose-weights/ /opt/densepose-weights/
 COPY --from=dependency-runtime /opt/whodoirunlike-provenance/ /opt/whodoirunlike-provenance/
 COPY --from=dependency-runtime /opt/whodoirunlike/donor-dependencies.json /opt/whodoirunlike/donor-dependencies.json
 

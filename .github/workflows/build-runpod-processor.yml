@@ -17,13 +17,34 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - role: candidate
-            dockerfile: Dockerfile.runpod.benchmark
-          - role: control
-            dockerfile: Dockerfile.runpod.benchmark.control
+          - role: schedule-only
+            dockerfile: Dockerfile.runpod.benchmark.schedule-only
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Materialize exact candidate source
+        run: |
+          mkdir -p .schedule-only-source
+          git archive 657d36588f3ca073554bfd40071ff747e0e750bb src/whodoirunlike \
+            | tar -x -C .schedule-only-source
+          python - <<'PY'
+          import hashlib
+          from pathlib import Path
+          import runpy
+
+          contract = runpy.run_path("src/whodoirunlike/sam31_parity.py")[
+              "NON_OVERLAY_PRODUCTION_SHA256"
+          ]["schedule_only"]
+          source = Path(".schedule-only-source/src/whodoirunlike")
+          observed = {
+              name: hashlib.sha256((source / name).read_bytes()).hexdigest()
+              for name in contract
+          }
+          assert observed == dict(contract), (observed, dict(contract))
+          PY
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3

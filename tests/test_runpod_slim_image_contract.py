@@ -76,12 +76,7 @@ def test_slim_image_copies_every_runtime_and_model_contract() -> None:
     text = _text(SLIM_DOCKERFILE)
     required_copies = {
         "/usr/local/bin/ /usr/local/bin/",
-        "/usr/local/lib/python3.12/dist-packages/torch*",
-        "/usr/local/lib/python3.12/dist-packages/triton*",
-        "/usr/local/lib/python3.12/dist-packages/nvidia/cudnn/",
-        "/usr/local/lib/python3.12/dist-packages/nvidia/cusparselt/",
-        "/usr/local/lib/python3.12/dist-packages/nvidia/nvshmem/",
-        "/usr/local/lib/python3.12/dist-packages/nvidia_*.dist-info",
+        "/usr/local/lib/python3.12/ /usr/local/lib/python3.12/",
         "/app/ /app/",
         "/opt/detectron2/ /opt/detectron2/",
         "/opt/sam3/ /opt/sam3/",
@@ -90,8 +85,8 @@ def test_slim_image_copies_every_runtime_and_model_contract() -> None:
     }
 
     assert all(copy in text for copy in required_copies)
-    assert "/usr/local/lib/python3.12/ /usr/local/lib/python3.12/" not in text
-    assert "[!" not in text
+    assert "dist-packages/[" not in text
+    assert "dist-packages/*" not in text
     assert "rm -rf /opt/detectron2/.git /opt/sam3/.git" in text
     assert "runtime-contract.py" in text
     assert "--verify" in text

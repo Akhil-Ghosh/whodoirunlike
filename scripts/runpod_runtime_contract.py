@@ -53,6 +53,11 @@ EXPECTED_REVISIONS = {
 EXPECTED_DISTRIBUTION_FINGERPRINT = (
     "875c0ab9cdf529cb8fef26e117c95c212544d5f8e5fc61b1b8326c462a380615"
 )
+EXPECTED_TREE_FINGERPRINTS = {
+    "app": "cb1321f756974b3b2f2c59c4cea9fbbb68c81aaeb38abf4cce770016e9fc085a",
+    "detectron2": "eb6f3c496af0f85faae1b9e63d8aed8c7f7657b385c9fc966c1bcc42a06698ee",
+    "sam3": "1b3a2309e831f5cf45689dcc613a47282a82f9de5060a78f8c0b2b73226aa133",
+}
 TREE_ROOTS = {
     "app": Path("/app"),
     "detectron2": Path("/opt/detectron2"),
@@ -240,6 +245,14 @@ def verify_snapshot(snapshot: dict[str, Any]) -> list[str]:
             "installed distribution set changed: expected "
             f"{EXPECTED_DISTRIBUTION_FINGERPRINT}, got "
             f"{snapshot['distribution_fingerprint']}"
+        )
+    actual_tree_fingerprints = {
+        name: details.get("sha256") for name, details in snapshot["trees"].items()
+    }
+    if actual_tree_fingerprints != EXPECTED_TREE_FINGERPRINTS:
+        errors.append(
+            "runtime source trees changed: expected "
+            f"{EXPECTED_TREE_FINGERPRINTS}, got {actual_tree_fingerprints}"
         )
     for name, expected in EXPECTED_DISTRIBUTIONS.items():
         actual = snapshot["critical_distributions"].get(name)

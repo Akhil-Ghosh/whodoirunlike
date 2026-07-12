@@ -53,39 +53,7 @@ RUN export DEBIAN_FRONTEND=noninteractive \
 # distro Python 3.12 interpreter provides the same CPython ABI without carrying
 # the candidate's CUDA devel toolchain into the final image.
 COPY --from=candidate-runtime /usr/local/bin/ /usr/local/bin/
-
-# Keep each compressed layer bounded. A single 9 GB COPY requires enough
-# scratch space for the entire uncompressed tree plus its compressed diff.
-COPY --from=candidate-runtime /usr/local/lib/python3.12/dist-packages/[0-9A-Fa-f_]* /usr/local/lib/python3.12/dist-packages/
-COPY --from=candidate-runtime /usr/local/lib/python3.12/dist-packages/[G-Mg-m]* /usr/local/lib/python3.12/dist-packages/
-COPY --from=candidate-runtime /usr/local/lib/python3.12/dist-packages/[Nn][^Vv]* /usr/local/lib/python3.12/dist-packages/
-COPY --from=candidate-runtime /usr/local/lib/python3.12/dist-packages/[Oo]* /usr/local/lib/python3.12/dist-packages/
-COPY --from=candidate-runtime /usr/local/lib/python3.12/dist-packages/[P-Sp-s]* /usr/local/lib/python3.12/dist-packages/
-COPY --from=candidate-runtime /usr/local/lib/python3.12/dist-packages/torch* /usr/local/lib/python3.12/dist-packages/
-COPY --from=candidate-runtime /usr/local/lib/python3.12/dist-packages/triton* /usr/local/lib/python3.12/dist-packages/
-COPY --from=candidate-runtime /usr/local/lib/python3.12/dist-packages/[Tt][^OoRr]* /usr/local/lib/python3.12/dist-packages/
-COPY --from=candidate-runtime /usr/local/lib/python3.12/dist-packages/[Tt][Oo]* /usr/local/lib/python3.12/dist-packages/
-COPY --from=candidate-runtime /usr/local/lib/python3.12/dist-packages/[Tt][Rr][^Ii]* /usr/local/lib/python3.12/dist-packages/
-COPY --from=candidate-runtime /usr/local/lib/python3.12/dist-packages/[U-Zu-z]* /usr/local/lib/python3.12/dist-packages/
-
-COPY --from=candidate-runtime /usr/local/lib/python3.12/dist-packages/nvidia/__init__.py /usr/local/lib/python3.12/dist-packages/nvidia/__init__.py
-COPY --from=candidate-runtime /usr/local/lib/python3.12/dist-packages/nvidia/cublas/ /usr/local/lib/python3.12/dist-packages/nvidia/cublas/
-COPY --from=candidate-runtime /usr/local/lib/python3.12/dist-packages/nvidia/cuda_cupti/ /usr/local/lib/python3.12/dist-packages/nvidia/cuda_cupti/
-COPY --from=candidate-runtime /usr/local/lib/python3.12/dist-packages/nvidia/cuda_nvrtc/ /usr/local/lib/python3.12/dist-packages/nvidia/cuda_nvrtc/
-COPY --from=candidate-runtime /usr/local/lib/python3.12/dist-packages/nvidia/cuda_runtime/ /usr/local/lib/python3.12/dist-packages/nvidia/cuda_runtime/
-COPY --from=candidate-runtime /usr/local/lib/python3.12/dist-packages/nvidia/cudnn/ /usr/local/lib/python3.12/dist-packages/nvidia/cudnn/
-COPY --from=candidate-runtime /usr/local/lib/python3.12/dist-packages/nvidia/cufft/ /usr/local/lib/python3.12/dist-packages/nvidia/cufft/
-COPY --from=candidate-runtime /usr/local/lib/python3.12/dist-packages/nvidia/cufile/ /usr/local/lib/python3.12/dist-packages/nvidia/cufile/
-COPY --from=candidate-runtime /usr/local/lib/python3.12/dist-packages/nvidia/curand/ /usr/local/lib/python3.12/dist-packages/nvidia/curand/
-COPY --from=candidate-runtime /usr/local/lib/python3.12/dist-packages/nvidia/cusolver/ /usr/local/lib/python3.12/dist-packages/nvidia/cusolver/
-COPY --from=candidate-runtime /usr/local/lib/python3.12/dist-packages/nvidia/cusparse/ /usr/local/lib/python3.12/dist-packages/nvidia/cusparse/
-COPY --from=candidate-runtime /usr/local/lib/python3.12/dist-packages/nvidia/cusparselt/ /usr/local/lib/python3.12/dist-packages/nvidia/cusparselt/
-COPY --from=candidate-runtime /usr/local/lib/python3.12/dist-packages/nvidia/nccl/ /usr/local/lib/python3.12/dist-packages/nvidia/nccl/
-COPY --from=candidate-runtime /usr/local/lib/python3.12/dist-packages/nvidia/nvjitlink/ /usr/local/lib/python3.12/dist-packages/nvidia/nvjitlink/
-COPY --from=candidate-runtime /usr/local/lib/python3.12/dist-packages/nvidia/nvshmem/ /usr/local/lib/python3.12/dist-packages/nvidia/nvshmem/
-COPY --from=candidate-runtime /usr/local/lib/python3.12/dist-packages/nvidia/nvtx/ /usr/local/lib/python3.12/dist-packages/nvidia/nvtx/
-COPY --from=candidate-runtime /usr/local/lib/python3.12/dist-packages/nvidia_*.dist-info /usr/local/lib/python3.12/dist-packages/
-
+COPY --from=candidate-runtime /usr/local/lib/python3.12/ /usr/local/lib/python3.12/
 COPY --from=candidate-runtime /app/ /app/
 COPY --from=candidate-runtime /opt/detectron2/ /opt/detectron2/
 COPY --from=candidate-runtime /opt/sam3/ /opt/sam3/

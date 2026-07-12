@@ -1,0 +1,23 @@
+ARG BASE_IMAGE=ghcr.io/akhil-ghosh/whodoirunlike-runpod-processor@sha256:47d776f83ae3e2e1c7f1fa935b0019a9abd82a324ada4ab3d98746b3d75216fc
+FROM ${BASE_IMAGE}
+
+ARG WHODOIRUNLIKE_PROCESSOR_VERSION=unknown
+
+ENV WHODOIRUNLIKE_PROCESSOR_VERSION=${WHODOIRUNLIKE_PROCESSOR_VERSION} \
+    WHODOIRUNLIKE_SAM31_GPU_EXACT_CV2_LOADER=true \
+    WHODOIRUNLIKE_SAM31_GPU_EXACT_CV2_CHUNK_FRAMES=8 \
+    WHODOIRUNLIKE_SAM31_GPU_EXACT_CV2_MAX_FRAMES=600 \
+    WHODOIRUNLIKE_SAM31_GPU_EXACT_CV2_MAX_DESTINATION_BYTES=8589934592 \
+    WHODOIRUNLIKE_PROCESSOR_CONCURRENCY=1 \
+    WHODOIRUNLIKE_PARALLEL_MASK_PRESENTATION=true \
+    WHODOIRUNLIKE_PARALLEL_POSE_DENSEPOSE=true \
+    WHODOIRUNLIKE_PARALLEL_POST_FUSION=true \
+    WHODOIRUNLIKE_PARALLEL_ARTIFACT_PUBLISH=true
+
+WORKDIR /app
+
+# Keep the exact dependency/model runtime already serving traffic. Only the
+# reviewed application package is replaced by this release checkout.
+COPY src/whodoirunlike/ /app/src/whodoirunlike/
+
+CMD ["python", "-m", "whodoirunlike.runpod_serverless"]

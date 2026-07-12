@@ -1,7 +1,12 @@
 from __future__ import annotations
 
 import json
+import sys
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from types import ModuleType
 
 import cv2
 import numpy as np
@@ -14,6 +19,48 @@ from whodoirunlike.identity_runner import (
     prompt_initial_box,
     run_identity_tracking,
 )
+
+
+def test_yolo11_model_cache_reuses_and_serializes_mutable_predictor(monkeypatch) -> None:
+    state_lock = threading.Lock()
+    active = 0
+    peak = 0
+    builds = 0
+    fake_ultralytics = ModuleType("ultralytics")
+
+    class Model:
+        task = "detect"
+
+        def predict(self, *_args: object, **_kwargs: object) -> list[object]:
+            nonlocal active, peak
+            with state_lock:
+                active += 1
+                peak = max(peak, active)
+            time.sleep(0.02)
+            with state_lock:
+                active -= 1
+            return []
+
+    def yolo(_model: str) -> Model:
+        nonlocal builds
+        builds += 1
+        return Model()
+
+    fake_ultralytics.YOLO = yolo  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "ultralytics", fake_ultralytics)
+    identity_runner.clear_yolo_model_cache()
+    try:
+        first = identity_runner._load_yolo_model("yolo11n.pt")
+        second = identity_runner._load_yolo_model("yolo11n.pt")
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            list(executor.map(lambda _: first.predict(np.zeros((8, 8, 3))), range(2)))
+    finally:
+        identity_runner.clear_yolo_model_cache()
+
+    assert first is second
+    assert builds == 1
+    assert peak == 1
+    assert first.task == "detect"
 
 
 def write_identity_video(path: Path) -> None:

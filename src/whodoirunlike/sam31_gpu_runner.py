@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 import os
+import sys
 import threading
 import time
 from pathlib import Path
@@ -12,11 +13,21 @@ import numpy as np
 from whodoirunlike.cv_flow import utc_now_iso
 from whodoirunlike.mask_artifacts import write_masks_jsonl_from_video
 from whodoirunlike.running_clip_run import RunningClipRun
+from whodoirunlike.sam31_cv2_loader import scoped_sam31_exact_cv2_loader
+from whodoirunlike.sam31_loader_config import (
+    DEFAULT_SAM31_EXACT_CV2_CHUNK_FRAMES,
+    DEFAULT_SAM31_EXACT_CV2_MAX_DESTINATION_BYTES,
+    DEFAULT_SAM31_EXACT_CV2_MAX_FRAMES,
+    REQUIRED_SAM31_EXACT_CV2_CONCURRENCY,
+    sam31_exact_cv2_loader_settings,
+)
 from whodoirunlike.sam2_runner import (
     extract_video_frames,
     inspect_video,
     load_prompt,
+    write_mask_presentation_outputs,
     write_mask_outputs,
+    write_runner_mask_data_outputs,
 )
 
 
@@ -524,15 +535,43 @@ def _collect_sam31_masks(
     track_boxes: dict[int, np.ndarray] | None = None,
     progress_callback: Callable[[int, int, str], None] | None = None,
     preseed_track_anchors: bool = True,
+    exact_cv2_loader_enabled: bool = False,
+    exact_cv2_chunk_frames: int = DEFAULT_SAM31_EXACT_CV2_CHUNK_FRAMES,
+    exact_cv2_max_frames: int = DEFAULT_SAM31_EXACT_CV2_MAX_FRAMES,
+    exact_cv2_max_destination_bytes: int = DEFAULT_SAM31_EXACT_CV2_MAX_DESTINATION_BYTES,
 ) -> tuple[dict[int, np.ndarray], dict[str, Any]]:
     import torch
 
-    response = predictor.handle_request(
-        request={
-            "type": "start_session",
-            "resource_path": str(video_path),
-        }
+    phase_timings = {
+        "start_session_seconds": 0.0,
+        "box_prompt_seconds": 0.0,
+        "point_prompt_seconds": 0.0,
+        "initial_prompt_seconds": 0.0,
+        "preseed_anchors_seconds": 0.0,
+        "propagation_seconds": 0.0,
+        "close_session_seconds": 0.0,
+    }
+    tracking_model = getattr(predictor, "model", None)
+    tracking_module = (
+        sys.modules.get(type(tracking_model).__module__)
+        if tracking_model is not None
+        else None
     )
+    phase_started_at = time.perf_counter()
+    with scoped_sam31_exact_cv2_loader(
+        tracking_module=tracking_module,
+        enabled=exact_cv2_loader_enabled,
+        chunk_frames=exact_cv2_chunk_frames,
+        max_frames=exact_cv2_max_frames,
+        max_destination_bytes=exact_cv2_max_destination_bytes,
+    ) as loader_probe:
+        response = predictor.handle_request(
+            request={
+                "type": "start_session",
+                "resource_path": str(video_path),
+            }
+        )
+    phase_timings["start_session_seconds"] = time.perf_counter() - phase_started_at
     session_id = response["session_id"]
     masks_by_frame: dict[int, np.ndarray] = {}
     diagnostics: dict[str, Any] = {
@@ -541,6 +580,21 @@ def _collect_sam31_masks(
         "visual_box_prompt": False,
         "propagation": [],
         "preseed_track_anchors": preseed_track_anchors,
+        "input_loader": {
+            "mode": "exact_cv2" if exact_cv2_loader_enabled else "upstream",
+            "enabled": bool(exact_cv2_loader_enabled),
+            "attempted": bool(loader_probe.attempted),
+            "used": bool(loader_probe.used),
+            "chunk_frames": max(1, int(exact_cv2_chunk_frames)),
+            "max_frames": max(1, int(exact_cv2_max_frames)),
+            "max_destination_bytes": max(1, int(exact_cv2_max_destination_bytes)),
+            "fallback_reason": loader_probe.fallback_reason,
+            "diagnostics": (
+                loader_probe.diagnostics.to_dict()
+                if loader_probe.diagnostics is not None
+                else None
+            ),
+        },
     }
     try:
         prompt_frame = max(0, min(int(prompt["frame_index"]), max(frame_count - 1, 0)))
@@ -582,6 +636,7 @@ def _collect_sam31_masks(
             active_obj_id = obj_id
             if visual_box is not None:
                 diagnostics["visual_box_prompt"] = True
+                phase_started_at = time.perf_counter()
                 box_response = predictor.handle_request(
                     request={
                         "type": "add_prompt",
@@ -594,6 +649,7 @@ def _collect_sam31_masks(
                         ),
                     }
                 )
+                phase_timings["box_prompt_seconds"] = time.perf_counter() - phase_started_at
                 box_outputs = box_response.get("outputs") or {}
                 box_obj_id = _first_nonempty_output_object_id(box_outputs)
                 if box_obj_id is not None:
@@ -613,6 +669,7 @@ def _collect_sam31_masks(
                 )
             else:
                 prompt_inputs = _relative_prompt_tensors(prompt=prompt, width=width, height=height)
+            phase_started_at = time.perf_counter()
             prompt_response = predictor.handle_request(
                 request={
                     "type": "add_prompt",
@@ -621,6 +678,10 @@ def _collect_sam31_masks(
                     "obj_id": active_obj_id,
                     **prompt_inputs,
                 }
+            )
+            phase_timings["point_prompt_seconds"] = time.perf_counter() - phase_started_at
+            phase_timings["initial_prompt_seconds"] = (
+                phase_timings["box_prompt_seconds"] + phase_timings["point_prompt_seconds"]
             )
             prompt_outputs = prompt_response.get("outputs") or {}
             prompt_obj_id = _first_nonempty_output_object_id(prompt_outputs)
@@ -647,6 +708,7 @@ def _collect_sam31_masks(
                 else []
             )
             diagnostics["preseed_anchor_frames"] = preseed_anchor_frames
+            phase_started_at = time.perf_counter()
             for anchor_frame in preseed_anchor_frames:
                 if anchor_frame == seed_frame:
                     continue
@@ -672,7 +734,9 @@ def _collect_sam31_masks(
                 )
                 if anchor_mask is not None:
                     masks_by_frame[anchor_frame] = anchor_mask
+            phase_timings["preseed_anchors_seconds"] = time.perf_counter() - phase_started_at
 
+            phase_started_at = time.perf_counter()
             diagnostics["propagation"].extend(
                 _propagate_from_seed_frame(
                     predictor=predictor,
@@ -685,6 +749,7 @@ def _collect_sam31_masks(
                     progress_callback=progress_callback,
                 )
             )
+            phase_timings["propagation_seconds"] += time.perf_counter() - phase_started_at
 
             needs_anchor_refinement = len(masks_by_frame) < anchor_refine_threshold
             diagnostics["anchor_refinement_threshold"] = anchor_refine_threshold
@@ -734,6 +799,7 @@ def _collect_sam31_masks(
                             masks_by_frame[anchor_frame] = anchor_mask
 
                 if needs_anchor_refinement and anchor_frames:
+                    phase_started_at = time.perf_counter()
                     diagnostics["propagation"].extend(
                         _propagate_from_seed_frame(
                             predictor=predictor,
@@ -746,15 +812,24 @@ def _collect_sam31_masks(
                             progress_callback=progress_callback,
                         )
                     )
+                    phase_timings["propagation_seconds"] += (
+                        time.perf_counter() - phase_started_at
+                    )
             else:
                 diagnostics["anchor_refinement_frames"] = []
     finally:
+        phase_started_at = time.perf_counter()
         predictor.handle_request(
             request={
                 "type": "close_session",
                 "session_id": session_id,
             }
         )
+        phase_timings["close_session_seconds"] = time.perf_counter() - phase_started_at
+    diagnostics["timings"] = {
+        key: round(max(0.0, value), 6)
+        for key, value in phase_timings.items()
+    }
     return masks_by_frame, diagnostics
 
 
@@ -1005,6 +1080,8 @@ def run_sam31_gpu_mask(
     force_frames: bool = False,
     obj_id: int = DEFAULT_SAM31_GPU_OBJ_ID,
     progress_callback: Sam31GpuProgressCallback | None = None,
+    runner_mask_ready_callback: Callable[[], None] | None = None,
+    render_qa_overlay: bool = True,
 ) -> dict[str, Any]:
     try:
         from sam3.model_builder import build_sam3_multiplex_video_predictor
@@ -1097,6 +1174,7 @@ def run_sam31_gpu_mask(
         "WHODOIRUNLIKE_SAM31_GPU_PRESEED_ANCHORS",
         default=True,
     )
+    exact_cv2_loader = sam31_exact_cv2_loader_settings()
     with _borrow_sam31_gpu_predictor(
         builder=build_sam3_multiplex_video_predictor,
         build_kwargs=predictor_build_kwargs,
@@ -1122,6 +1200,10 @@ def run_sam31_gpu_mask(
                     direction=direction,
                 ),
                 preseed_track_anchors=preseed_track_anchors,
+                exact_cv2_loader_enabled=exact_cv2_loader.enabled,
+                exact_cv2_chunk_frames=exact_cv2_loader.chunk_frames,
+                exact_cv2_max_frames=exact_cv2_loader.max_frames,
+                exact_cv2_max_destination_bytes=exact_cv2_loader.max_destination_bytes,
             )
     prompt_summary["sam31_predictor_cache"] = predictor_cache
     prompt_summary["sam31"] = sam_prompt_diagnostics
@@ -1130,21 +1212,40 @@ def run_sam31_gpu_mask(
     masks_by_frame, identity_filter = _filter_masks_to_track_boxes(masks_by_frame, track_boxes)
     prompt_summary["identity_filter"] = identity_filter
 
-    emit_progress("rendering", len(masks_by_frame), total_frames=len(frame_paths))
-    write_mask_outputs(
-        frame_paths=frame_paths,
-        masks_by_frame=masks_by_frame,
-        fps=video_meta["fps"],
-        runner_mask_path=runner_mask_path,
-        masked_runner_path=masked_runner_path,
-        qa_overlay_path=qa_overlay_path,
-        metadata_path=metadata_path,
-        phase_callback=lambda phase: emit_progress(
-            phase,
-            len(masks_by_frame),
-            total_frames=len(frame_paths),
-        ),
-    )
+    split_presentation = runner_mask_ready_callback is not None or not render_qa_overlay
+
+    def write_current_mask_data() -> None:
+        emit_progress("rendering", len(masks_by_frame), total_frames=len(frame_paths))
+        if split_presentation:
+            write_runner_mask_data_outputs(
+                frame_paths=frame_paths,
+                masks_by_frame=masks_by_frame,
+                fps=video_meta["fps"],
+                runner_mask_path=runner_mask_path,
+                metadata_path=metadata_path,
+                phase_callback=lambda phase: emit_progress(
+                    phase,
+                    len(masks_by_frame),
+                    total_frames=len(frame_paths),
+                ),
+            )
+            return
+        write_mask_outputs(
+            frame_paths=frame_paths,
+            masks_by_frame=masks_by_frame,
+            fps=video_meta["fps"],
+            runner_mask_path=runner_mask_path,
+            masked_runner_path=masked_runner_path,
+            qa_overlay_path=qa_overlay_path,
+            metadata_path=metadata_path,
+            phase_callback=lambda phase: emit_progress(
+                phase,
+                len(masks_by_frame),
+                total_frames=len(frame_paths),
+            ),
+        )
+
+    write_current_mask_data()
     mask_summary = write_masks_jsonl_from_video(runner_mask_path, masks_jsonl_path)
     fallback: dict[str, Any] | None = None
     nonempty_frames = int(mask_summary.get("nonempty_frames") or 0)
@@ -1170,25 +1271,30 @@ def run_sam31_gpu_mask(
             combined_masks = dict(fallback_masks)
             combined_masks.update(masks_by_frame)
             masks_by_frame = combined_masks
-            emit_progress("rendering", len(masks_by_frame), total_frames=len(frame_paths))
-            write_mask_outputs(
-                frame_paths=frame_paths,
-                masks_by_frame=masks_by_frame,
-                fps=video_meta["fps"],
-                runner_mask_path=runner_mask_path,
-                masked_runner_path=masked_runner_path,
-                qa_overlay_path=qa_overlay_path,
-                metadata_path=metadata_path,
-                phase_callback=lambda phase: emit_progress(
-                    phase,
-                    len(masks_by_frame),
-                    total_frames=len(frame_paths),
-                ),
-            )
+            write_current_mask_data()
             mask_summary = write_masks_jsonl_from_video(runner_mask_path, masks_jsonl_path)
             fallback["nonempty_frames_after_fallback"] = int(mask_summary.get("nonempty_frames") or 0)
         else:
             fallback["nonempty_frames_after_fallback"] = 0
+    data_ready_seconds = time.perf_counter() - start
+    emit_progress("analytical_mask_ready", len(frame_paths), total_frames=len(frame_paths))
+    if split_presentation:
+        if runner_mask_ready_callback is not None:
+            runner_mask_ready_callback()
+        emit_progress("rendering", len(masks_by_frame), total_frames=len(frame_paths))
+        write_mask_presentation_outputs(
+            frame_paths=frame_paths,
+            masks_by_frame=masks_by_frame,
+            fps=video_meta["fps"],
+            masked_runner_path=masked_runner_path,
+            qa_overlay_path=qa_overlay_path,
+            render_qa_overlay=render_qa_overlay,
+            phase_callback=lambda phase: emit_progress(
+                phase,
+                len(masks_by_frame),
+                total_frames=len(frame_paths),
+            ),
+        )
     elapsed_seconds = time.perf_counter() - start
     emit_progress("completed", len(frame_paths), total_frames=len(frame_paths))
     update_manifest_after_sam31_gpu(
@@ -1213,8 +1319,47 @@ def run_sam31_gpu_mask(
         "cache_hit": bool(predictor_cache["hit"]),
         "model_build_seconds": float(predictor_cache["model_build_seconds"]),
         "predictor_lock_wait_seconds": float(predictor_cache["lock_wait_seconds"]),
+        "start_session_seconds": float(
+            sam_prompt_diagnostics.get("timings", {}).get("start_session_seconds", 0.0)
+        ),
+        "initial_prompt_seconds": float(
+            sam_prompt_diagnostics.get("timings", {}).get("initial_prompt_seconds", 0.0)
+        ),
+        "preseed_anchors_seconds": float(
+            sam_prompt_diagnostics.get("timings", {}).get("preseed_anchors_seconds", 0.0)
+        ),
+        "propagation_seconds": float(
+            sam_prompt_diagnostics.get("timings", {}).get("propagation_seconds", 0.0)
+        ),
+        "close_session_seconds": float(
+            sam_prompt_diagnostics.get("timings", {}).get("close_session_seconds", 0.0)
+        ),
+        "exact_cv2_loader_enabled": exact_cv2_loader.enabled,
+        "exact_cv2_loader_attempted": bool(
+            sam_prompt_diagnostics.get("input_loader", {}).get("attempted", False)
+        ),
+        "exact_cv2_loader_used": bool(
+            sam_prompt_diagnostics.get("input_loader", {}).get("used", False)
+        ),
+        "exact_cv2_loader_chunk_frames": exact_cv2_loader.chunk_frames,
+        "exact_cv2_loader_max_frames": exact_cv2_loader.max_frames,
+        "exact_cv2_loader_max_destination_bytes": exact_cv2_loader.max_destination_bytes,
+        "exact_cv2_loader_required_concurrency": REQUIRED_SAM31_EXACT_CV2_CONCURRENCY,
+        "exact_cv2_loader_configured_concurrency": exact_cv2_loader.configured_concurrency,
+        "exact_cv2_loader_concurrency_ready": exact_cv2_loader.concurrency_ready,
+        "exact_cv2_loader_seconds": float(
+            (
+                sam_prompt_diagnostics.get("input_loader", {}).get("diagnostics") or {}
+            ).get("elapsed_seconds", 0.0)
+        ),
+        "exact_cv2_loader_peak_host_staging_bytes": int(
+            (
+                sam_prompt_diagnostics.get("input_loader", {}).get("diagnostics") or {}
+            ).get("peak_host_staging_bytes", 0)
+        ),
         "prompting": prompt_summary,
         "fallback": fallback,
+        "data_ready_seconds": round(data_ready_seconds, 3),
         "elapsed_seconds": round(elapsed_seconds, 3),
         "runner_mask": str(runner_mask_path),
         "masked_runner": str(masked_runner_path),

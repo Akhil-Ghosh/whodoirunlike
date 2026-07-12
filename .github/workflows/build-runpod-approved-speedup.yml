@@ -1,0 +1,118 @@
+name: Build Approved SAM Speedup
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE_NAME: ghcr.io/akhil-ghosh/whodoirunlike-runpod-processor
+  BASE_IMAGE: ghcr.io/akhil-ghosh/whodoirunlike-runpod-processor@sha256:47d776f83ae3e2e1c7f1fa935b0019a9abd82a324ada4ab3d98746b3d75216fc
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push immutable approved image
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.runpod-approved-speedup
+          platforms: linux/amd64
+          push: true
+          build-args: |
+            BASE_IMAGE=${{ env.BASE_IMAGE }}
+            WHODOIRUNLIKE_PROCESSOR_VERSION=${{ github.sha }}
+          tags: |
+            ${{ env.IMAGE_NAME }}:sam31-approved-${{ github.sha }}
+          provenance: false
+
+  smoke:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    env:
+      RELEASE_IMAGE: ghcr.io/akhil-ghosh/whodoirunlike-runpod-processor@${{ needs.build.outputs.digest }}
+      EXPECTED_COMMIT: ${{ github.sha }}
+    steps:
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Pull immutable release image
+        run: docker pull "${RELEASE_IMAGE}"
+
+      - name: Verify approved runtime contract offline
+        run: |
+          docker run --rm --network none -i \
+            --entrypoint python \
+            -e EXPECTED_COMMIT="${EXPECTED_COMMIT}" \
+            "${RELEASE_IMAGE}" - <<'PY'
+          import os
+
+          from whodoirunlike.runpod_serverless import handler
+
+          response = handler({"input": {"type": "health"}})
+          assert response["status"] == "ok", response
+          assert response["health"]["ready_for_invocation"] is True, response
+          assert response["health"]["mask_backend"] == "sam31_gpu", response
+          assert response["health"]["pose_backend"] == "mmpose_rtmpose_l_384", response
+          assert response["health"]["sam31_input_loader"] == {
+              "mode": "exact_cv2",
+              "enabled": True,
+              "chunk_frames": 8,
+              "max_frames": 600,
+              "max_destination_bytes": 8589934592,
+              "required_concurrency": 1,
+              "configured_concurrency": 1,
+              "concurrency_ready": True,
+          }
+          assert os.getenv("WHODOIRUNLIKE_PROCESSOR_VERSION") == os.environ["EXPECTED_COMMIT"]
+          for name in (
+              "WHODOIRUNLIKE_PARALLEL_MASK_PRESENTATION",
+              "WHODOIRUNLIKE_PARALLEL_POSE_DENSEPOSE",
+              "WHODOIRUNLIKE_PARALLEL_POST_FUSION",
+              "WHODOIRUNLIKE_PARALLEL_ARTIFACT_PUBLISH",
+          ):
+              assert os.getenv(name) == "true", name
+          for name in (
+              "MMPOSE_USE_DETECTOR",
+              "DENSEPOSE_TARGET_CROP",
+              "DENSEPOSE_INPUT_MIN_SIZE_TEST",
+              "DENSEPOSE_INPUT_MAX_SIZE_TEST",
+          ):
+              assert not os.getenv(name, "").strip(), name
+          PY
+
+      - name: Record immutable image digest
+        run: |
+          {
+            echo "### Approved SAM speedup image"
+            echo
+            echo "- Commit: \`${EXPECTED_COMMIT}\`"
+            echo "- Image: \`${RELEASE_IMAGE}\`"
+            echo "- No endpoint was changed by this workflow."
+          } >> "${GITHUB_STEP_SUMMARY}"

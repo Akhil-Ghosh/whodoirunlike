@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import subprocess
+import threading
+import time
 from pathlib import Path
 
 import cv2
 import imageio_ffmpeg
 import numpy as np
 
-from whodoirunlike.video_io import make_browser_playable_mp4
+import whodoirunlike.video_io as video_io
+from whodoirunlike.video_io import make_browser_playable_mp4, make_browser_playable_mp4s
 
 
 def _write_mp4v_fixture(path: Path) -> None:
@@ -40,3 +43,30 @@ def test_make_browser_playable_mp4_rewrites_opencv_mp4v_to_h264(tmp_path: Path) 
     video_line = _ffmpeg_video_line(video_path)
     assert "Video: h264" in video_line
     assert "yuv420p" in video_line
+
+
+def test_make_browser_playable_mp4s_encodes_independent_files_concurrently(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    paths = [tmp_path / f"artifact-{index}.mp4" for index in range(3)]
+    active = 0
+    peak_active = 0
+    lock = threading.Lock()
+
+    def encode(path: Path, *, crf: int = 20) -> None:
+        nonlocal active, peak_active
+        assert crf == 17
+        assert path in paths
+        with lock:
+            active += 1
+            peak_active = max(peak_active, active)
+        time.sleep(0.03)
+        with lock:
+            active -= 1
+
+    monkeypatch.setattr(video_io, "make_browser_playable_mp4", encode)
+
+    make_browser_playable_mp4s(paths, crf=17)
+
+    assert peak_active == len(paths)

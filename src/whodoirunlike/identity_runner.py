@@ -5,7 +5,8 @@ import time
 import importlib
 import importlib.util
 import inspect
-from dataclasses import dataclass
+import threading
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterable, Sequence
 
@@ -41,6 +42,28 @@ BOXMOT_BACKEND_ALIASES = {
 DEFAULT_DETECTOR_MODEL = "yolo11n.pt"
 DEFAULT_REID_WEIGHTS = "osnet_x0_25_msmt17.pt"
 IdentityProgressCallback = Callable[[dict[str, Any]], None]
+_YOLO_MODEL_CACHE: dict[str, _LockedYoloModel] = {}
+_YOLO_MODEL_CACHE_LOCK = threading.RLock()
+
+
+@dataclass
+class _LockedYoloModel:
+    model: Any
+    inference_lock: threading.RLock = field(
+        default_factory=threading.RLock,
+        repr=False,
+    )
+
+    @property
+    def task(self) -> Any:
+        return getattr(self.model, "task", None)
+
+    def predict(self, *args: Any, **kwargs: Any) -> Any:
+        with self.inference_lock:
+            return self.model.predict(*args, **kwargs)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.model, name)
 
 
 def canonical_identity_backend(value: str | None) -> str:
@@ -615,14 +638,31 @@ def _select_identity_device(device: str | None) -> str:
 
 
 def _load_yolo_model(detector_model: str) -> Any:
-    try:
-        from ultralytics import YOLO
-    except ModuleNotFoundError as exc:
-        raise RuntimeError(
-            f"YOLO person detection import failed; missing Python package: {exc.name}. Install with: "
-            'python -m pip install -e ".[mot]"'
-        ) from exc
-    return YOLO(detector_model)
+    model_value = str(detector_model).strip()
+    cache_key = (
+        model_value
+        if model_value.startswith(("http://", "https://"))
+        else str(Path(model_value).expanduser().resolve(strict=False))
+    )
+    with _YOLO_MODEL_CACHE_LOCK:
+        cached = _YOLO_MODEL_CACHE.get(cache_key)
+        if cached is not None:
+            return cached
+        try:
+            from ultralytics import YOLO
+        except ModuleNotFoundError as exc:
+            raise RuntimeError(
+                f"YOLO person detection import failed; missing Python package: {exc.name}. "
+                "Install with: " + 'python -m pip install -e ".[mot]"'
+            ) from exc
+        model = _LockedYoloModel(YOLO(detector_model))
+        _YOLO_MODEL_CACHE[cache_key] = model
+        return model
+
+
+def clear_yolo_model_cache() -> None:
+    with _YOLO_MODEL_CACHE_LOCK:
+        _YOLO_MODEL_CACHE.clear()
 
 
 def _create_boxmot_tracker(

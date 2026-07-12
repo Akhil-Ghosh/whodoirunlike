@@ -25,13 +25,15 @@ import {
   useState,
 } from "react";
 
+import { jobResultReady } from "./uploadJobState";
+
 const apiBaseUrl =
   process.env.NEXT_PUBLIC_API_BASE_URL ??
   (process.env.NODE_ENV === "production" ? "https://api.whodoirunlike.com" : "http://127.0.0.1:8000");
 const uploadApiMode =
   process.env.NEXT_PUBLIC_UPLOAD_API_MODE ?? (process.env.NODE_ENV === "production" ? "async" : "sync");
 const maxBytes = 75 * 1024 * 1024;
-const asyncPollIntervalMs = 5_000;
+const asyncPollIntervalMs = 1_000;
 const asyncPollTimeoutMs = 20 * 60 * 1_000;
 
 type UploadState = "idle" | "ready" | "error" | "loading" | "queued" | "complete";
@@ -86,6 +88,8 @@ type ClipProcessResponse = {
 type WorkerJobResponse = {
   run_id: string;
   status: "uploaded" | "queued" | "running" | "complete" | "failed";
+  result_ready?: boolean;
+  result_ready_at?: string | null;
   progress?: {
     phase?: string;
     elapsed_seconds?: number;
@@ -113,7 +117,8 @@ const processingSteps = [
   { phase: "queued_on_runpod", label: "GPU worker queued" },
   { phase: "running_full_cv_pipeline", label: "Runner analysis" },
   { phase: "uploading_artifacts", label: "Saving overlays" },
-  { phase: "complete", label: "Preview ready" },
+  { phase: "result_ready", label: "Preview ready" },
+  { phase: "complete", label: "Full run complete" },
 ];
 
 function sleep(ms: number) {
@@ -141,8 +146,9 @@ function phaseLabel(job: WorkerJobResponse) {
     typeof elapsed === "number" && Number.isFinite(elapsed) && elapsed > 0
       ? ` ${Math.round(elapsed)}s elapsed.`
       : "";
-  if (job.status === "complete") return "Full pipeline complete.";
   if (job.status === "failed") return job.error || "Pipeline failed.";
+  if (job.status === "complete") return "Full pipeline complete.";
+  if (jobResultReady(job)) return "Overlay ready. Final artifacts are still being saved.";
   if (phase) return `Pipeline ${phase}.${elapsedLabel}`;
   if (job.message) return job.message;
   return "Clip is queued for the full CV pipeline.";
@@ -359,6 +365,9 @@ function phaseIndex(job: WorkerJobResponse | null) {
   if (!job) return 0;
   if (job.status === "complete") return processingSteps.length - 1;
   if (job.status === "failed") return -1;
+  if (jobResultReady(job)) {
+    return processingSteps.findIndex((step) => step.phase === "result_ready");
+  }
   const phase = job.progress?.phase;
   const index = processingSteps.findIndex((step) => step.phase === phase);
   if (index >= 0) return index;
@@ -575,12 +584,15 @@ function ProcessingDialog({
   const currentIndex = phaseIndex(job);
   const isFailed = status === "error" || job?.status === "failed";
   const isComplete = status === "complete" || job?.status === "complete";
+  const hasReadyResult = jobResultReady(job);
   const canCopy = Boolean(job?.run_id && typeof navigator !== "undefined" && navigator.clipboard);
-  const helperText = isComplete
-    ? "The cloud run finished. Open the overlay when you are ready."
-    : isFailed
-      ? "Review the error, then try another upload or adjust the selected runner."
-      : "The clip is being processed in the cloud. Keep this tab open to watch the result land here.";
+  const helperText = isFailed
+    ? "Review the error, then try another upload or adjust the selected runner."
+    : isComplete
+      ? "The cloud run finished. Open the overlay when you are ready."
+      : hasReadyResult
+        ? "The preview can open now. Secondary artifacts are still being saved in the background."
+        : "The clip is being processed in the cloud. Keep this tab open to watch the result land here.";
 
   useEffect(() => {
     if (!open) setCopied(false);
@@ -607,7 +619,7 @@ function ProcessingDialog({
           <div>
             <p className="text-[11px] font-bold uppercase tracking-[0.08em] text-[var(--accent-deep)]">Cloud Processing</p>
             <h3 className="mt-1 text-[26px] font-medium leading-none">
-              {isComplete ? "Overlay is ready" : isFailed ? "Processing stopped" : "Clip is still processing"}
+              {isFailed ? "Processing stopped" : hasReadyResult ? "Overlay is ready" : isComplete ? "Processing complete" : "Clip is still processing"}
             </h3>
           </div>
           <button className="focus-ring grid h-10 w-10 place-items-center rounded-full border border-[var(--line)] bg-white/70 text-[var(--ink)] transition hover:bg-white" type="button" onClick={onClose} aria-label="Close processing dialog">
@@ -619,7 +631,7 @@ function ProcessingDialog({
           <div className="rounded-[18px] border border-[var(--line)] bg-white/70 p-4">
             <div className="flex items-start gap-3">
               <span className="mt-0.5 grid h-10 w-10 shrink-0 place-items-center rounded-full bg-[#f3ede3] text-[var(--accent-deep)]">
-                {isComplete ? <CheckCircle size={23} weight="regular" /> : isFailed ? <WarningCircle size={23} weight="regular" /> : <SpinnerGap size={23} weight="regular" className="animate-spin" />}
+                {isFailed ? <WarningCircle size={23} weight="regular" /> : isComplete || hasReadyResult ? <CheckCircle size={23} weight="regular" /> : <SpinnerGap size={23} weight="regular" className="animate-spin" />}
               </span>
               <div>
                 <p className="text-[15px] font-semibold leading-tight">{message}</p>
@@ -676,6 +688,7 @@ function ProcessingDialog({
               <p>Status: {job?.status ?? status}</p>
               <p>Phase: {job?.progress?.phase?.replaceAll("_", " ") ?? "waiting for first update"}</p>
               {typeof job?.progress?.elapsed_seconds === "number" ? <p>Elapsed: {Math.round(job.progress.elapsed_seconds)} seconds</p> : null}
+              {hasReadyResult ? <p>Preview: ready</p> : null}
               {artifact ? <p>Primary artifact: fused overlay</p> : null}
             </div>
           ) : null}
@@ -805,7 +818,6 @@ export function UploadCard() {
     const deadline = Date.now() + asyncPollTimeoutMs;
 
     while (Date.now() < deadline) {
-      await sleep(asyncPollIntervalMs);
       const response = await fetch(`${apiBaseUrl}/v1/jobs/${runId}`);
       const job = await parseJsonResponse<WorkerJobResponse>(response);
       setResult({ mode: "async", data: job });
@@ -819,6 +831,7 @@ export function UploadCard() {
       if (job.status === "failed") {
         throw new Error(job.error || "Pipeline failed.");
       }
+      await sleep(asyncPollIntervalMs);
     }
 
     setStatus("queued");

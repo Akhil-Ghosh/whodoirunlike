@@ -158,6 +158,131 @@ def contour_overlay(frame: np.ndarray, mask: np.ndarray) -> np.ndarray:
     return overlay
 
 
+def write_runner_mask_data_outputs(
+    *,
+    frame_paths: list[Path],
+    masks_by_frame: dict[int, np.ndarray],
+    fps: float,
+    runner_mask_path: Path,
+    metadata_path: Path,
+    phase_callback: Callable[[str], None] | None = None,
+) -> None:
+    """Write the finalized analytical mask contract without presentation videos."""
+    first = cv2.imread(str(frame_paths[0]))
+    if first is None:
+        raise ValueError(f"Could not read first extracted frame: {frame_paths[0]}")
+    height, width = first.shape[:2]
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    runner_mask_path.parent.mkdir(parents=True, exist_ok=True)
+    metadata_path.parent.mkdir(parents=True, exist_ok=True)
+    mask_writer = cv2.VideoWriter(str(runner_mask_path), fourcc, fps, (width, height), True)
+    if not mask_writer.isOpened():
+        raise ValueError("Could not open runner-mask output video writer")
+
+    previous_centroid: tuple[float, float] | None = None
+    metadata_rows: list[dict[str, Any]] = []
+    for frame_index, frame_path in enumerate(frame_paths):
+        frame = cv2.imread(str(frame_path))
+        if frame is None:
+            continue
+        mask = mask_to_uint8(masks_by_frame.get(frame_index, np.zeros((height, width))), height, width)
+        mask_bool = mask > 0
+        area = int(mask_bool.sum())
+        area_ratio = area / float(height * width)
+        if area:
+            ys, xs = np.where(mask_bool)
+            centroid = (float(xs.mean()), float(ys.mean()))
+        else:
+            centroid = None
+
+        if centroid and previous_centroid:
+            centroid_delta = float(
+                ((centroid[0] - previous_centroid[0]) ** 2 + (centroid[1] - previous_centroid[1]) ** 2)
+                ** 0.5
+            )
+        else:
+            centroid_delta = None
+        if centroid:
+            previous_centroid = centroid
+
+        reason = None
+        if area_ratio < 0.002:
+            reason = "mask_missing_or_tiny"
+        elif centroid_delta and centroid_delta > width * 0.28:
+            reason = "centroid_jump_identity_risk"
+
+        mask_writer.write(cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR))
+        metadata_rows.append(
+            {
+                "frame_index": frame_index,
+                "mask_area_ratio": round(area_ratio, 6),
+                "centroid": [round(centroid[0], 2), round(centroid[1], 2)] if centroid else None,
+                "centroid_delta_px": round(centroid_delta, 2) if centroid_delta else None,
+                "usable": reason is None,
+                "drop_reason": reason,
+            }
+        )
+
+    mask_writer.release()
+    if phase_callback:
+        phase_callback("encoding")
+    make_browser_playable_mp4s([runner_mask_path])
+    if phase_callback:
+        phase_callback("writing_outputs")
+    with metadata_path.open("w", encoding="utf-8") as f:
+        for row in metadata_rows:
+            f.write(json.dumps(row) + "\n")
+
+
+def write_mask_presentation_outputs(
+    *,
+    frame_paths: list[Path],
+    masks_by_frame: dict[int, np.ndarray],
+    fps: float,
+    masked_runner_path: Path,
+    qa_overlay_path: Path,
+    render_qa_overlay: bool = True,
+    phase_callback: Callable[[str], None] | None = None,
+) -> None:
+    """Write presentation-only mask artifacts after the analytical mask is ready."""
+    first = cv2.imread(str(frame_paths[0]))
+    if first is None:
+        raise ValueError(f"Could not read first extracted frame: {frame_paths[0]}")
+    height, width = first.shape[:2]
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    masked_runner_path.parent.mkdir(parents=True, exist_ok=True)
+    masked_writer = cv2.VideoWriter(str(masked_runner_path), fourcc, fps, (width, height), True)
+    qa_writer = None
+    if render_qa_overlay:
+        qa_overlay_path.parent.mkdir(parents=True, exist_ok=True)
+        qa_writer = cv2.VideoWriter(str(qa_overlay_path), fourcc, fps, (width, height), True)
+    if not masked_writer.isOpened() or (qa_writer is not None and not qa_writer.isOpened()):
+        raise ValueError("Could not open one or more presentation output video writers")
+
+    for frame_index, frame_path in enumerate(frame_paths):
+        frame = cv2.imread(str(frame_path))
+        if frame is None:
+            continue
+        mask = mask_to_uint8(masks_by_frame.get(frame_index, np.zeros((height, width))), height, width)
+        mask_bool = mask > 0
+        masked = np.zeros_like(frame)
+        masked[mask_bool] = frame[mask_bool]
+        masked_writer.write(masked)
+        if qa_writer is not None:
+            qa_writer.write(contour_overlay(frame, mask))
+
+    masked_writer.release()
+    output_paths = [masked_runner_path]
+    if qa_writer is not None:
+        qa_writer.release()
+        output_paths.append(qa_overlay_path)
+    if phase_callback:
+        phase_callback("encoding")
+    make_browser_playable_mp4s(output_paths)
+    if phase_callback:
+        phase_callback("writing_outputs")
+
+
 def write_mask_outputs(
     *,
     frame_paths: list[Path],

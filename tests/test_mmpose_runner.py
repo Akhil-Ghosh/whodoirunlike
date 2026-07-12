@@ -1,8 +1,16 @@
 from __future__ import annotations
 
+import json
+import sys
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+from types import ModuleType
 from typing import Any
 
 import numpy as np
+import pytest
 
 from whodoirunlike import mmpose_runner
 from whodoirunlike.mmpose_runner import (
@@ -84,6 +92,26 @@ def test_select_mmpose_prediction_prefers_mask_overlap() -> None:
     assert mask_iou > 0
 
 
+def test_select_mmpose_prediction_preserves_fallback_when_all_predictions_are_off_mask() -> None:
+    off_target = {
+        "keypoints": np.asarray([[10, 10], [15, 18], [18, 22]], dtype=np.float32),
+        "keypoint_scores": np.asarray([0.95, 0.9, 0.88], dtype=np.float32),
+    }
+
+    selected_index, selected, bbox, mask_iou = select_mmpose_prediction(
+        [off_target],
+        crop={"x": 0, "y": 0, "width": 100, "height": 100},
+        frame_width=100,
+        frame_height=100,
+        mask_bbox={"x": 0.7, "y": 0.65, "width": 0.2, "height": 0.3},
+    )
+
+    assert selected_index == 0
+    assert selected is off_target
+    assert bbox is not None
+    assert mask_iou == 0.0
+
+
 def test_rtmlib_arrays_to_predictions_normalizes_single_person_arrays() -> None:
     predictions = rtmlib_arrays_to_predictions(
         np.asarray([[10.0, 20.0], [30.0, 40.0]], dtype=np.float32),
@@ -105,3 +133,169 @@ def test_mmpose_setup_status_reports_missing_optional_dependencies(monkeypatch) 
     assert status["ready"] is False
     assert "rtmlib" in status["reasons"][0]
     assert status["backend"] == "mmpose_rtmw_l_384"
+
+
+@pytest.mark.parametrize(
+    ("isolate_qa_overlay", "expected_name", "normalize_qa_overlay"),
+    [(False, "qa_overlay.mp4", True), (True, "pose_qa_overlay.mp4", False)],
+)
+def test_run_mmpose_pose_can_isolate_qa_without_changing_standalone_default(
+    tmp_path: Path,
+    monkeypatch,
+    isolate_qa_overlay: bool,
+    expected_name: str,
+    normalize_qa_overlay: bool,
+) -> None:
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    source = run_dir / "source_segment.mp4"
+    mask = run_dir / "runner_mask.mp4"
+    source.touch()
+    mask.touch()
+    (run_dir / "cv_run_manifest.json").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "candidate_id": "runner-1",
+                "paths": {
+                    "source_segment": str(source),
+                    "runner_mask": str(mask),
+                    "qa_overlay": str(run_dir / "qa_overlay.mp4"),
+                },
+                "stages": {"pose": {"status": "pending"}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    observed: dict[str, Any] = {}
+
+    monkeypatch.setattr(
+        mmpose_runner,
+        "mmpose_setup_status",
+        lambda _model_id: {
+            "ready": True,
+            "device": "cpu",
+            "runtime_backend": "onnxruntime",
+            "reasons": [],
+        },
+    )
+
+    def process(**kwargs: Any) -> dict[str, Any]:
+        observed["qa_overlay_path"] = kwargs["qa_overlay_path"]
+        observed["normalize_qa_overlay"] = kwargs["normalize_qa_overlay"]
+        return {"frame_count": 3, "quality": {}}
+
+    monkeypatch.setattr(mmpose_runner, "process_mmpose_video", process)
+
+    result = mmpose_runner.run_mmpose_pose(
+        run_dir=run_dir,
+        isolate_qa_overlay=isolate_qa_overlay,
+    )
+
+    assert result["status"] == "complete"
+    assert observed["qa_overlay_path"] == run_dir / expected_name
+    assert observed["normalize_qa_overlay"] is normalize_qa_overlay
+    manifest = json.loads((run_dir / "cv_run_manifest.json").read_text(encoding="utf-8"))
+    expected_key = "pose_qa_overlay" if isolate_qa_overlay else "qa_overlay"
+    assert manifest["paths"][expected_key] == str(run_dir / expected_name)
+    assert manifest["paths"]["qa_overlay"] == str(run_dir / "qa_overlay.mp4")
+    assert manifest["stages"]["renders"][expected_key] == str(run_dir / expected_name)
+    if isolate_qa_overlay:
+        assert "qa_overlay" not in manifest["stages"]["renders"]
+
+
+def test_rtmlib_model_cache_keys_runtime_and_device(
+    monkeypatch,
+) -> None:
+    built: list[dict[str, Any]] = []
+    fake_rtmlib = ModuleType("rtmlib")
+
+    def custom(**kwargs: Any) -> object:
+        built.append(kwargs)
+        return object()
+
+    fake_rtmlib.Custom = custom  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "rtmlib", fake_rtmlib)
+    mmpose_runner.clear_rtmlib_model_cache()
+    spec = mmpose_runner.mmpose_model_spec("mmpose_rtmw_l_384")
+    try:
+        first = mmpose_runner.build_rtmlib_model(
+            spec,
+            device="cuda",
+            runtime_backend="onnxruntime",
+        )
+        second = mmpose_runner.build_rtmlib_model(
+            spec,
+            device="cuda",
+            runtime_backend="onnxruntime",
+        )
+        third = mmpose_runner.build_rtmlib_model(
+            spec,
+            device="cpu",
+            runtime_backend="onnxruntime",
+        )
+    finally:
+        mmpose_runner.clear_rtmlib_model_cache()
+
+    assert first is second
+    assert third is not first
+    assert len(built) == 2
+    assert built[0]["det_class"] == "YOLOX"
+    assert built[0]["det"] == mmpose_runner.YOLOX_M_HUMANART_ONNX
+
+
+def test_cached_rtmlib_model_serializes_shared_inference(monkeypatch) -> None:
+    state_lock = threading.Lock()
+    active = 0
+    peak = 0
+    fake_rtmlib = ModuleType("rtmlib")
+
+    class Custom:
+        def __init__(self, **_kwargs: Any) -> None:
+            pass
+
+        def __call__(self, _frame: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+            nonlocal active, peak
+            with state_lock:
+                active += 1
+                peak = max(peak, active)
+            time.sleep(0.02)
+            with state_lock:
+                active -= 1
+            return np.zeros((1, 1, 2)), np.ones((1, 1))
+
+    fake_rtmlib.Custom = Custom  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "rtmlib", fake_rtmlib)
+    mmpose_runner.clear_rtmlib_model_cache()
+    try:
+        model = mmpose_runner.build_rtmlib_model(
+            mmpose_runner.mmpose_model_spec("mmpose_rtmpose_l_384"),
+            device="cuda",
+            runtime_backend="onnxruntime",
+        )
+        frame = np.zeros((32, 32, 3), dtype=np.uint8)
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            list(executor.map(lambda _: model(frame), range(2)))
+    finally:
+        mmpose_runner.clear_rtmlib_model_cache()
+
+    assert peak == 1
+
+
+def test_rtmlib_model_keeps_yolox_detector_by_default(monkeypatch) -> None:
+    built: list[dict[str, Any]] = []
+    fake_rtmlib = ModuleType("rtmlib")
+    fake_rtmlib.Custom = lambda **kwargs: built.append(kwargs) or object()  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "rtmlib", fake_rtmlib)
+    mmpose_runner.clear_rtmlib_model_cache()
+    try:
+        mmpose_runner.build_rtmlib_model(
+            mmpose_runner.mmpose_model_spec("mmpose_rtmw_l_384"),
+            device="cpu",
+            runtime_backend="onnxruntime",
+        )
+    finally:
+        mmpose_runner.clear_rtmlib_model_cache()
+
+    assert built[0]["det_class"] == "YOLOX"
+    assert built[0]["det"] == mmpose_runner.YOLOX_M_HUMANART_ONNX

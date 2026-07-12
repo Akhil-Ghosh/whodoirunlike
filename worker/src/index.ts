@@ -47,8 +47,16 @@ type ArtifactRecord = {
   key: string;
   attempt_id?: string;
   content_type: string;
+  object_version?: string;
   size_bytes: number;
   updated_at: string;
+};
+
+type ArtifactFinalizeItem = {
+  name: string;
+  content_type: string;
+  object_version: string;
+  size_bytes: number;
 };
 
 type ProcessingAttemptRecord = {
@@ -130,9 +138,13 @@ type RunPodStartResponse = {
 };
 
 const DEFAULT_MAX_UPLOAD_BYTES = 75 * 1024 * 1024;
+const MAX_ARTIFACT_FINALIZE_BODY_BYTES = 64 * 1024;
+const MAX_ARTIFACT_FINALIZE_COUNT = 64;
+const MAX_R2_OBJECT_BYTES = 5 * 1024 * 1024 * 1024;
 const JSON_HEADERS = {
   "Content-Type": "application/json; charset=utf-8",
 };
+const RESULT_READY_ARTIFACT_NAME = "fused_overlay.mp4";
 
 export default {
   async fetch(request, env, ctx): Promise<Response> {
@@ -209,6 +221,15 @@ async function handleRequest(
           return errorResponse(request, env, 400, "Invalid artifact name.");
         }
         return handlePutArtifact(request, env, runId, artifactName);
+      }
+
+      if (
+        request.method === "POST" &&
+        segments.length === 5 &&
+        segments[3] === "artifacts" &&
+        segments[4] === "finalize"
+      ) {
+        return handleFinalizeArtifacts(request, env, runId);
       }
 
       if (request.method === "POST" && segments.length === 4 && segments[3] === "report") {
@@ -613,18 +634,50 @@ async function handlePutArtifact(
     return errorResponse(request, env, 409, "Processing attempt is stale.");
   }
 
-  const contentType = request.headers.get("content-type") ?? "application/octet-stream";
+  const deferIndex = new URL(request.url).searchParams.get("defer_index") === "1";
+  if (deferIndex && artifactName === RESULT_READY_ARTIFACT_NAME) {
+    return errorResponse(request, env, 400, "The result-ready artifact must be indexed immediately.");
+  }
+  const requestedContentType = request.headers.get("content-type") ?? "application/octet-stream";
+  const contentType = deferIndex
+    ? normalizeArtifactContentType(requestedContentType)
+    : requestedContentType;
+  if (!contentType) {
+    return errorResponse(request, env, 400, "Invalid artifact content type.");
+  }
   const artifactKey = `artifacts/${runId}/${attemptId}/${artifactName}`;
   const stored = await env.CLIPS.put(artifactKey, request.body, {
     httpMetadata: { contentType },
     customMetadata: { run_id: runId, attempt_id: attemptId, artifact_name: artifactName },
   });
 
+  if (deferIndex) {
+    if (stored.size > MAX_R2_OBJECT_BYTES) {
+      logAbandonedDeferredArtifact(runId, attemptId, artifactName, "invalid_size");
+      return errorResponse(request, env, 400, "Artifact size is invalid.");
+    }
+    const latestJob = await readJob(env, runId);
+    if (!latestJob || latestJob.attempt_id !== attemptId) {
+      logAbandonedDeferredArtifact(runId, attemptId, artifactName, "stale_attempt");
+      return errorResponse(request, env, 409, "Processing attempt became stale.");
+    }
+    return jsonResponse(request, env, {
+      run_id: runId,
+      attempt_id: attemptId,
+      artifact: artifactName,
+      status: "stored_unindexed",
+      content_type: contentType,
+      object_version: stored.version,
+      size_bytes: stored.size,
+    });
+  }
+
   const updated = updateJob(job, job.status);
   updated.artifacts[artifactName] = {
     key: artifactKey,
     attempt_id: attemptId,
     content_type: contentType,
+    object_version: stored.version,
     size_bytes: stored.size,
     updated_at: updated.updated_at,
   };
@@ -638,6 +691,110 @@ async function handlePutArtifact(
     artifact: artifactName,
     status: "stored",
     size_bytes: stored.size,
+  });
+}
+
+async function handleFinalizeArtifacts(
+  request: Request,
+  env: Env,
+  runId: string,
+): Promise<Response> {
+  if (!(await hasProcessorAuth(request, env))) {
+    return errorResponse(request, env, 401, "Processor authorization required.");
+  }
+  const declaredLength = parseContentLength(request);
+  if (declaredLength !== null && declaredLength > MAX_ARTIFACT_FINALIZE_BODY_BYTES) {
+    return errorResponse(request, env, 413, "Artifact finalization body is too large.");
+  }
+
+  const boundedBody = await readBoundedRequestText(
+    request,
+    MAX_ARTIFACT_FINALIZE_BODY_BYTES,
+  );
+  if (!boundedBody.ok) {
+    return errorResponse(request, env, 413, "Artifact finalization body is too large.");
+  }
+  const rawBody = boundedBody.value;
+  let rawPayload: unknown;
+  try {
+    rawPayload = JSON.parse(rawBody);
+  } catch {
+    return errorResponse(request, env, 400, "Artifact finalization must be valid JSON.");
+  }
+  const parsed = parseArtifactFinalizePayload(rawPayload);
+  if (!parsed.ok) {
+    return errorResponse(request, env, 400, parsed.error);
+  }
+  const headerAttemptId = normalizeAttemptId(
+    request.headers.get("x-processing-attempt-id") ?? "",
+  );
+  if (!headerAttemptId) {
+    return errorResponse(request, env, 400, "X-Processing-Attempt-Id is required.");
+  }
+  if (headerAttemptId !== parsed.attemptId) {
+    return errorResponse(request, env, 400, "Processing attempt identifiers do not match.");
+  }
+
+  const job = await readJob(env, runId);
+  if (!job) {
+    return errorResponse(request, env, 404, "Job not found.");
+  }
+  if (job.attempt_id !== parsed.attemptId) {
+    return errorResponse(request, env, 409, "Processing attempt is stale.");
+  }
+
+  const records = await Promise.all(
+    parsed.artifacts.map(async (artifact): Promise<[string, ArtifactRecord] | null> => {
+      const key = `artifacts/${runId}/${parsed.attemptId}/${artifact.name}`;
+      const stored = await env.CLIPS.head(key);
+      if (
+        !stored ||
+        stored.size !== artifact.size_bytes ||
+        stored.version !== artifact.object_version ||
+        stored.httpMetadata?.contentType !== artifact.content_type ||
+        stored.customMetadata?.run_id !== runId ||
+        stored.customMetadata?.attempt_id !== parsed.attemptId ||
+        stored.customMetadata?.artifact_name !== artifact.name
+      ) {
+        return null;
+      }
+      return [
+        artifact.name,
+        {
+          key,
+          attempt_id: parsed.attemptId,
+          content_type: artifact.content_type,
+          object_version: artifact.object_version,
+          size_bytes: artifact.size_bytes,
+          updated_at: stored.uploaded.toISOString(),
+        },
+      ];
+    }),
+  );
+  if (records.some((record) => record === null)) {
+    return errorResponse(request, env, 409, "A deferred artifact is missing or changed.");
+  }
+
+  try {
+    await mutateCurrentJob(env, runId, parsed.attemptId, (current) => {
+      const updated = updateJob(current, current.status);
+      for (const record of records) {
+        if (record) updated.artifacts[record[0]] = record[1];
+      }
+      return updated;
+    });
+  } catch (error) {
+    if (error instanceof JobMutationConflictError) {
+      return errorResponse(request, env, 409, error.message);
+    }
+    throw error;
+  }
+
+  return jsonResponse(request, env, {
+    run_id: runId,
+    attempt_id: parsed.attemptId,
+    status: "indexed",
+    artifacts: parsed.artifacts.map((artifact) => artifact.name),
   });
 }
 
@@ -736,12 +893,15 @@ async function handleGetArtifact(
     return errorResponse(request, env, 404, "Job not found.");
   }
   const artifact = job.artifacts[artifactName];
-  if (!artifact) {
+  if (!artifact || !artifactBelongsToCurrentAttempt(job, artifact)) {
     return errorResponse(request, env, 404, "Artifact not found.");
   }
   const object = await env.CLIPS.get(artifact.key);
   if (!object) {
     return errorResponse(request, env, 404, "Artifact object not found.");
+  }
+  if (artifact.object_version && object.version !== artifact.object_version) {
+    return errorResponse(request, env, 404, "Artifact object version changed.");
   }
   return objectResponse(request, env, object, {
     "Content-Type": artifact.content_type,
@@ -1024,16 +1184,23 @@ function runPodEndpointId(env: Env): string {
 }
 
 function publicJob(job: JobRecord, baseUrl: string): Record<string, unknown> {
+  const resultReadyArtifact = job.artifacts[RESULT_READY_ARTIFACT_NAME];
+  const resultReady = Boolean(
+    resultReadyArtifact &&
+    artifactBelongsToCurrentAttempt(job, resultReadyArtifact),
+  );
   const artifacts = Object.fromEntries(
-    Object.entries(job.artifacts).map(([name, artifact]) => [
-      name,
-      {
-        href: `${baseUrl}/v1/artifacts/${job.run_id}/${encodeURIComponent(name)}`,
-        content_type: artifact.content_type,
-        size_bytes: artifact.size_bytes,
-        updated_at: artifact.updated_at,
-      },
-    ]),
+    Object.entries(job.artifacts)
+      .filter(([, artifact]) => artifactBelongsToCurrentAttempt(job, artifact))
+      .map(([name, artifact]) => [
+        name,
+        {
+          href: `${baseUrl}/v1/artifacts/${job.run_id}/${encodeURIComponent(name)}`,
+          content_type: artifact.content_type,
+          size_bytes: artifact.size_bytes,
+          updated_at: artifact.updated_at,
+        },
+      ]),
   );
 
   return {
@@ -1046,6 +1213,8 @@ function publicJob(job: JobRecord, baseUrl: string): Record<string, unknown> {
     created_at: job.created_at,
     upload_completed_at: job.upload_completed_at ?? null,
     updated_at: job.updated_at,
+    result_ready: resultReady,
+    result_ready_at: resultReady ? resultReadyArtifact.updated_at : null,
     upload: {
       filename: job.upload.filename,
       content_type: job.upload.content_type,
@@ -1071,6 +1240,13 @@ function publicJob(job: JobRecord, baseUrl: string): Record<string, unknown> {
         : null,
     },
   };
+}
+
+function artifactBelongsToCurrentAttempt(
+  job: JobRecord,
+  artifact: ArtifactRecord,
+): boolean {
+  return Boolean(job.attempt_id && artifact.attempt_id === job.attempt_id);
 }
 
 type WorkerLifecycleDetails = Pick<
@@ -1674,6 +1850,42 @@ function parseContentLength(request: Request): number | null {
   return Number.isFinite(parsed) ? parsed : null;
 }
 
+type BoundedRequestTextResult =
+  | { ok: true; value: string }
+  | { ok: false };
+
+async function readBoundedRequestText(
+  request: Request,
+  maxBytes: number,
+): Promise<BoundedRequestTextResult> {
+  if (!request.body) return { ok: true, value: "" };
+  const reader = request.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let byteLength = 0;
+  try {
+    while (true) {
+      const chunk = await reader.read();
+      if (chunk.done) break;
+      byteLength += chunk.value.byteLength;
+      if (byteLength > maxBytes) {
+        await reader.cancel("request body exceeds configured limit");
+        return { ok: false };
+      }
+      chunks.push(chunk.value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+
+  const body = new Uint8Array(byteLength);
+  let offset = 0;
+  for (const chunk of chunks) {
+    body.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return { ok: true, value: new TextDecoder().decode(body) };
+}
+
 function normalizeRunId(value: string): string | null {
   const decoded = decodeURIComponent(value);
   return /^[a-f0-9-]{32,36}$/i.test(decoded) ? decoded : null;
@@ -1686,6 +1898,107 @@ function normalizeAttemptId(value: string): string | null {
 function normalizeArtifactName(value: string): string | null {
   const decoded = decodeURIComponent(value);
   return /^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,95}$/.test(decoded) ? decoded : null;
+}
+
+function normalizeArtifactContentType(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const normalized = value.trim();
+  if (
+    normalized.length < 3 ||
+    normalized.length > 200 ||
+    !/^[a-zA-Z0-9!#$&^_.+-]+\/[a-zA-Z0-9!#$&^_.+-]+(?:\s*;[^\r\n]*)?$/.test(normalized)
+  ) {
+    return null;
+  }
+  return normalized;
+}
+
+type ArtifactFinalizeParseResult =
+  | { ok: true; attemptId: string; artifacts: ArtifactFinalizeItem[] }
+  | { ok: false; error: string };
+
+function parseArtifactFinalizePayload(value: unknown): ArtifactFinalizeParseResult {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return { ok: false, error: "Artifact finalization must be an object." };
+  }
+  const payload = value as Record<string, unknown>;
+  const attemptId = normalizeAttemptId(
+    typeof payload.attempt_id === "string" ? payload.attempt_id : "",
+  );
+  if (!attemptId) {
+    return { ok: false, error: "Artifact finalization attempt_id is required." };
+  }
+  if (
+    !Array.isArray(payload.artifacts) ||
+    payload.artifacts.length < 1 ||
+    payload.artifacts.length > MAX_ARTIFACT_FINALIZE_COUNT
+  ) {
+    return {
+      ok: false,
+      error: `Artifact finalization requires 1 to ${MAX_ARTIFACT_FINALIZE_COUNT} artifacts.`,
+    };
+  }
+
+  const artifacts: ArtifactFinalizeItem[] = [];
+  const seenNames = new Set<string>();
+  for (const value of payload.artifacts) {
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+      return { ok: false, error: "Artifact finalization metadata is invalid." };
+    }
+    const raw = value as Record<string, unknown>;
+    const name = normalizeArtifactName(typeof raw.name === "string" ? raw.name : "");
+    const contentType = normalizeArtifactContentType(raw.content_type);
+    const objectVersion = normalizeR2ObjectVersion(raw.object_version);
+    const sizeBytes = raw.size_bytes;
+    if (
+      !name ||
+      name === RESULT_READY_ARTIFACT_NAME ||
+      !contentType ||
+      !objectVersion ||
+      typeof sizeBytes !== "number" ||
+      !Number.isSafeInteger(sizeBytes) ||
+      sizeBytes < 0 ||
+      sizeBytes > MAX_R2_OBJECT_BYTES
+    ) {
+      return { ok: false, error: "Artifact finalization metadata is invalid." };
+    }
+    if (seenNames.has(name)) {
+      return { ok: false, error: "Artifact finalization names must be unique." };
+    }
+    seenNames.add(name);
+    artifacts.push({
+      name,
+      content_type: contentType,
+      object_version: objectVersion,
+      size_bytes: sizeBytes,
+    });
+  }
+  return { ok: true, attemptId, artifacts };
+}
+
+function normalizeR2ObjectVersion(value: unknown): string | null {
+  return typeof value === "string" && /^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/.test(value)
+    ? value
+    : null;
+}
+
+function logAbandonedDeferredArtifact(
+  runId: string,
+  attemptId: string,
+  artifactName: string,
+  reason: "invalid_size" | "stale_attempt",
+): void {
+  console.warn(
+    JSON.stringify({
+      level: "warn",
+      message: "deferred_artifact_abandoned",
+      run_id: runId,
+      attempt_id: attemptId,
+      artifact: artifactName,
+      reason,
+      cleanup: "retained_unindexed_to_avoid_deleting_a_newer_write",
+    }),
+  );
 }
 
 function normalizeReportStatus(value: unknown): "running" | "complete" | "failed" | null {

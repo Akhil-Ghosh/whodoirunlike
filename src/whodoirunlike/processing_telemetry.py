@@ -17,7 +17,7 @@ import uuid
 from collections.abc import Callable, Mapping
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, TextIO
 
 
 SCHEMA_VERSION = 1
@@ -616,11 +616,11 @@ class ProcessingTelemetry:
         self._lock = threading.RLock()
         self._emit_lock = threading.RLock()
         self._write_lock = threading.Lock()
+        self._local_output: TextIO | None = None
         self._state_lock = threading.Lock()
         self._last_progress_at: dict[tuple[str, str | None], float] = {}
-        self._active_stage: dict[str, Any] | None = None
-        self._active_span: dict[str, Any] | None = None
-        self._latest_progress: dict[str, Any] = {"phase": "running"}
+        self._active_boundaries: dict[int, dict[str, Any]] = {}
+        self._latest_progress: dict[tuple[str, str | None], dict[str, Any]] = {}
         self._closed = False
         self.local_write_failures = 0
         self.delivery_failures = 0
@@ -849,10 +849,22 @@ class ProcessingTelemetry:
             line = json.dumps(event, separators=(",", ":"), allow_nan=False) + "\n"
             with self._write_lock:
                 self.local_path.parent.mkdir(parents=True, exist_ok=True)
-                with self.local_path.open("a", encoding="utf-8") as output:
-                    output.write(line)
-                    output.flush()
+                if self._local_output is None or self._local_output.closed:
+                    self._local_output = self.local_path.open(
+                        "a",
+                        encoding="utf-8",
+                        buffering=1,
+                    )
+                self._local_output.write(line)
+                self._local_output.flush()
         except BaseException:
+            with self._write_lock:
+                if self._local_output is not None:
+                    try:
+                        self._local_output.close()
+                    except BaseException:
+                        pass
+                    self._local_output = None
             with self._lock:
                 self.local_write_failures += 1
 
@@ -971,7 +983,7 @@ class ProcessingTelemetry:
         now = self._safe_clock()
         key = (stage, span)
         with self._state_lock:
-            self._latest_progress = _safe_json_value(dict(progress)) or {}
+            self._latest_progress[key] = _safe_json_value(dict(progress)) or {}
             last = self._last_progress_at.get(key)
             if not force and last is not None and now - last < self.progress_interval_seconds:
                 return None
@@ -992,43 +1004,70 @@ class ProcessingTelemetry:
 
     def _activate_boundary(self, boundary: _Boundary) -> None:
         state = {
+            "kind": boundary.kind,
             "stage": boundary.stage,
             "span": boundary.span,
             "started_at": boundary.started_at,
             "runtime": dict(boundary.runtime),
+            "thread_id": threading.get_ident(),
         }
         with self._state_lock:
-            if boundary.kind == "stage":
-                self._active_stage = state
-                self._latest_progress = {"phase": "running"}
-            else:
-                self._active_span = state
+            self._active_boundaries[id(boundary)] = state
+            self._latest_progress[(boundary.stage, boundary.span)] = {"phase": "running"}
 
     def _deactivate_boundary(self, boundary: _Boundary) -> None:
         with self._state_lock:
-            if boundary.kind == "stage":
-                if self._active_stage and self._active_stage.get("stage") == boundary.stage:
-                    self._active_stage = None
-                    self._active_span = None
-            elif self._active_span and self._active_span.get("span") == boundary.span:
-                self._active_span = None
+            state = self._active_boundaries.pop(id(boundary), None)
+            if boundary.kind == "stage" and state is not None:
+                thread_id = state.get("thread_id")
+                stale_spans = [
+                    token
+                    for token, active in self._active_boundaries.items()
+                    if active.get("kind") == "span"
+                    and active.get("stage") == boundary.stage
+                    and active.get("thread_id") == thread_id
+                ]
+                for token in stale_spans:
+                    self._active_boundaries.pop(token, None)
 
     def _heartbeat_loop(self) -> None:
         while not self._heartbeat_stop.wait(self.progress_interval_seconds):
             with self._state_lock:
-                active = dict(self._active_span or self._active_stage or {})
-                progress = dict(self._latest_progress)
-            if not active:
-                continue
+                active_boundaries = [dict(active) for active in self._active_boundaries.values()]
+                active_span_scopes = {
+                    (active.get("thread_id"), active.get("stage"))
+                    for active in active_boundaries
+                    if active.get("kind") == "span"
+                }
+                active_leaves = [
+                    active
+                    for active in active_boundaries
+                    if active.get("kind") == "span"
+                    or (active.get("thread_id"), active.get("stage"))
+                    not in active_span_scopes
+                ]
+                snapshots = [
+                    (
+                        active,
+                        dict(
+                            self._latest_progress.get(
+                                (str(active["stage"]), active.get("span")),
+                                {"phase": "running"},
+                            )
+                        ),
+                    )
+                    for active in active_leaves
+                ]
             now = self._safe_clock()
-            progress["heartbeat"] = True
-            self.sample_progress(
-                stage=str(active["stage"]),
-                span=active.get("span"),
-                progress=progress,
-                elapsed_seconds=max(0.0, now - float(active["started_at"])),
-                runtime=active.get("runtime"),
-            )
+            for active, progress in snapshots:
+                progress["heartbeat"] = True
+                self.sample_progress(
+                    stage=str(active["stage"]),
+                    span=active.get("span"),
+                    progress=progress,
+                    elapsed_seconds=max(0.0, now - float(active["started_at"])),
+                    runtime=active.get("runtime"),
+                )
 
     def close(self, *, timeout: float = 2.0) -> bool:
         if self._closed:
@@ -1040,6 +1079,14 @@ class ProcessingTelemetry:
         delivered = True
         if self._async_sender is not None:
             delivered = self._async_sender.close(timeout)
+        with self._write_lock:
+            if self._local_output is not None:
+                try:
+                    self._local_output.close()
+                except BaseException:
+                    with self._lock:
+                        self.local_write_failures += 1
+                self._local_output = None
         return delivered
 
     def flush_delivery(self, *, timeout: float) -> bool:
@@ -1209,14 +1256,31 @@ def _measurements_from_result(result: Mapping[str, Any]) -> dict[str, Any]:
         "artifact_count",
         "artifacts_uploaded",
         "cache_hit",
+        "close_session_seconds",
+        "data_ready_seconds",
         "detected_frames",
         "elapsed_seconds",
+        "exact_cv2_loader_attempted",
+        "exact_cv2_loader_chunk_frames",
+        "exact_cv2_loader_concurrency_ready",
+        "exact_cv2_loader_configured_concurrency",
+        "exact_cv2_loader_enabled",
+        "exact_cv2_loader_max_destination_bytes",
+        "exact_cv2_loader_max_frames",
+        "exact_cv2_loader_peak_host_staging_bytes",
+        "exact_cv2_loader_required_concurrency",
+        "exact_cv2_loader_seconds",
+        "exact_cv2_loader_used",
         "exports",
         "frame_count",
+        "initial_prompt_seconds",
         "processed_frames",
         "model_build_seconds",
+        "preseed_anchors_seconds",
         "predictor_lock_wait_seconds",
+        "propagation_seconds",
         "row_count",
+        "start_session_seconds",
         "track_gated_frames",
         "usable_frame_count",
         "usable_frames",
@@ -1239,6 +1303,9 @@ def _measurements_from_result(result: Mapping[str, Any]) -> dict[str, Any]:
     elapsed = _safe_float(measurements.get("elapsed_seconds"))
     if frame_count and elapsed is not None and frame_count > 0:
         measurements["milliseconds_per_frame"] = elapsed * 1000.0 / frame_count
+    data_ready = _safe_float(measurements.get("data_ready_seconds"))
+    if elapsed is not None and data_ready is not None and 0.0 <= data_ready <= elapsed:
+        measurements["presentation_tail_seconds"] = elapsed - data_ready
     return measurements
 
 

@@ -1,6 +1,7 @@
-FROM runpod/pytorch:1.0.3-cu1281-torch291-ubuntu2404
+FROM runpod/pytorch:1.0.3-cu1281-torch291-ubuntu2404@sha256:3e874356857adfa3e8faa3fd913b65bd127f77a0fe2e489513e7775e1c1e16b1
 
 ARG WHODOIRUNLIKE_PROCESSOR_VERSION=unknown
+ARG DETECTRON2_COMMIT=02b5c4e295e990042a714712c21dc79b731e8833
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
@@ -15,6 +16,8 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     WHODOIRUNLIKE_SAM31_GPU_PRESEED_ANCHORS=true \
     WHODOIRUNLIKE_SKIP_DENSEPOSE=false \
     WHODOIRUNLIKE_PROCESSOR_VERSION=${WHODOIRUNLIKE_PROCESSOR_VERSION} \
+    MMPOSE_DEVICE=cpu \
+    RTMW_RUNTIME_BACKEND=onnxruntime \
     DENSEPOSE_CONFIG=/opt/detectron2/projects/DensePose/configs/densepose_rcnn_R_50_FPN_s1x.yaml \
     DENSEPOSE_WEIGHTS=https://dl.fbaipublicfiles.com/densepose/densepose_rcnn_R_50_FPN_s1x/165712039/model_final_162be9.pkl \
     DENSEPOSE_DEVICE=cuda
@@ -31,7 +34,10 @@ RUN apt-get update \
         ninja-build \
     && rm -rf /var/lib/apt/lists/*
 
-RUN git clone --depth 1 https://github.com/facebookresearch/detectron2.git /opt/detectron2
+RUN git init /opt/detectron2 \
+    && git -C /opt/detectron2 remote add origin https://github.com/facebookresearch/detectron2.git \
+    && git -C /opt/detectron2 fetch --depth 1 origin ${DETECTRON2_COMMIT} \
+    && git -C /opt/detectron2 checkout --detach FETCH_HEAD
 
 COPY pyproject.toml README.md ./
 COPY src ./src
@@ -60,6 +66,7 @@ RUN python -m pip install --upgrade pip setuptools wheel \
         "timm>=1.0.17" \
     && python -m pip install --no-cache-dir --no-build-isolation --no-deps /opt/detectron2 \
     && python -m pip install --no-cache-dir --no-build-isolation --no-deps /opt/detectron2/projects/DensePose \
+    && python -c 'import onnxruntime as ort; providers = ort.get_available_providers(); assert "CPUExecutionProvider" in providers, providers' \
     && python -c 'from importlib.metadata import version; from whodoirunlike.identity_runner import identity_setup_status; assert version("boxmot") == "21.0.0"; status = identity_setup_status("boxmot_bytetrack"); assert status["ready"], status' \
     && python scripts/preload_rtmlib_models.py --cache-root "$TORCH_HOME"
 

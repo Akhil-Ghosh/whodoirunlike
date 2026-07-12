@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import json
+import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from importlib import import_module
 from pathlib import Path
 from typing import Any, Callable
@@ -36,12 +37,21 @@ DensePoseProgressCallback = Callable[[dict[str, Any]], None]
 @dataclass(frozen=True)
 class DensePoseBackend:
     predictor: Any
+    inference_lock: threading.RLock = field(
+        default_factory=threading.RLock,
+        compare=False,
+        repr=False,
+    )
 
 
 @dataclass(frozen=True)
 class DensePoseFrameOutput:
     row: dict[str, Any]
     labels: np.ndarray | None = None
+
+
+_DENSEPOSE_BACKEND_CACHE: dict[tuple[Any, ...], DensePoseBackend] = {}
+_DENSEPOSE_BACKEND_CACHE_LOCK = threading.RLock()
 
 
 def build_densepose_progress(
@@ -124,27 +134,46 @@ def load_densepose_backend(
     weights_path: str | None = None,
     confidence_threshold: float = 0.5,
     device: str = "cpu",
+    cache_enabled: bool = True,
 ) -> DensePoseBackend:
     if config_path is None or weights_path in (None, ""):
         raise DensePoseSetupError(
             "DensePose config and weights are required. " + DENSEPOSE_SETUP_INSTRUCTIONS
         )
 
-    try:
-        from detectron2.config import get_cfg
-        from detectron2.engine import DefaultPredictor
-        from densepose import add_densepose_config
-    except ModuleNotFoundError as exc:
-        raise DensePoseSetupError(DENSEPOSE_SETUP_INSTRUCTIONS) from exc
+    key = (
+        str(config_path.resolve(strict=False)),
+        str(weights_path),
+        float(confidence_threshold),
+        str(device),
+    )
+    with _DENSEPOSE_BACKEND_CACHE_LOCK:
+        if cache_enabled and key in _DENSEPOSE_BACKEND_CACHE:
+            return _DENSEPOSE_BACKEND_CACHE[key]
 
-    cfg = get_cfg()
-    add_densepose_config(cfg)
-    cfg.merge_from_file(str(config_path))
-    cfg.MODEL.WEIGHTS = str(weights_path)
-    cfg.MODEL.DEVICE = device
-    cfg.MODEL.ROI_HEADS.SCORE_THRESH_TEST = float(confidence_threshold)
-    cfg.freeze()
-    return DensePoseBackend(predictor=DefaultPredictor(cfg))
+        try:
+            from detectron2.config import get_cfg
+            from detectron2.engine import DefaultPredictor
+            from densepose import add_densepose_config
+        except ModuleNotFoundError as exc:
+            raise DensePoseSetupError(DENSEPOSE_SETUP_INSTRUCTIONS) from exc
+
+        cfg = get_cfg()
+        add_densepose_config(cfg)
+        cfg.merge_from_file(str(config_path))
+        cfg.MODEL.WEIGHTS = str(weights_path)
+        cfg.MODEL.DEVICE = device
+        cfg.MODEL.ROI_HEADS.SCORE_THRESH_TEST = float(confidence_threshold)
+        cfg.freeze()
+        backend = DensePoseBackend(predictor=DefaultPredictor(cfg))
+        if cache_enabled:
+            _DENSEPOSE_BACKEND_CACHE[key] = backend
+        return backend
+
+
+def clear_densepose_backend_cache() -> None:
+    with _DENSEPOSE_BACKEND_CACHE_LOCK:
+        _DENSEPOSE_BACKEND_CACHE.clear()
 
 
 def mask_bbox(mask: np.ndarray) -> list[int] | None:
@@ -275,7 +304,8 @@ def apply_densepose_to_frame(
 ) -> DensePoseFrameOutput:
     masked_frame = frame_bgr.copy()
     masked_frame[runner_mask <= 0] = 0
-    outputs = backend.predictor(masked_frame)
+    with backend.inference_lock:
+        outputs = backend.predictor(masked_frame)
     instances = _instances_to_cpu(outputs.get("instances"))
     if instances is None or len(instances) == 0:
         return DensePoseFrameOutput({"usable": False, "drop_reason": "densepose_missing"})
@@ -294,7 +324,9 @@ def apply_densepose_to_frame(
             best_index = index
 
     if best_index is None or best_overlap < min_mask_overlap:
-        return DensePoseFrameOutput({"usable": False, "drop_reason": "no_detection_on_runner_mask"})
+        return DensePoseFrameOutput(
+            {"usable": False, "drop_reason": "no_detection_on_runner_mask"}
+        )
 
     row = {
         "usable": True,
@@ -410,7 +442,6 @@ def run_densepose(
     runner_mask = run.artifact_path("runner_mask", manifest)
     densepose_path = run.artifact_path("densepose", manifest)
     qa_overlay_path = run.artifact_path("qa_overlay", manifest)
-
     if progress_callback:
         progress_callback(
             build_densepose_progress(
@@ -498,6 +529,7 @@ def run_densepose(
             ok, frame = source_capture.read()
             if not ok:
                 break
+            labels = None
             mask = _read_mask_frame(mask_capture, width, height)
             if mask is None:
                 row = {"usable": False, "drop_reason": "runner_mask_frame_missing"}
@@ -506,7 +538,6 @@ def run_densepose(
                 mask_area_ratio = float((mask > 0).sum()) / float(max(width * height, 1))
                 if bbox is None:
                     row = {"usable": False, "drop_reason": "runner_mask_empty"}
-                    labels = None
                 else:
                     densepose_output = apply_densepose_to_frame(
                         frame,
@@ -519,7 +550,6 @@ def run_densepose(
                         labels = densepose_output.labels
                     else:
                         row = densepose_output
-                        labels = None
                 row["mask_area_ratio"] = round(mask_area_ratio, 6)
                 row.setdefault("runner_bbox", bbox)
                 if writer is not None:

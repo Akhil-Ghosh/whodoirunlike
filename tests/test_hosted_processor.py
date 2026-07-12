@@ -1780,7 +1780,78 @@ def test_processor_readiness_accepts_sam_mask_presentation_overlap(monkeypatch: 
         "mode": "exact_cv2",
         "enabled": True,
         "chunk_frames": 3,
+        "max_frames": 600,
+        "max_destination_bytes": 8 * 1024**3,
+        "required_concurrency": 1,
+        "configured_concurrency": 1,
+        "concurrency_ready": True,
     }
+    assert readiness["checks"]["execution_policy"] == {"ready": True, "reasons": []}
+
+
+def test_processor_readiness_rejects_exact_loader_concurrency_above_one(
+    monkeypatch: Any,
+) -> None:
+    from whodoirunlike import hosted_processor
+
+    monkeypatch.setenv("WHODOIRUNLIKE_PROCESSOR_SHARED_SECRET", "secret")
+    monkeypatch.setenv("WHODOIRUNLIKE_SKIP_DENSEPOSE", "true")
+    monkeypatch.setenv("WHODOIRUNLIKE_SAM31_GPU_EXACT_CV2_LOADER", "true")
+    monkeypatch.setenv("WHODOIRUNLIKE_PROCESSOR_CONCURRENCY", "2")
+    monkeypatch.setattr(
+        hosted_processor,
+        "identity_setup_status",
+        lambda backend=None: {"ready": True, "reasons": [], "backend": backend},
+    )
+    monkeypatch.setattr(
+        hosted_processor,
+        "sam31_gpu_setup_status",
+        lambda: {"ready": True, "reasons": [], "backend": "sam31_gpu"},
+    )
+    monkeypatch.setattr(
+        hosted_processor,
+        "pose_setup_status",
+        lambda backend: {"ready": True, "reasons": [], "backend": backend},
+    )
+
+    readiness = hosted_processor.processor_readiness()
+
+    assert readiness["ready_for_full_pipeline"] is False
+    assert readiness["sam31_input_loader"]["configured_concurrency"] == 2
+    assert readiness["sam31_input_loader"]["concurrency_ready"] is False
+    assert readiness["checks"]["execution_policy"]["ready"] is False
+    assert "CONCURRENCY=1" in readiness["checks"]["execution_policy"]["reasons"][-1]
+
+
+def test_processor_readiness_allows_other_concurrency_when_exact_loader_is_disabled(
+    monkeypatch: Any,
+) -> None:
+    from whodoirunlike import hosted_processor
+
+    monkeypatch.setenv("WHODOIRUNLIKE_PROCESSOR_SHARED_SECRET", "secret")
+    monkeypatch.setenv("WHODOIRUNLIKE_SKIP_DENSEPOSE", "true")
+    monkeypatch.setenv("WHODOIRUNLIKE_SAM31_GPU_EXACT_CV2_LOADER", "false")
+    monkeypatch.setenv("WHODOIRUNLIKE_PROCESSOR_CONCURRENCY", "2")
+    monkeypatch.setattr(
+        hosted_processor,
+        "identity_setup_status",
+        lambda backend=None: {"ready": True, "reasons": [], "backend": backend},
+    )
+    monkeypatch.setattr(
+        hosted_processor,
+        "sam31_gpu_setup_status",
+        lambda: {"ready": True, "reasons": [], "backend": "sam31_gpu"},
+    )
+    monkeypatch.setattr(
+        hosted_processor,
+        "pose_setup_status",
+        lambda backend: {"ready": True, "reasons": [], "backend": backend},
+    )
+
+    readiness = hosted_processor.processor_readiness()
+
+    assert readiness["ready_for_full_pipeline"] is True
+    assert readiness["sam31_input_loader"]["concurrency_ready"] is False
     assert readiness["checks"]["execution_policy"] == {"ready": True, "reasons": []}
 
 
@@ -2131,6 +2202,11 @@ def test_process_hosted_job_emits_complete_lifecycle_with_worker_attempt_id(
     monkeypatch.setenv("WHODOIRUNLIKE_INLINE_MASK_FALLBACK_BACKEND", "sam31_mlx")
     monkeypatch.setenv("WHODOIRUNLIKE_SAM31_GPU_EXACT_CV2_LOADER", "true")
     monkeypatch.setenv("WHODOIRUNLIKE_SAM31_GPU_EXACT_CV2_CHUNK_FRAMES", "3")
+    monkeypatch.setenv("WHODOIRUNLIKE_SAM31_GPU_EXACT_CV2_MAX_FRAMES", "321")
+    monkeypatch.setenv(
+        "WHODOIRUNLIKE_SAM31_GPU_EXACT_CV2_MAX_DESTINATION_BYTES",
+        "456789",
+    )
 
     def make_telemetry(**kwargs: Any) -> ProcessingTelemetry:
         telemetry = ProcessingTelemetry(
@@ -2246,6 +2322,11 @@ def test_process_hosted_job_emits_complete_lifecycle_with_worker_attempt_id(
     assert events[0]["runtime"]["parallel_post_fusion"] is True
     assert events[0]["runtime"]["sam31_input_loader_mode"] == "exact_cv2"
     assert events[0]["runtime"]["sam31_exact_cv2_chunk_frames"] == 3
+    assert events[0]["runtime"]["sam31_exact_cv2_max_frames"] == 321
+    assert events[0]["runtime"]["sam31_exact_cv2_max_destination_bytes"] == 456789
+    assert events[0]["runtime"]["sam31_exact_cv2_required_concurrency"] == 1
+    assert events[0]["runtime"]["sam31_exact_cv2_configured_concurrency"] == 1
+    assert events[0]["runtime"]["sam31_exact_cv2_concurrency_ready"] is True
     assert events[0]["runtime"]["identity_detector_model"] == "runner-seg.engine"
     assert events[0]["runtime"]["inline_mask_dilation_pixels"] == 7
     assert events[0]["runtime"]["inline_mask_temporal_reset_gap_frames"] == 11

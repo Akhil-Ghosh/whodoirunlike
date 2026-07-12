@@ -92,9 +92,9 @@ def test_manual_image_build_is_sha_only_and_cannot_move_latest() -> None:
 
 def test_exact_cv2_loader_remains_opt_in_in_the_full_image() -> None:
     dockerfile = (ROOT / "Dockerfile.runpod").read_text(encoding="utf-8")
-    runner = (ROOT / "src/whodoirunlike/sam31_gpu_runner.py").read_text(
+    config = (ROOT / "src/whodoirunlike/sam31_loader_config.py").read_text(
         encoding="utf-8"
     )
 
     assert "WHODOIRUNLIKE_SAM31_GPU_EXACT_CV2_LOADER=" not in dockerfile
-    assert "_env_bool(SAM31_EXACT_CV2_LOADER_ENV, default=False)" in runner
+    assert "SAM31_EXACT_CV2_LOADER_ENV, False" in config

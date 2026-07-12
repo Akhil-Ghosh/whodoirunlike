@@ -14,6 +14,13 @@ from whodoirunlike.cv_flow import utc_now_iso
 from whodoirunlike.mask_artifacts import write_masks_jsonl_from_video
 from whodoirunlike.running_clip_run import RunningClipRun
 from whodoirunlike.sam31_cv2_loader import scoped_sam31_exact_cv2_loader
+from whodoirunlike.sam31_loader_config import (
+    DEFAULT_SAM31_EXACT_CV2_CHUNK_FRAMES,
+    DEFAULT_SAM31_EXACT_CV2_MAX_DESTINATION_BYTES,
+    DEFAULT_SAM31_EXACT_CV2_MAX_FRAMES,
+    REQUIRED_SAM31_EXACT_CV2_CONCURRENCY,
+    sam31_exact_cv2_loader_settings,
+)
 from whodoirunlike.sam2_runner import (
     extract_video_frames,
     inspect_video,
@@ -28,9 +35,6 @@ DEFAULT_SAM31_GPU_MODEL = "facebook/sam3.1"
 DEFAULT_SAM31_GPU_OBJ_ID = 1
 DEFAULT_SAM31_GPU_TRACK_PROMPT_ANCHORS = 6
 DEFAULT_SAM31_GPU_DISABLE_DEMO_SUPPRESSION = True
-SAM31_EXACT_CV2_LOADER_ENV = "WHODOIRUNLIKE_SAM31_GPU_EXACT_CV2_LOADER"
-SAM31_EXACT_CV2_CHUNK_FRAMES_ENV = "WHODOIRUNLIKE_SAM31_GPU_EXACT_CV2_CHUNK_FRAMES"
-DEFAULT_SAM31_EXACT_CV2_CHUNK_FRAMES = 8
 Sam31GpuProgressCallback = Callable[[dict[str, Any]], None]
 
 _SAM31_GPU_PREDICTOR_LOCK = threading.Lock()
@@ -43,14 +47,6 @@ def _env_bool(name: str, default: bool = False) -> bool:
     if raw is None:
         return default
     return raw.strip().lower() in {"1", "true", "yes", "on"}
-
-
-def _env_int(name: str, default: int, *, minimum: int, maximum: int) -> int:
-    try:
-        value = int(os.getenv(name, str(default)))
-    except (TypeError, ValueError):
-        value = default
-    return max(minimum, min(maximum, value))
 
 
 def _predictor_config_key(build_kwargs: dict[str, Any]) -> tuple[Any, ...]:
@@ -540,7 +536,9 @@ def _collect_sam31_masks(
     progress_callback: Callable[[int, int, str], None] | None = None,
     preseed_track_anchors: bool = True,
     exact_cv2_loader_enabled: bool = False,
-    exact_cv2_chunk_frames: int = 8,
+    exact_cv2_chunk_frames: int = DEFAULT_SAM31_EXACT_CV2_CHUNK_FRAMES,
+    exact_cv2_max_frames: int = DEFAULT_SAM31_EXACT_CV2_MAX_FRAMES,
+    exact_cv2_max_destination_bytes: int = DEFAULT_SAM31_EXACT_CV2_MAX_DESTINATION_BYTES,
 ) -> tuple[dict[int, np.ndarray], dict[str, Any]]:
     import torch
 
@@ -564,6 +562,8 @@ def _collect_sam31_masks(
         tracking_module=tracking_module,
         enabled=exact_cv2_loader_enabled,
         chunk_frames=exact_cv2_chunk_frames,
+        max_frames=exact_cv2_max_frames,
+        max_destination_bytes=exact_cv2_max_destination_bytes,
     ) as loader_probe:
         response = predictor.handle_request(
             request={
@@ -583,8 +583,11 @@ def _collect_sam31_masks(
         "input_loader": {
             "mode": "exact_cv2" if exact_cv2_loader_enabled else "upstream",
             "enabled": bool(exact_cv2_loader_enabled),
+            "attempted": bool(loader_probe.attempted),
             "used": bool(loader_probe.used),
             "chunk_frames": max(1, int(exact_cv2_chunk_frames)),
+            "max_frames": max(1, int(exact_cv2_max_frames)),
+            "max_destination_bytes": max(1, int(exact_cv2_max_destination_bytes)),
             "fallback_reason": loader_probe.fallback_reason,
             "diagnostics": (
                 loader_probe.diagnostics.to_dict()
@@ -1171,13 +1174,7 @@ def run_sam31_gpu_mask(
         "WHODOIRUNLIKE_SAM31_GPU_PRESEED_ANCHORS",
         default=True,
     )
-    exact_cv2_loader_enabled = _env_bool(SAM31_EXACT_CV2_LOADER_ENV, default=False)
-    exact_cv2_chunk_frames = _env_int(
-        SAM31_EXACT_CV2_CHUNK_FRAMES_ENV,
-        DEFAULT_SAM31_EXACT_CV2_CHUNK_FRAMES,
-        minimum=1,
-        maximum=64,
-    )
+    exact_cv2_loader = sam31_exact_cv2_loader_settings()
     with _borrow_sam31_gpu_predictor(
         builder=build_sam3_multiplex_video_predictor,
         build_kwargs=predictor_build_kwargs,
@@ -1203,8 +1200,10 @@ def run_sam31_gpu_mask(
                     direction=direction,
                 ),
                 preseed_track_anchors=preseed_track_anchors,
-                exact_cv2_loader_enabled=exact_cv2_loader_enabled,
-                exact_cv2_chunk_frames=exact_cv2_chunk_frames,
+                exact_cv2_loader_enabled=exact_cv2_loader.enabled,
+                exact_cv2_chunk_frames=exact_cv2_loader.chunk_frames,
+                exact_cv2_max_frames=exact_cv2_loader.max_frames,
+                exact_cv2_max_destination_bytes=exact_cv2_loader.max_destination_bytes,
             )
     prompt_summary["sam31_predictor_cache"] = predictor_cache
     prompt_summary["sam31"] = sam_prompt_diagnostics
@@ -1335,11 +1334,19 @@ def run_sam31_gpu_mask(
         "close_session_seconds": float(
             sam_prompt_diagnostics.get("timings", {}).get("close_session_seconds", 0.0)
         ),
-        "exact_cv2_loader_enabled": exact_cv2_loader_enabled,
+        "exact_cv2_loader_enabled": exact_cv2_loader.enabled,
+        "exact_cv2_loader_attempted": bool(
+            sam_prompt_diagnostics.get("input_loader", {}).get("attempted", False)
+        ),
         "exact_cv2_loader_used": bool(
             sam_prompt_diagnostics.get("input_loader", {}).get("used", False)
         ),
-        "exact_cv2_loader_chunk_frames": exact_cv2_chunk_frames,
+        "exact_cv2_loader_chunk_frames": exact_cv2_loader.chunk_frames,
+        "exact_cv2_loader_max_frames": exact_cv2_loader.max_frames,
+        "exact_cv2_loader_max_destination_bytes": exact_cv2_loader.max_destination_bytes,
+        "exact_cv2_loader_required_concurrency": REQUIRED_SAM31_EXACT_CV2_CONCURRENCY,
+        "exact_cv2_loader_configured_concurrency": exact_cv2_loader.configured_concurrency,
+        "exact_cv2_loader_concurrency_ready": exact_cv2_loader.concurrency_ready,
         "exact_cv2_loader_seconds": float(
             (
                 sam_prompt_diagnostics.get("input_loader", {}).get("diagnostics") or {}

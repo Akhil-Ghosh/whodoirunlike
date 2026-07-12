@@ -3,24 +3,11 @@ from __future__ import annotations
 import os
 from typing import Any
 
+from whodoirunlike.sam31_loader_config import sam31_exact_cv2_loader_settings
+
 
 def _sam31_input_loader_health() -> dict[str, Any]:
-    enabled = os.getenv(
-        "WHODOIRUNLIKE_SAM31_GPU_EXACT_CV2_LOADER",
-        "false",
-    ).strip().lower() in {"1", "true", "yes", "on"}
-    try:
-        chunk_frames = int(
-            os.getenv("WHODOIRUNLIKE_SAM31_GPU_EXACT_CV2_CHUNK_FRAMES", "8")
-        )
-    except (TypeError, ValueError):
-        chunk_frames = 8
-    chunk_frames = max(1, min(64, chunk_frames))
-    return {
-        "mode": "exact_cv2" if enabled else "upstream",
-        "enabled": enabled,
-        "chunk_frames": chunk_frames,
-    }
+    return sam31_exact_cv2_loader_settings().to_dict()
 
 
 def _shallow_health() -> dict[str, Any]:

@@ -17,6 +17,10 @@ from whodoirunlike.identity_runner import DEFAULT_IDENTITY_BACKEND, run_identity
 from whodoirunlike.processing_telemetry import ProcessingTelemetry
 from whodoirunlike.qc import run_qc_metrics
 from whodoirunlike.running_clip_run import RunningClipRun
+from whodoirunlike.sam31_loader_config import (
+    REQUIRED_SAM31_EXACT_CV2_CONCURRENCY,
+    sam31_exact_cv2_loader_settings,
+)
 from whodoirunlike.sam31_mlx_runner import run_sam31_mlx_mask
 from whodoirunlike.video_io import make_browser_playable_mp4
 
@@ -552,26 +556,21 @@ def run_full_cv_pipeline(
         "parallel_presentation": parallel_mask_presentation,
     }
     if mask_backend.strip().lower() in _SAM31_GPU_BACKENDS:
-        exact_cv2_loader_enabled = _env_bool_value(
-            "WHODOIRUNLIKE_SAM31_GPU_EXACT_CV2_LOADER",
-            False,
-        )
+        exact_cv2_loader = sam31_exact_cv2_loader_settings()
         mask_runtime.update(
             {
-                "input_loader_mode": (
-                    "exact_cv2" if exact_cv2_loader_enabled else "upstream"
+                "input_loader_mode": exact_cv2_loader.mode,
+                "exact_cv2_loader_enabled": exact_cv2_loader.enabled,
+                "exact_cv2_chunk_frames": exact_cv2_loader.chunk_frames,
+                "exact_cv2_max_frames": exact_cv2_loader.max_frames,
+                "exact_cv2_max_destination_bytes": (
+                    exact_cv2_loader.max_destination_bytes
                 ),
-                "exact_cv2_loader_enabled": exact_cv2_loader_enabled,
-                "exact_cv2_chunk_frames": max(
-                    1,
-                    min(
-                        64,
-                        _env_nonnegative_int(
-                            "WHODOIRUNLIKE_SAM31_GPU_EXACT_CV2_CHUNK_FRAMES",
-                            8,
-                        ),
-                    ),
+                "exact_cv2_required_concurrency": REQUIRED_SAM31_EXACT_CV2_CONCURRENCY,
+                "exact_cv2_configured_concurrency": (
+                    exact_cv2_loader.configured_concurrency
                 ),
+                "exact_cv2_concurrency_ready": exact_cv2_loader.concurrency_ready,
             }
         )
     mask_phase_spans: dict[str, str | None] | None = _MASK_PHASE_SPANS

@@ -10,6 +10,11 @@ from typing import Any, Callable, Iterator
 import cv2
 import numpy as np
 
+from whodoirunlike.sam31_loader_config import (
+    DEFAULT_SAM31_EXACT_CV2_MAX_DESTINATION_BYTES,
+    DEFAULT_SAM31_EXACT_CV2_MAX_FRAMES,
+)
+
 
 @dataclass(frozen=True)
 class ExactCv2LoaderDiagnostics:
@@ -19,6 +24,8 @@ class ExactCv2LoaderDiagnostics:
     chunk_frames: int
     max_buffered_frames: int
     peak_host_staging_bytes: int
+    max_frames: int
+    max_destination_bytes: int
     destination_bytes: int
     output_tensor_bytes: int
     output_shape: tuple[int, ...]
@@ -35,8 +42,13 @@ class ExactCv2LoaderUnavailable(RuntimeError):
     """The bounded loader cannot safely preallocate an exact output tensor."""
 
 
+class ExactCv2LoaderSafetyLimitExceeded(RuntimeError):
+    """The input exceeds a configured hard bound for the exact loader."""
+
+
 @dataclass
 class ExactCv2LoaderProbe:
+    attempted: bool = False
     used: bool = False
     diagnostics: ExactCv2LoaderDiagnostics | None = None
     fallback_reason: str | None = None
@@ -52,6 +64,8 @@ def scoped_sam31_exact_cv2_loader(
     tracking_module: Any,
     enabled: bool,
     chunk_frames: int,
+    max_frames: int = DEFAULT_SAM31_EXACT_CV2_MAX_FRAMES,
+    max_destination_bytes: int = DEFAULT_SAM31_EXACT_CV2_MAX_DESTINATION_BYTES,
 ) -> Iterator[ExactCv2LoaderProbe]:
     """Substitute SAM's imported loader only for one serialized session start.
 
@@ -81,20 +95,25 @@ def scoped_sam31_exact_cv2_loader(
         if not is_supported_video or video_loader_type != "cv2":
             return original_loader(**kwargs)
 
-        probe.used = True
+        probe.attempted = True
         try:
-            return load_video_frames_exact_cv2(
+            result = load_video_frames_exact_cv2(
                 video_path=resource_path,
                 image_size=int(kwargs["image_size"]),
                 offload_video_to_cpu=bool(kwargs["offload_video_to_cpu"]),
                 img_mean=tuple(kwargs.get("img_mean") or (0.5, 0.5, 0.5)),
                 img_std=tuple(kwargs.get("img_std") or (0.5, 0.5, 0.5)),
                 chunk_frames=chunk_frames,
+                max_frames=max_frames,
+                max_destination_bytes=max_destination_bytes,
                 diagnostics_callback=lambda sample: setattr(probe, "diagnostics", sample),
             )
         except ExactCv2LoaderUnavailable as exc:
+            probe.used = False
             probe.fallback_reason = str(exc)
             return original_loader(**kwargs)
+        probe.used = True
+        return result
 
     with _UPSTREAM_LOADER_PATCH_LOCK:
         setattr(tracking_module, "load_resource_as_video_frames", replacement_loader)
@@ -113,6 +132,8 @@ def load_video_frames_exact_cv2(
     img_mean: tuple[float, float, float] = (0.5, 0.5, 0.5),
     img_std: tuple[float, float, float] = (0.5, 0.5, 0.5),
     chunk_frames: int = 8,
+    max_frames: int = DEFAULT_SAM31_EXACT_CV2_MAX_FRAMES,
+    max_destination_bytes: int = DEFAULT_SAM31_EXACT_CV2_MAX_DESTINATION_BYTES,
     diagnostics_callback: Callable[[ExactCv2LoaderDiagnostics], None] | None = None,
 ) -> tuple[Any, int, int]:
     """Load SAM frames with upstream-equivalent CV2 preprocessing.
@@ -126,6 +147,8 @@ def load_video_frames_exact_cv2(
 
     started_at = time.perf_counter()
     effective_chunk_frames = max(1, int(chunk_frames))
+    effective_max_frames = max(1, int(max_frames))
+    effective_max_destination_bytes = max(1, int(max_destination_bytes))
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         raise ValueError(f"Could not open video: {video_path}")
@@ -137,6 +160,22 @@ def load_video_frames_exact_cv2(
         if frame_capacity <= 0:
             raise ExactCv2LoaderUnavailable(
                 "OpenCV did not report a positive frame count for bounded preallocation"
+            )
+
+        destination_bytes = (
+            frame_capacity * image_size * image_size * 3 * np.dtype(np.float32).itemsize
+        )
+        if frame_capacity > effective_max_frames:
+            raise ExactCv2LoaderSafetyLimitExceeded(
+                "SAM exact CV2 loader refused "
+                f"{frame_capacity} frames because the configured maximum is "
+                f"{effective_max_frames}; refusing unbounded upstream fallback"
+            )
+        if destination_bytes > effective_max_destination_bytes:
+            raise ExactCv2LoaderSafetyLimitExceeded(
+                "SAM exact CV2 loader refused a "
+                f"{destination_bytes}-byte destination because the configured maximum is "
+                f"{effective_max_destination_bytes}; refusing unbounded upstream fallback"
             )
 
         device = "cpu" if offload_video_to_cpu else "cuda"
@@ -221,9 +260,9 @@ def load_video_frames_exact_cv2(
                     chunk_frames=effective_chunk_frames,
                     max_buffered_frames=max_buffered_frames,
                     peak_host_staging_bytes=peak_host_staging_bytes,
-                    destination_bytes=(
-                        frame_capacity * image_size * image_size * 3 * np.dtype(np.float32).itemsize
-                    ),
+                    max_frames=effective_max_frames,
+                    max_destination_bytes=effective_max_destination_bytes,
+                    destination_bytes=destination_bytes,
                     output_tensor_bytes=(
                         decoded_frames * image_size * image_size * 3 * np.dtype(np.float32).itemsize
                     ),

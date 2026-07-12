@@ -22,6 +22,11 @@ def test_runpod_handler_health(monkeypatch: Any) -> None:
         "mode": "exact_cv2",
         "enabled": True,
         "chunk_frames": 4,
+        "max_frames": 600,
+        "max_destination_bytes": 8 * 1024**3,
+        "required_concurrency": 1,
+        "configured_concurrency": 1,
+        "concurrency_ready": True,
     }
 
 

@@ -46,12 +46,8 @@ from whodoirunlike.processing_telemetry import (
 )
 from whodoirunlike.running_clip_run import RunningClipRun
 from whodoirunlike.sam2_runner import inspect_video
-from whodoirunlike.sam31_gpu_runner import (
-    DEFAULT_SAM31_EXACT_CV2_CHUNK_FRAMES,
-    DEFAULT_SAM31_GPU_MODEL,
-    SAM31_EXACT_CV2_CHUNK_FRAMES_ENV,
-    SAM31_EXACT_CV2_LOADER_ENV,
-)
+from whodoirunlike.sam31_gpu_runner import DEFAULT_SAM31_GPU_MODEL
+from whodoirunlike.sam31_loader_config import sam31_exact_cv2_loader_settings
 from whodoirunlike.sam31_mlx_runner import DEFAULT_SAM31_MLX_MODEL
 from whodoirunlike.video_io import make_browser_playable_mp4
 
@@ -1330,20 +1326,7 @@ def _env_int(name: str, default: int, *, minimum: int = 0) -> int:
 
 
 def _sam31_input_loader_settings() -> dict[str, Any]:
-    enabled = _env_bool(SAM31_EXACT_CV2_LOADER_ENV, False)
-    chunk_frames = min(
-        64,
-        _env_int(
-            SAM31_EXACT_CV2_CHUNK_FRAMES_ENV,
-            DEFAULT_SAM31_EXACT_CV2_CHUNK_FRAMES,
-            minimum=1,
-        ),
-    )
-    return {
-        "mode": "exact_cv2" if enabled else "upstream",
-        "enabled": enabled,
-        "chunk_frames": chunk_frames,
-    }
+    return sam31_exact_cv2_loader_settings().to_dict()
 
 
 def _inline_mask_settings() -> dict[str, Any]:
@@ -1820,6 +1803,15 @@ def processor_readiness() -> dict[str, Any]:
             "WHODOIRUNLIKE_PARALLEL_MASK_PRESENTATION requires sam31_gpu, "
             "an mmpose backend, and DensePose enabled."
         )
+    if (
+        sam31_input_loader["enabled"]
+        and not sam31_input_loader["concurrency_ready"]
+    ):
+        execution_policy_reasons.append(
+            "WHODOIRUNLIKE_SAM31_GPU_EXACT_CV2_LOADER requires "
+            "WHODOIRUNLIKE_PROCESSOR_CONCURRENCY=1; configured concurrency is "
+            f"{sam31_input_loader['configured_concurrency']}."
+        )
     checks = {
         "processor_secret": _readiness_check("processor_secret", _secret_status),
         "identity": _readiness_check(
@@ -1899,6 +1891,19 @@ def process_hosted_job(payload: WorkerJobRequest, *, raise_on_error: bool = Fals
             "sam31_input_loader_mode": sam31_input_loader["mode"],
             "sam31_exact_cv2_loader_enabled": sam31_input_loader["enabled"],
             "sam31_exact_cv2_chunk_frames": sam31_input_loader["chunk_frames"],
+            "sam31_exact_cv2_max_frames": sam31_input_loader["max_frames"],
+            "sam31_exact_cv2_max_destination_bytes": sam31_input_loader[
+                "max_destination_bytes"
+            ],
+            "sam31_exact_cv2_required_concurrency": sam31_input_loader[
+                "required_concurrency"
+            ],
+            "sam31_exact_cv2_configured_concurrency": sam31_input_loader[
+                "configured_concurrency"
+            ],
+            "sam31_exact_cv2_concurrency_ready": sam31_input_loader[
+                "concurrency_ready"
+            ],
             **inline_mask_settings,
             "attempt_timing_available": has_attempt_timing,
         },

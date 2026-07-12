@@ -714,7 +714,12 @@ def test_collect_sam31_masks_scopes_exact_cv2_loader_to_session_start(
     @contextmanager
     def scoped_loader(**kwargs: object):
         scoped_calls.append(kwargs)
-        yield types.SimpleNamespace(used=False, diagnostics=None, fallback_reason=None)
+        yield types.SimpleNamespace(
+            attempted=False,
+            used=False,
+            diagnostics=None,
+            fallback_reason=None,
+        )
 
     monkeypatch.setattr(
         sam31_gpu_runner,
@@ -736,6 +741,8 @@ def test_collect_sam31_masks_scopes_exact_cv2_loader_to_session_start(
         obj_id=1,
         exact_cv2_loader_enabled=True,
         exact_cv2_chunk_frames=3,
+        exact_cv2_max_frames=21,
+        exact_cv2_max_destination_bytes=987654,
     )
 
     assert scoped_calls == [
@@ -743,6 +750,8 @@ def test_collect_sam31_masks_scopes_exact_cv2_loader_to_session_start(
             "tracking_module": tracking_module,
             "enabled": True,
             "chunk_frames": 3,
+            "max_frames": 21,
+            "max_destination_bytes": 987654,
         }
     ]
 

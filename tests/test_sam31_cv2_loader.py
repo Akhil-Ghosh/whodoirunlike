@@ -13,6 +13,7 @@ import pytest
 
 from whodoirunlike.sam31_cv2_loader import (
     ExactCv2LoaderDiagnostics,
+    ExactCv2LoaderSafetyLimitExceeded,
     load_video_frames_exact_cv2,
 )
 
@@ -112,6 +113,8 @@ def test_exact_cv2_loader_bounds_host_staging_to_configured_chunk(tmp_path: Path
     assert sample.decoded_frames == frames.shape[0] == 7
     assert sample.max_buffered_frames <= 2
     assert sample.peak_host_staging_bytes <= 2 * bytes_per_frame * (1 + 4)
+    assert sample.max_frames == 600
+    assert sample.max_destination_bytes == 8 * 1024**3
     assert sample.destination_bytes == 7 * bytes_per_frame * 4
 
 
@@ -144,6 +147,7 @@ def test_scoped_sam_loader_uses_exact_cv2_and_restores_upstream(tmp_path: Path) 
         )
         assert frames.shape == (7, 3, 32, 32)
         assert (height, width) == (34, 46)
+        assert probe.attempted is True
         assert probe.used is True
         assert probe.diagnostics is not None
         assert original_calls == []
@@ -217,7 +221,82 @@ def test_frame_count_mismatch_releases_destination_before_upstream_fallback(
         )
 
     assert result == "upstream"
-    assert probe.used is True
+    assert probe.attempted is True
+    assert probe.used is False
     assert probe.fallback_reason == (
         "OpenCV decoded more frames than CAP_PROP_FRAME_COUNT reported"
     )
+
+
+@pytest.mark.parametrize(
+    ("max_frames", "max_destination_bytes", "expected_message"),
+    [
+        (6, 8 * 1024**3, "7 frames because the configured maximum is 6"),
+        (600, 7 * 32 * 32 * 3 * 4 - 1, "destination because the configured maximum"),
+    ],
+)
+def test_exact_cv2_loader_hard_fails_before_allocation_when_input_exceeds_safety_bound(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    max_frames: int,
+    max_destination_bytes: int,
+    expected_message: str,
+) -> None:
+    video_path = tmp_path / "synthetic.mp4"
+    _write_synthetic_video(video_path)
+    empty_calls = 0
+    real_empty = torch.empty
+
+    def recording_empty(*args, **kwargs):
+        nonlocal empty_calls
+        empty_calls += 1
+        return real_empty(*args, **kwargs)
+
+    monkeypatch.setattr(torch, "empty", recording_empty)
+
+    with pytest.raises(ExactCv2LoaderSafetyLimitExceeded, match=expected_message):
+        load_video_frames_exact_cv2(
+            video_path=str(video_path),
+            image_size=32,
+            offload_video_to_cpu=True,
+            max_frames=max_frames,
+            max_destination_bytes=max_destination_bytes,
+        )
+
+    assert empty_calls == 0
+
+
+def test_scoped_loader_does_not_fall_back_when_safety_bound_is_exceeded(
+    tmp_path: Path,
+) -> None:
+    from whodoirunlike.sam31_cv2_loader import scoped_sam31_exact_cv2_loader
+
+    video_path = tmp_path / "synthetic.mp4"
+    _write_synthetic_video(video_path)
+    original_calls = 0
+
+    def original_loader(**_kwargs):
+        nonlocal original_calls
+        original_calls += 1
+        return "upstream"
+
+    tracking_module = types.SimpleNamespace(load_resource_as_video_frames=original_loader)
+
+    with pytest.raises(ExactCv2LoaderSafetyLimitExceeded, match="refusing unbounded"):
+        with scoped_sam31_exact_cv2_loader(
+            tracking_module=tracking_module,
+            enabled=True,
+            chunk_frames=2,
+            max_frames=6,
+        ) as probe:
+            tracking_module.load_resource_as_video_frames(
+                resource_path=str(video_path),
+                image_size=32,
+                offload_video_to_cpu=True,
+                video_loader_type="cv2",
+            )
+
+    assert original_calls == 0
+    assert probe.attempted is True
+    assert probe.used is False
+    assert probe.fallback_reason is None

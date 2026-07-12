@@ -86,14 +86,32 @@ class DashboardQueryContractTests(unittest.TestCase):
             query.sql,
         )
 
-    def test_failed_stage_time_is_attributed_to_the_attempt(self) -> None:
+    def test_overlapping_and_failed_stage_time_uses_interval_union(self) -> None:
         query = dashboard_queries.build_query("attempts")
         self.assertIn(
-            "event_type IN ('stage_completed', 'stage_failed') THEN elapsed_seconds",
+            "WHERE event_type IN ('stage_completed', 'stage_failed')",
             query.sql,
         )
         self.assertIn(
-            "WHERE event_type IN ('stage_completed', 'stage_failed')",
+            "ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING",
+            query.sql,
+        )
+        self.assertIn("stage_interval_unions AS", query.sql)
+        self.assertIn(
+            "sum(date_diff('millisecond', interval_start_at, interval_end_at)) / 1000.0",
+            query.sql,
+        )
+        self.assertIn("AS observed_stage_seconds", query.sql)
+        self.assertIn("greatest(", query.sql)
+        self.assertIn("coalesce(a.attempt_failed_seconds, 0)", query.sql)
+        self.assertNotIn(
+            "coalesce(a.attempt_complete_seconds, a.result_ready_seconds, "
+            "a.attempt_failed_seconds, 0)",
+            query.sql,
+        )
+        self.assertNotIn(
+            "sum(CASE WHEN event_type IN ('stage_completed', 'stage_failed') "
+            "THEN elapsed_seconds ELSE 0 END)",
             query.sql,
         )
 
@@ -107,6 +125,8 @@ class DashboardQueryContractTests(unittest.TestCase):
         self.assertNotIn("measurements_json", query.sql)
         self.assertIn("e.model_build_seconds", query.sql)
         self.assertIn("e.predictor_lock_wait_seconds", query.sql)
+        self.assertIn("e.data_ready_seconds", query.sql)
+        self.assertIn("e.presentation_tail_seconds", query.sql)
         self.assertNotIn("attributes_json", query.sql)
 
     def test_attempt_list_and_stalls_are_strictly_bounded(self) -> None:

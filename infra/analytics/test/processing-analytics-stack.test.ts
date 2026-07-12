@@ -48,14 +48,19 @@ test("retains RunPod endpoint provenance in the validated event schema", () => {
   );
 });
 
-test("exposes predictor cache timing as typed analytics columns", () => {
+test("exposes pipeline optimization timing as typed analytics columns", () => {
   const output = template();
   const tables = Object.values(output.findResources("AWS::Glue::Table"));
   const processingEvents = tables.find(
     (resource) => resource.Properties?.TableInput?.Name === "processing_events",
   );
   const columns = processingEvents?.Properties?.TableInput?.StorageDescriptor?.Columns ?? [];
-  for (const name of ["model_build_seconds", "predictor_lock_wait_seconds"]) {
+  for (const name of [
+    "model_build_seconds",
+    "predictor_lock_wait_seconds",
+    "data_ready_seconds",
+    "presentation_tail_seconds",
+  ]) {
     assert.ok(
       columns.some(
         (column: { Name?: string; Type?: string }) =>
@@ -178,6 +183,35 @@ test("queries expose complete attempt attribution and per-attempt span totals", 
   }
   assert.match(attemptQuery, /unattributed_to_attempt_complete_seconds/);
   assert.match(attemptQuery, /top_bottleneck_stage/);
+  assert.match(attemptQuery, /stage_interval_unions AS/);
+  assert.match(
+    attemptQuery,
+    /ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING/,
+  );
+  assert.match(
+    attemptQuery,
+    /sum\(date_diff\('millisecond', interval_start_at, interval_end_at\)\) \/ 1000\.0 AS observed_stage_seconds/,
+  );
+  assert.match(attemptQuery, /greatest\(/);
+  assert.match(attemptQuery, /coalesce\(a\.attempt_failed_seconds, 0\)/);
+  assert.doesNotMatch(
+    attemptQuery,
+    /coalesce\(\s*a\.attempt_complete_seconds,\s*a\.result_ready_seconds,\s*a\.attempt_failed_seconds/,
+  );
+  assert.doesNotMatch(
+    attemptQuery,
+    /sum\(CASE WHEN event_type = 'stage_completed' THEN elapsed_seconds ELSE 0 END\) AS observed_stage_seconds/,
+  );
+
+  const milestoneQuery = queryByName("result_ready_vs_analysis_complete_last_30_days");
+  assert.match(
+    milestoneQuery,
+    /result_ready_seconds - analysis_complete_seconds AS publish_after_analysis_seconds/,
+  );
+  assert.doesNotMatch(
+    milestoneQuery,
+    /analysis_complete_seconds - result_ready_seconds/,
+  );
 
   const spanQuery = queryByName("span_latency_last_30_days");
   assert.match(spanQuery, /sum\(elapsed_seconds\) AS total_span_seconds/);

@@ -131,9 +131,9 @@ events AS (
 )""".strip()
 
 
-def _attempt_dimensions_cte() -> str:
-    return """
-attempt_dimensions AS (
+def _attempt_dimensions_cte(name: str = "attempt_dimensions") -> str:
+    return f"""
+{name} AS (
   SELECT run_id, attempt_id,
          max_by(environment, sequence) FILTER (WHERE environment IS NOT NULL) AS environment,
          max_by(backend, sequence) FILTER (
@@ -157,7 +157,6 @@ attempt_dimensions AS (
          max(CASE WHEN event_type = 'attempt_failed' THEN 1 ELSE 0 END) AS failed,
          max(CASE WHEN event_type = 'attempt_completed' THEN 1 ELSE 0 END) AS completed,
          max(CASE WHEN stage IN ('processor_enqueue', 'processor_queue') THEN 1 ELSE 0 END) AS processing_was_requested,
-         sum(CASE WHEN event_type IN ('stage_completed', 'stage_failed') THEN elapsed_seconds ELSE 0 END) AS observed_stage_seconds,
          max_by(stage, elapsed_seconds) FILTER (
            WHERE event_type IN ('stage_completed', 'stage_failed')
          ) AS bottleneck_stage,
@@ -168,6 +167,58 @@ attempt_dimensions AS (
          max_by(span, sequence) FILTER (WHERE span IS NOT NULL) AS last_span,
          max_by(event_type, sequence) AS last_event_type
   FROM events
+  GROUP BY run_id, attempt_id
+)""".strip()
+
+
+def _stage_active_time_ctes() -> str:
+    """Build overlap-aware stage intervals for attempt-level wall-time accounting."""
+
+    return """
+stage_intervals AS (
+  SELECT run_id, attempt_id, sequence, event_id,
+         date_add(
+           'millisecond',
+           -CAST(round(elapsed_seconds * 1000) AS bigint),
+           from_iso8601_timestamp(event_time)
+         ) AS interval_start_at,
+         from_iso8601_timestamp(event_time) AS interval_end_at
+  FROM events
+  WHERE event_type IN ('stage_completed', 'stage_failed')
+    AND elapsed_seconds IS NOT NULL
+),
+stage_interval_scan AS (
+  SELECT *,
+         max(interval_end_at) OVER (
+           PARTITION BY run_id, attempt_id
+           ORDER BY interval_start_at, interval_end_at, sequence, event_id
+           ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
+         ) AS prior_max_end_at
+  FROM stage_intervals
+),
+stage_interval_groups AS (
+  SELECT *,
+         sum(
+           CASE WHEN prior_max_end_at IS NULL OR interval_start_at > prior_max_end_at
+                THEN 1 ELSE 0 END
+         ) OVER (
+           PARTITION BY run_id, attempt_id
+           ORDER BY interval_start_at, interval_end_at, sequence, event_id
+           ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+         ) AS interval_group
+  FROM stage_interval_scan
+),
+stage_interval_unions AS (
+  SELECT run_id, attempt_id, interval_group,
+         min(interval_start_at) AS interval_start_at,
+         max(interval_end_at) AS interval_end_at
+  FROM stage_interval_groups
+  GROUP BY run_id, attempt_id, interval_group
+),
+stage_active_time AS (
+  SELECT run_id, attempt_id,
+         sum(date_diff('millisecond', interval_start_at, interval_end_at)) / 1000.0 AS observed_stage_seconds
+  FROM stage_interval_unions
   GROUP BY run_id, attempt_id
 )""".strip()
 
@@ -325,7 +376,15 @@ def _attempts(raw: Any) -> DashboardQuery:
         )
     sql = f"""
 WITH {_deduplicated_ctes(days)},
-{_attempt_dimensions_cte()}
+{_stage_active_time_ctes()},
+{_attempt_dimensions_cte("attempt_dimensions_base")},
+attempt_dimensions AS (
+  SELECT a.*,
+         coalesce(s.observed_stage_seconds, 0.0) AS observed_stage_seconds
+  FROM attempt_dimensions_base a
+  LEFT JOIN stage_active_time s
+    ON a.run_id = s.run_id AND a.attempt_id = s.attempt_id
+)
 SELECT a.run_id, a.attempt_id, a.first_event_at, a.last_event_at,
        CASE WHEN a.failed = 1 THEN 'failed' WHEN a.completed = 1 THEN 'complete' ELSE 'running' END AS status,
        a.environment, a.backend, a.gpu_type, a.processor_version, a.cold_start,
@@ -334,7 +393,11 @@ SELECT a.run_id, a.attempt_id, a.first_event_at, a.last_event_at,
        a.result_ready_seconds, a.analysis_complete_seconds, a.attempt_complete_seconds,
        a.observed_stage_seconds,
        greatest(
-         coalesce(a.attempt_complete_seconds, a.result_ready_seconds, a.attempt_failed_seconds, 0) - a.observed_stage_seconds,
+         greatest(
+           coalesce(a.attempt_complete_seconds, 0),
+           coalesce(a.result_ready_seconds, 0),
+           coalesce(a.attempt_failed_seconds, 0)
+         ) - a.observed_stage_seconds,
          0
        ) AS unattributed_seconds,
        a.bottleneck_stage, a.bottleneck_seconds,
@@ -376,6 +439,7 @@ SELECT e.run_id, e.attempt_id, e.sequence, e.event_type, e.stage, e.span, e.stat
        e.timing_basis, e.artifact_type, e.artifact_size_bytes, e.processed_frames, e.total_frames,
        e.backend, e.gpu_type, e.processor_version, e.cold_start,
        e.runpod_endpoint_id, e.cache_hit, e.model_build_seconds, e.predictor_lock_wait_seconds,
+       e.data_ready_seconds, e.presentation_tail_seconds,
        e.error_class, e.error_code
 FROM attempt_events e
 CROSS JOIN origin o

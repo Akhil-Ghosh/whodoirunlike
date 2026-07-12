@@ -254,6 +254,11 @@ def flatten_event(event: dict[str, Any], *, ingested_at: str) -> dict[str, Any]:
             measurements,
             "predictor_lock_wait_seconds",
         ),
+        "data_ready_seconds": _value(measurements, "data_ready_seconds"),
+        "presentation_tail_seconds": _value(
+            measurements,
+            "presentation_tail_seconds",
+        ),
         "rss_mb": _value(resources, "rss_mb"),
         "peak_rss_mb": _megabytes(resources, "peak_rss_mb", "peak_rss_bytes"),
         "cuda_allocated_mb": _megabytes(

@@ -54,6 +54,8 @@ const VALIDATED_COLUMNS: glue.CfnTable.ColumnProperty[] = [
   { name: "cache_hit", type: "boolean" },
   { name: "model_build_seconds", type: "double" },
   { name: "predictor_lock_wait_seconds", type: "double" },
+  { name: "data_ready_seconds", type: "double" },
+  { name: "presentation_tail_seconds", type: "double" },
   { name: "rss_mb", type: "double" },
   { name: "peak_rss_mb", type: "double" },
   { name: "cuda_allocated_mb", type: "double" },
@@ -609,6 +611,54 @@ events AS (
   SELECT * FROM ranked WHERE event_rank = 1
 )`;
 
+    const stageActiveTimeCtes = `
+stage_intervals AS (
+  SELECT run_id, attempt_id, sequence, event_id,
+         date_add(
+           'millisecond',
+           -CAST(round(elapsed_seconds * 1000) AS bigint),
+           from_iso8601_timestamp(event_time)
+         ) AS interval_start_at,
+         from_iso8601_timestamp(event_time) AS interval_end_at
+  FROM events
+  WHERE event_type IN ('stage_completed', 'stage_failed')
+    AND elapsed_seconds IS NOT NULL
+),
+stage_interval_scan AS (
+  SELECT *,
+         max(interval_end_at) OVER (
+           PARTITION BY run_id, attempt_id
+           ORDER BY interval_start_at, interval_end_at, sequence, event_id
+           ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
+         ) AS prior_max_end_at
+  FROM stage_intervals
+),
+stage_interval_groups AS (
+  SELECT *,
+         sum(
+           CASE WHEN prior_max_end_at IS NULL OR interval_start_at > prior_max_end_at
+                THEN 1 ELSE 0 END
+         ) OVER (
+           PARTITION BY run_id, attempt_id
+           ORDER BY interval_start_at, interval_end_at, sequence, event_id
+           ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+         ) AS interval_group
+  FROM stage_interval_scan
+),
+stage_interval_unions AS (
+  SELECT run_id, attempt_id, interval_group,
+         min(interval_start_at) AS interval_start_at,
+         max(interval_end_at) AS interval_end_at
+  FROM stage_interval_groups
+  GROUP BY run_id, attempt_id, interval_group
+),
+stage_active_time AS (
+  SELECT run_id, attempt_id,
+         sum(date_diff('millisecond', interval_start_at, interval_end_at)) / 1000.0 AS observed_stage_seconds
+  FROM stage_interval_unions
+  GROUP BY run_id, attempt_id
+)`;
+
     const addNamedQuery = (
       id: string,
       props: athena.CfnNamedQueryProps,
@@ -736,9 +786,10 @@ ORDER BY p95_seconds DESC`,
       database: databaseName,
       workGroup: workGroup.name,
       name: "attempt_stage_breakdown_last_30_days",
-      description: "One row per attempt for waterfalls and slow-run inspection",
+      description: "One row per attempt with overlap-aware active stage time",
       queryString: `
 WITH ${deduplicatedCtes},
+${stageActiveTimeCtes},
 attempts AS (
   SELECT run_id, attempt_id, max(attempt_number) AS attempt_number,
        max(duration_bucket) AS duration_bucket,
@@ -762,15 +813,25 @@ attempts AS (
        max(CASE WHEN event_type = 'result_ready' THEN elapsed_seconds END) AS result_ready_seconds,
        max(CASE WHEN event_type = 'analysis_completed' THEN elapsed_seconds END) AS analysis_complete_seconds,
        max(CASE WHEN event_type = 'attempt_completed' THEN elapsed_seconds END) AS attempt_complete_seconds,
-       sum(CASE WHEN event_type = 'stage_completed' THEN elapsed_seconds ELSE 0 END) AS observed_stage_seconds,
+       max(CASE WHEN event_type = 'attempt_failed' THEN elapsed_seconds END) AS attempt_failed_seconds,
        max_by(stage, elapsed_seconds) FILTER (WHERE event_type = 'stage_completed') AS top_bottleneck_stage,
        max(elapsed_seconds) FILTER (WHERE event_type = 'stage_completed') AS top_bottleneck_seconds
   FROM events
   GROUP BY run_id, attempt_id
 )
-SELECT *,
-       attempt_complete_seconds - observed_stage_seconds AS unattributed_to_attempt_complete_seconds
-FROM attempts
+SELECT a.*,
+       coalesce(s.observed_stage_seconds, 0.0) AS observed_stage_seconds,
+       greatest(
+         greatest(
+           coalesce(a.attempt_complete_seconds, 0),
+           coalesce(a.result_ready_seconds, 0),
+           coalesce(a.attempt_failed_seconds, 0)
+         ) - coalesce(s.observed_stage_seconds, 0.0),
+         0
+       ) AS unattributed_to_attempt_complete_seconds
+FROM attempts a
+LEFT JOIN stage_active_time s
+  ON a.run_id = s.run_id AND a.attempt_id = s.attempt_id
 ORDER BY result_ready_seconds DESC NULLS LAST`,
     });
 
@@ -778,7 +839,7 @@ ORDER BY result_ready_seconds DESC NULLS LAST`,
       database: databaseName,
       workGroup: workGroup.name,
       name: "result_ready_vs_analysis_complete_last_30_days",
-      description: "Compares the user-visible milestone with completion of selected analysis",
+      description: "Measures publish lag from analysis completion to the user-visible result",
       queryString: `
 WITH ${deduplicatedCtes},
 attempts AS (
@@ -789,7 +850,7 @@ attempts AS (
   GROUP BY run_id, attempt_id
 )
 SELECT run_id, attempt_id, result_ready_seconds, analysis_complete_seconds,
-       analysis_complete_seconds - result_ready_seconds AS analysis_minus_result_seconds
+       result_ready_seconds - analysis_complete_seconds AS publish_after_analysis_seconds
 FROM attempts
 WHERE result_ready_seconds IS NOT NULL OR analysis_complete_seconds IS NOT NULL
 ORDER BY greatest(coalesce(result_ready_seconds, 0), coalesce(analysis_complete_seconds, 0)) DESC`,

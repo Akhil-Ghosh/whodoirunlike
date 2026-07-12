@@ -56,6 +56,8 @@ def event_payload(**overrides: object) -> dict[str, object]:
             "cache_hit": True,
             "model_build_seconds": 0.0,
             "predictor_lock_wait_seconds": 0.004,
+            "data_ready_seconds": 78.25,
+            "presentation_tail_seconds": 16.75,
         },
     }
     payload.update(overrides)
@@ -82,6 +84,8 @@ class EventContractTests(unittest.TestCase):
         self.assertIs(flat["cache_hit"], True)
         self.assertEqual(flat["model_build_seconds"], 0.0)
         self.assertEqual(flat["predictor_lock_wait_seconds"], 0.004)
+        self.assertEqual(flat["data_ready_seconds"], 78.25)
+        self.assertEqual(flat["presentation_tail_seconds"], 16.75)
         self.assertEqual(event_partition(event["event_time"]), ("2026-07-09", "21"))
 
     def test_rejects_unknown_field(self) -> None:

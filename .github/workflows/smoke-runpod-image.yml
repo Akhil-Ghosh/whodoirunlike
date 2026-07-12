@@ -50,19 +50,41 @@ jobs:
             "${{ inputs.image }}" \
             - <<'PY'
           import json
+          import os
 
           from whodoirunlike.sam31_benchmark_serverless import handler
+          from whodoirunlike.sam31_parity import (
+              EXACT_CANDIDATE_COMMIT,
+              EXACT_CANDIDATE_IMAGE_DIGEST,
+              EXACT_CONTROL_COMMIT,
+              EXACT_CONTROL_IMAGE_DIGEST,
+          )
 
           payload = handler({"input": {"type": "health"}})
           print(json.dumps(payload, indent=2, sort_keys=True))
+          expected_role = os.environ["EXPECTED_BENCHMARK_IMAGE_ROLE"]
 
           assert payload["status"] == "ok"
           assert payload["service"] == "sam31_speed_lab"
           assert payload["benchmark_enabled"] is True
           assert payload["has_hf_token"] is True
           assert payload["variant_ids"] == ["production_candidate_public_entrypoint"]
-          assert payload["base_image_role"] == __import__("os").environ[
-              "EXPECTED_BENCHMARK_IMAGE_ROLE"
-          ]
+          assert payload["base_image_role"] == expected_role
           assert payload["base_contract"]["passed"] is True
+          assert payload["base_contract"]["image_role"] == expected_role
+          assert payload["base_contract"]["checked_file_count"] == 12
+          assert payload["base_contract"]["mismatches"] == []
+          if expected_role == "schedule_only":
+              assert "production_candidate_schedule_only" in payload["full_profile_ids"]
+              assert payload["base_processor_commit"] == EXACT_CONTROL_COMMIT
+              assert payload["base_processor_image_digest"] == EXACT_CONTROL_IMAGE_DIGEST
+              assert payload["code_overlay_source"] == "git_commit"
+              assert payload["code_overlay_commit"] == EXACT_CANDIDATE_COMMIT
+              assert (
+                  payload["code_overlay_reference_image_digest"]
+                  == EXACT_CANDIDATE_IMAGE_DIGEST
+              )
+              assert payload["dependency_base_role"] == "control"
+              assert payload["dependency_base_commit"] == EXACT_CONTROL_COMMIT
+              assert payload["dependency_base_image_digest"] == EXACT_CONTROL_IMAGE_DIGEST
           PY

@@ -12,6 +12,7 @@ import os
 import platform
 import site
 import sys
+from collections import Counter
 from importlib.metadata import PackageNotFoundError, distributions, version
 from pathlib import Path
 from typing import Any
@@ -269,22 +270,26 @@ def _verify_dependency_baseline(
     baseline: dict[str, Any],
     current: dict[str, Any],
 ) -> list[str]:
-    def distribution_labels(value: Any) -> set[str]:
+    def distribution_counts(value: Any) -> Counter[str]:
         if not isinstance(value, list):
-            return set()
-        return {
+            return Counter()
+        return Counter(
             f"{item['name']}=={item['version']}"
             for item in value
             if isinstance(item, dict)
             and isinstance(item.get("name"), str)
             and isinstance(item.get("version"), str)
-        }
+        )
 
-    def summarize(labels: set[str]) -> str:
-        ordered = sorted(labels)
+    def summarize(counts: Counter[str]) -> str:
+        ordered = sorted(counts.items())
         visible = ordered[:20]
         suffix = f", +{len(ordered) - len(visible)} more" if len(ordered) > len(visible) else ""
-        return ",".join(visible) + suffix if visible else "none"
+        return (
+            ",".join(f"{label} x{count}" for label, count in visible) + suffix
+            if visible
+            else "none"
+        )
 
     errors: list[str] = []
     for key in (
@@ -302,8 +307,8 @@ def _verify_dependency_baseline(
         if current.get(key) == baseline.get(key):
             continue
         if key == "distributions":
-            expected = distribution_labels(baseline.get(key))
-            observed = distribution_labels(current.get(key))
+            expected = distribution_counts(baseline.get(key))
+            observed = distribution_counts(current.get(key))
             errors.append(
                 "dependency contract changed for distributions "
                 f"(missing={summarize(expected - observed)}; "

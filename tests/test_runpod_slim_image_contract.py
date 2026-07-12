@@ -163,7 +163,24 @@ def test_contract_detects_dependency_and_application_drift() -> None:
     ]
     assert contract._verify_dependency_baseline(baseline, distribution_drift) == [
         "dependency contract changed for distributions "
-        "(missing=none; unexpected=runtime-only==2.0)"
+        "(missing=none; unexpected=runtime-only==2.0 x1)"
+    ]
+
+    duplicate_drift_baseline = dict(baseline)
+    duplicate_drift_baseline["distributions"] = [
+        {"name": "duplicated", "version": "1.0"},
+        {"name": "duplicated", "version": "1.0"},
+    ]
+    duplicate_drift_current = dict(duplicate_drift_baseline)
+    duplicate_drift_current["distributions"] = [
+        {"name": "duplicated", "version": "1.0"},
+    ]
+    assert contract._verify_dependency_baseline(
+        duplicate_drift_baseline,
+        duplicate_drift_current,
+    ) == [
+        "dependency contract changed for distributions "
+        "(missing=duplicated==1.0 x1; unexpected=none)"
     ]
 
     application = {

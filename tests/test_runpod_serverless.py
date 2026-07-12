@@ -9,6 +9,8 @@ def test_runpod_handler_health(monkeypatch: Any) -> None:
     monkeypatch.setenv("WHODOIRUNLIKE_PROCESSOR_SHARED_SECRET", "secret")
     monkeypatch.setenv("HF_TOKEN", "token")
     monkeypatch.setenv("WHODOIRUNLIKE_MASK_BACKEND", "sam31_gpu")
+    monkeypatch.setenv("WHODOIRUNLIKE_SAM31_GPU_EXACT_CV2_LOADER", "true")
+    monkeypatch.setenv("WHODOIRUNLIKE_SAM31_GPU_EXACT_CV2_CHUNK_FRAMES", "4")
 
     response = runpod_serverless.handler({"input": {"type": "health"}})
 
@@ -16,6 +18,11 @@ def test_runpod_handler_health(monkeypatch: Any) -> None:
     assert response["health"]["has_processor_secret"] is True
     assert response["health"]["has_hf_token"] is True
     assert response["health"]["mask_backend"] == "sam31_gpu"
+    assert response["health"]["sam31_input_loader"] == {
+        "mode": "exact_cv2",
+        "enabled": True,
+        "chunk_frames": 4,
+    }
 
 
 def test_runpod_handler_deep_health(monkeypatch: Any) -> None:

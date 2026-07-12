@@ -46,7 +46,12 @@ from whodoirunlike.processing_telemetry import (
 )
 from whodoirunlike.running_clip_run import RunningClipRun
 from whodoirunlike.sam2_runner import inspect_video
-from whodoirunlike.sam31_gpu_runner import DEFAULT_SAM31_GPU_MODEL
+from whodoirunlike.sam31_gpu_runner import (
+    DEFAULT_SAM31_EXACT_CV2_CHUNK_FRAMES,
+    DEFAULT_SAM31_GPU_MODEL,
+    SAM31_EXACT_CV2_CHUNK_FRAMES_ENV,
+    SAM31_EXACT_CV2_LOADER_ENV,
+)
 from whodoirunlike.sam31_mlx_runner import DEFAULT_SAM31_MLX_MODEL
 from whodoirunlike.video_io import make_browser_playable_mp4
 
@@ -1324,6 +1329,23 @@ def _env_int(name: str, default: int, *, minimum: int = 0) -> int:
         return default
 
 
+def _sam31_input_loader_settings() -> dict[str, Any]:
+    enabled = _env_bool(SAM31_EXACT_CV2_LOADER_ENV, False)
+    chunk_frames = min(
+        64,
+        _env_int(
+            SAM31_EXACT_CV2_CHUNK_FRAMES_ENV,
+            DEFAULT_SAM31_EXACT_CV2_CHUNK_FRAMES,
+            minimum=1,
+        ),
+    )
+    return {
+        "mode": "exact_cv2" if enabled else "upstream",
+        "enabled": enabled,
+        "chunk_frames": chunk_frames,
+    }
+
+
 def _inline_mask_settings() -> dict[str, Any]:
     return {
         "identity_detector_model": os.getenv(
@@ -1777,6 +1799,7 @@ def processor_readiness() -> dict[str, Any]:
     parallel_pose_densepose = _env_bool("WHODOIRUNLIKE_PARALLEL_POSE_DENSEPOSE")
     parallel_post_fusion = _env_bool("WHODOIRUNLIKE_PARALLEL_POST_FUSION")
     inline_mask_settings = _inline_mask_settings()
+    sam31_input_loader = _sam31_input_loader_settings()
     execution_policy_reasons: list[str] = []
     if (
         parallel_pose_densepose
@@ -1827,6 +1850,7 @@ def processor_readiness() -> dict[str, Any]:
         "parallel_pose_densepose": parallel_pose_densepose,
         "parallel_post_fusion": parallel_post_fusion,
         "inline_mask": inline_mask_settings,
+        "sam31_input_loader": sam31_input_loader,
         "checks": checks,
     }
 
@@ -1848,6 +1872,7 @@ def process_hosted_job(payload: WorkerJobRequest, *, raise_on_error: bool = Fals
     parallel_pose_densepose = _env_bool("WHODOIRUNLIKE_PARALLEL_POSE_DENSEPOSE")
     parallel_post_fusion = _env_bool("WHODOIRUNLIKE_PARALLEL_POST_FUSION")
     inline_mask_settings = _inline_mask_settings()
+    sam31_input_loader = _sam31_input_loader_settings()
     attempt_elapsed_offset, has_attempt_timing = _elapsed_from_timestamp(
         payload.attempt_started_at or payload.processor_enqueued_at,
         invocation_started_at,
@@ -1871,6 +1896,9 @@ def process_hosted_job(payload: WorkerJobRequest, *, raise_on_error: bool = Fals
             "parallel_mask_presentation": parallel_mask_presentation,
             "parallel_pose_densepose": parallel_pose_densepose,
             "parallel_post_fusion": parallel_post_fusion,
+            "sam31_input_loader_mode": sam31_input_loader["mode"],
+            "sam31_exact_cv2_loader_enabled": sam31_input_loader["enabled"],
+            "sam31_exact_cv2_chunk_frames": sam31_input_loader["chunk_frames"],
             **inline_mask_settings,
             "attempt_timing_available": has_attempt_timing,
         },

@@ -1749,6 +1749,8 @@ def test_processor_readiness_accepts_sam_mask_presentation_overlap(monkeypatch: 
     monkeypatch.setenv("WHODOIRUNLIKE_POSE_BACKEND", "mmpose_rtmpose_l_384")
     monkeypatch.setenv("WHODOIRUNLIKE_SKIP_DENSEPOSE", "false")
     monkeypatch.setenv("WHODOIRUNLIKE_PARALLEL_MASK_PRESENTATION", "true")
+    monkeypatch.setenv("WHODOIRUNLIKE_SAM31_GPU_EXACT_CV2_LOADER", "true")
+    monkeypatch.setenv("WHODOIRUNLIKE_SAM31_GPU_EXACT_CV2_CHUNK_FRAMES", "3")
     monkeypatch.setattr(
         hosted_processor,
         "identity_setup_status",
@@ -1774,6 +1776,11 @@ def test_processor_readiness_accepts_sam_mask_presentation_overlap(monkeypatch: 
 
     assert readiness["ready_for_full_pipeline"] is True
     assert readiness["parallel_mask_presentation"] is True
+    assert readiness["sam31_input_loader"] == {
+        "mode": "exact_cv2",
+        "enabled": True,
+        "chunk_frames": 3,
+    }
     assert readiness["checks"]["execution_policy"] == {"ready": True, "reasons": []}
 
 
@@ -2122,6 +2129,8 @@ def test_process_hosted_job_emits_complete_lifecycle_with_worker_attempt_id(
     monkeypatch.setenv("WHODOIRUNLIKE_INLINE_MASK_DEFER_BROWSER_ENCODING", "true")
     monkeypatch.setenv("WHODOIRUNLIKE_INLINE_MASK_SAM_FALLBACK", "false")
     monkeypatch.setenv("WHODOIRUNLIKE_INLINE_MASK_FALLBACK_BACKEND", "sam31_mlx")
+    monkeypatch.setenv("WHODOIRUNLIKE_SAM31_GPU_EXACT_CV2_LOADER", "true")
+    monkeypatch.setenv("WHODOIRUNLIKE_SAM31_GPU_EXACT_CV2_CHUNK_FRAMES", "3")
 
     def make_telemetry(**kwargs: Any) -> ProcessingTelemetry:
         telemetry = ProcessingTelemetry(
@@ -2235,6 +2244,8 @@ def test_process_hosted_job_emits_complete_lifecycle_with_worker_attempt_id(
     assert events[0]["runtime"]["parallel_mask_presentation"] is False
     assert events[0]["runtime"]["parallel_pose_densepose"] is True
     assert events[0]["runtime"]["parallel_post_fusion"] is True
+    assert events[0]["runtime"]["sam31_input_loader_mode"] == "exact_cv2"
+    assert events[0]["runtime"]["sam31_exact_cv2_chunk_frames"] == 3
     assert events[0]["runtime"]["identity_detector_model"] == "runner-seg.engine"
     assert events[0]["runtime"]["inline_mask_dilation_pixels"] == 7
     assert events[0]["runtime"]["inline_mask_temporal_reset_gap_frames"] == 11

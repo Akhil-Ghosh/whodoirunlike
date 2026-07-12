@@ -649,6 +649,102 @@ def test_collect_sam31_masks_tracks_visual_box_object_id(monkeypatch, tmp_path: 
     assert {request["start_frame_index"] for request in predictor.stream_requests} == {0}
     assert sorted(masks) == [0, 1]
     assert masks[1].tolist() == [[1, 1], [0, 0]]
+    assert set(diagnostics["timings"]) == {
+        "start_session_seconds",
+        "box_prompt_seconds",
+        "point_prompt_seconds",
+        "initial_prompt_seconds",
+        "preseed_anchors_seconds",
+        "propagation_seconds",
+        "close_session_seconds",
+    }
+    assert all(value >= 0 for value in diagnostics["timings"].values())
+
+
+def test_collect_sam31_masks_scopes_exact_cv2_loader_to_session_start(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    class FakeInferenceMode:
+        def __enter__(self) -> None:
+            return None
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+    fake_torch = types.SimpleNamespace(
+        float32="float32",
+        int32="int32",
+        tensor=lambda data, **_kwargs: np.asarray(data),
+        inference_mode=lambda: FakeInferenceMode(),
+    )
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+
+    tracking_module = types.ModuleType("test_sam31_tracking_module")
+    monkeypatch.setitem(sys.modules, tracking_module.__name__, tracking_module)
+
+    class Model:
+        pass
+
+    Model.__module__ = tracking_module.__name__
+
+    class Predictor:
+        model = Model()
+
+        def handle_request(self, *, request: dict[str, object]) -> dict[str, object]:
+            if request["type"] == "start_session":
+                return {"session_id": "session-1"}
+            if request["type"] == "close_session":
+                return {}
+            if request["type"] == "add_prompt":
+                return {
+                    "outputs": {
+                        "out_obj_ids": np.array([1]),
+                        "out_binary_masks": np.array([[[1, 0], [0, 0]]], dtype=np.uint8),
+                    }
+                }
+            raise AssertionError(f"unexpected request: {request['type']}")
+
+        def handle_stream_request(self, *, request: dict[str, object]):
+            assert request["type"] == "propagate_in_video"
+            return []
+
+    scoped_calls: list[dict[str, object]] = []
+
+    @contextmanager
+    def scoped_loader(**kwargs: object):
+        scoped_calls.append(kwargs)
+        yield types.SimpleNamespace(used=False, diagnostics=None, fallback_reason=None)
+
+    monkeypatch.setattr(
+        sam31_gpu_runner,
+        "scoped_sam31_exact_cv2_loader",
+        scoped_loader,
+    )
+
+    _collect_sam31_masks(
+        predictor=Predictor(),
+        video_path=tmp_path / "clip.mp4",
+        prompt={
+            "frame_index": 0,
+            "points": np.array([[1, 1]], dtype=np.float32),
+            "labels": np.array([1], dtype=np.int32),
+        },
+        width=2,
+        height=2,
+        frame_count=1,
+        obj_id=1,
+        exact_cv2_loader_enabled=True,
+        exact_cv2_chunk_frames=3,
+    )
+
+    assert scoped_calls == [
+        {
+            "tracking_module": tracking_module,
+            "enabled": True,
+            "chunk_frames": 3,
+        }
+    ]
 
 
 def test_collect_sam31_masks_seeds_from_first_target_track_frame(

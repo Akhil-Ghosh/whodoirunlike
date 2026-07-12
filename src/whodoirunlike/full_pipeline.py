@@ -551,6 +551,29 @@ def run_full_cv_pipeline(
         "quality_mode": mask_quality_mode,
         "parallel_presentation": parallel_mask_presentation,
     }
+    if mask_backend.strip().lower() in _SAM31_GPU_BACKENDS:
+        exact_cv2_loader_enabled = _env_bool_value(
+            "WHODOIRUNLIKE_SAM31_GPU_EXACT_CV2_LOADER",
+            False,
+        )
+        mask_runtime.update(
+            {
+                "input_loader_mode": (
+                    "exact_cv2" if exact_cv2_loader_enabled else "upstream"
+                ),
+                "exact_cv2_loader_enabled": exact_cv2_loader_enabled,
+                "exact_cv2_chunk_frames": max(
+                    1,
+                    min(
+                        64,
+                        _env_nonnegative_int(
+                            "WHODOIRUNLIKE_SAM31_GPU_EXACT_CV2_CHUNK_FRAMES",
+                            8,
+                        ),
+                    ),
+                ),
+            }
+        )
     mask_phase_spans: dict[str, str | None] | None = _MASK_PHASE_SPANS
     mask_default_span: str | None = "inference"
     if inline_segmentation:

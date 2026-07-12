@@ -6,6 +6,7 @@ import base64
 import gzip
 import hashlib
 import json
+import mimetypes
 import os
 from pathlib import Path
 import re
@@ -15,43 +16,49 @@ from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
-
-RUN_ID = "11c51cf1-c4d0-42ef-a2e1-cb9e2605ef1b"
-BASE_ARTIFACT_URL = f"https://api.whodoirunlike.com/v1/artifacts/{RUN_ID}"
-ASSETS = {
-    "person_prompt_json": {
-        "url": f"{BASE_ARTIFACT_URL}/person_prompt.json",
-        "encoding": "base64",
-        "sha256": "66d0760138febcd8fee2b7d944aedd68bd7ada665cc47c7253de376cf065e26c",
-    },
-    "tracklets_jsonl": {
-        "url": f"{BASE_ARTIFACT_URL}/tracklets.jsonl",
-        "encoding": "gzip+base64",
-        "sha256": "47dea72891c0de6b95e7a255506c1afac1f7ee6525c2d1afe4589544fd760010",
-    },
-    "baseline_runner_mask_mp4": {
-        "url": f"{BASE_ARTIFACT_URL}/runner_mask.mp4",
-        "encoding": "base64",
-        "sha256": "0edf35fb0837d4083f0f73103631b10972c69347cc13ffccafa2cb78634c443f",
-    },
-}
-VARIANT_IDS = (
-    "production_control",
-    "preseed_single_pass",
-    "preseed_single_pass_frame_dir",
-    "preseed_single_pass_offload_video_cpu",
-    "preseed_single_pass_max_objects_1",
-    "probe_then_anchor_1",
-    "probe_then_anchor_8",
-    "probe_then_anchor_24",
-    "probe_then_anchor_64",
-    "seed_single_pass_cache_scaffold",
-    "preseed_single_pass_cache_scaffold",
-    "preseed_single_pass_cache_scaffold_compile",
-    "preseed_single_pass_cache_scaffold_compile_warm_up",
-    "preseed_single_pass_cache_scaffold_frame_dir",
-    "preseed_single_pass_cache_scaffold_frame_dir_offload",
+from whodoirunlike.sam31_parity import (
+    CANONICAL_FRAME130_FIXTURE_ID,
+    load_local_fixture_assets,
 )
+
+
+VARIANT_IDS = ("production_candidate_public_entrypoint",)
+FULL_PROFILE_IDS = (
+    "downstream_baseline_control",
+    "downstream_candidate_control",
+    "downstream_candidate_optimized",
+    "production_control",
+    "production_candidate",
+)
+FULL_PROFILE_MATRICES = {
+    "three-arm": [
+        "downstream_baseline_control",
+        "downstream_candidate_control",
+        "downstream_candidate_optimized",
+    ],
+    "production": ["production_control", "production_candidate"],
+    "production-reversed": ["production_candidate", "production_control"],
+    "authoritative-control": ["production_control"],
+    "authoritative-candidate": ["production_candidate"],
+}
+
+
+def _resolve_full_profile_ids(
+    *,
+    profile_id: str | None,
+    profile_matrix: str | None,
+) -> list[str]:
+    if profile_id and profile_matrix:
+        raise ValueError("Choose either --profile-id or --profile-matrix, not both.")
+    if profile_id:
+        if profile_id not in FULL_PROFILE_IDS:
+            raise ValueError(f"Unsupported full profile: {profile_id}")
+        return [profile_id]
+    matrix_id = profile_matrix or "three-arm"
+    try:
+        return list(FULL_PROFILE_MATRICES[matrix_id])
+    except KeyError as exc:
+        raise ValueError(f"Unsupported full profile matrix: {matrix_id}") from exc
 
 
 def _request_json(
@@ -62,9 +69,7 @@ def _request_json(
     timeout_seconds: float = 60.0,
 ) -> dict[str, Any]:
     data = (
-        json.dumps(payload, separators=(",", ":")).encode("utf-8")
-        if payload is not None
-        else None
+        json.dumps(payload, separators=(",", ":")).encode("utf-8") if payload is not None else None
     )
     headers = {"Accept": "application/json", "User-Agent": "wdirl-sam31-speed-lab/1"}
     if data is not None:
@@ -82,6 +87,73 @@ def _request_json(
         raise RuntimeError(f"Request failed for {url}: {exc.reason}") from exc
 
 
+def _create_artifact_sink(
+    *,
+    api_base_url: str,
+    source_clip: Path,
+) -> dict[str, str]:
+    content_type = mimetypes.guess_type(source_clip.name)[0] or "video/mp4"
+    body = source_clip.read_bytes()
+    request = Request(
+        f"{api_base_url.rstrip('/')}/v1/uploads",
+        data=body,
+        method="POST",
+        headers={
+            "Accept": "application/json",
+            "Content-Type": content_type,
+            "Content-Length": str(len(body)),
+            "X-Original-Filename": "parity-scratch-source.mp4",
+            "X-Clip-Consent": "operator-parity-scratch",
+            "User-Agent": "wdirl-sam31-speed-lab/1",
+        },
+    )
+    try:
+        with urlopen(request, timeout=120) as response:
+            created = json.loads(response.read().decode("utf-8"))
+    except HTTPError as exc:
+        response_body = exc.read(4096).decode("utf-8", errors="replace")
+        raise RuntimeError(
+            f"Could not create parity artifact sink ({exc.code}): {response_body}"
+        ) from exc
+    except URLError as exc:
+        raise RuntimeError(f"Could not create parity artifact sink: {exc.reason}") from exc
+    run_id = created.get("run_id")
+    attempt_id = created.get("attempt_id")
+    if not isinstance(run_id, str) or not isinstance(attempt_id, str):
+        raise RuntimeError("Parity artifact sink response omitted run_id or attempt_id.")
+    return {
+        "callback_base_url": api_base_url.rstrip("/"),
+        "run_id": run_id,
+        "attempt_id": attempt_id,
+    }
+
+
+def _load_or_create_artifact_sink(
+    *,
+    sink_file: Path,
+    api_base_url: str,
+    source_clip: Path,
+) -> dict[str, str]:
+    if sink_file.is_file():
+        payload = json.loads(sink_file.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict):
+            raise RuntimeError("Artifact sink file must contain a JSON object.")
+        required = {"callback_base_url", "run_id", "attempt_id"}
+        if set(payload) != required or not all(
+            isinstance(payload.get(key), str) and payload[key] for key in required
+        ):
+            raise RuntimeError("Artifact sink file has an invalid descriptor.")
+        return {key: str(payload[key]) for key in required}
+    if not source_clip.is_file():
+        raise RuntimeError(f"Canonical source clip is unavailable: {source_clip}")
+    sink = _create_artifact_sink(
+        api_base_url=api_base_url,
+        source_clip=source_clip,
+    )
+    _write_private_json(sink_file, sink)
+    return sink
+
+
 def _download(url: str) -> bytes:
     request = Request(url, headers={"User-Agent": "wdirl-sam31-speed-lab/1"})
     try:
@@ -94,20 +166,32 @@ def _download(url: str) -> bytes:
         raise RuntimeError(f"Could not fetch benchmark artifact: {exc.reason}") from exc
 
 
-def _build_assets() -> dict[str, Any]:
+def _encode_assets(raw_assets: dict[str, bytes]) -> dict[str, Any]:
     result: dict[str, Any] = {}
-    for name, spec in ASSETS.items():
-        raw = _download(str(spec["url"]))
+    for name, raw in raw_assets.items():
+        encoding = "gzip+base64" if name == "tracklets_jsonl" else "base64"
         digest = hashlib.sha256(raw).hexdigest()
-        if digest != spec["sha256"]:
-            raise RuntimeError(f"Downloaded benchmark artifact {name} failed SHA-256 verification.")
-        encoded_raw = gzip.compress(raw, compresslevel=9, mtime=0) if spec["encoding"] == "gzip+base64" else raw
+        encoded_raw = (
+            gzip.compress(raw, compresslevel=9, mtime=0) if encoding == "gzip+base64" else raw
+        )
         result[name] = {
-            "encoding": spec["encoding"],
+            "encoding": encoding,
             "sha256": digest,
             "data": base64.b64encode(encoded_raw).decode("ascii"),
         }
     return result
+
+
+def _build_assets(
+    *,
+    fixture_id: str = CANONICAL_FRAME130_FIXTURE_ID,
+    fixture_root: Path | None = None,
+) -> dict[str, Any]:
+    if fixture_root is None:
+        raise RuntimeError(
+            f"Fixture {fixture_id} requires --fixture-root with private local assets."
+        )
+    return _encode_assets(load_local_fixture_assets(fixture_id, fixture_root))
 
 
 def _write_private_json(path: Path, payload: dict[str, Any]) -> None:
@@ -134,7 +218,41 @@ def _cancel_job(base_url: str, job_id: str, api_key: str) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser(description="Run the isolated SAM 3.1 speed-lab fixture.")
     parser.add_argument("--endpoint-id", required=True)
-    parser.add_argument("--variant-id", required=True, choices=VARIANT_IDS)
+    parser.add_argument("--scope", choices=("mask", "full"), default="full")
+    parser.add_argument("--variant-id", choices=VARIANT_IDS)
+    parser.add_argument("--profile-id", choices=FULL_PROFILE_IDS)
+    parser.add_argument("--profile-matrix", choices=tuple(FULL_PROFILE_MATRICES))
+    parser.add_argument(
+        "--artifact-sink-file",
+        type=Path,
+        help=(
+            "Private JSON descriptor for a scratch Cloudflare/R2 sink. The first run "
+            "creates it; control and candidate runs reuse the same file."
+        ),
+    )
+    parser.add_argument(
+        "--sink-api-base-url",
+        default="https://api.whodoirunlike.com",
+    )
+    parser.add_argument(
+        "--source-clip",
+        type=Path,
+        default=Path("site/public/assets/demos/cole-source.mp4"),
+        help="Canonical clip used only to create an unstarted scratch sink job.",
+    )
+    parser.add_argument(
+        "--fixture-id",
+        choices=(CANONICAL_FRAME130_FIXTURE_ID,),
+        default=CANONICAL_FRAME130_FIXTURE_ID,
+    )
+    parser.add_argument(
+        "--fixture-root",
+        type=Path,
+        help=(
+            "Private local fixture directory containing tracklets.jsonl and runner_mask.mp4. "
+            "Files below artifacts/ are already gitignored."
+        ),
+    )
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--poll-seconds", type=float, default=5.0)
     parser.add_argument("--timeout-seconds", type=float, default=1200.0)
@@ -146,21 +264,65 @@ def main() -> int:
     if not api_key:
         parser.error("RUNPOD_API_KEY must be set in the environment")
 
-    print("Fetching and verifying the fixed production comparison assets...", flush=True)
+    if args.fixture_root is None:
+        parser.error(f"{CANONICAL_FRAME130_FIXTURE_ID} requires --fixture-root")
+    if args.scope == "mask" and (args.profile_id or args.profile_matrix):
+        parser.error("--profile-id and --profile-matrix require --scope full")
+    if args.scope == "full" and args.variant_id:
+        parser.error("--variant-id requires --scope mask")
+    if args.scope == "mask" and args.variant_id is None:
+        args.variant_id = VARIANT_IDS[0]
+    if args.artifact_sink_file is not None and args.scope != "full":
+        parser.error("--artifact-sink-file requires --scope full")
+    try:
+        profile_ids = (
+            _resolve_full_profile_ids(
+                profile_id=args.profile_id,
+                profile_matrix=args.profile_matrix,
+            )
+            if args.scope == "full"
+            else None
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
+    if args.artifact_sink_file is not None and profile_ids not in (
+        ["production_control"],
+        ["production_candidate"],
+    ):
+        parser.error(
+            "--artifact-sink-file requires authoritative-control, "
+            "authoritative-candidate, or the matching single --profile-id"
+        )
+    print(f"Loading and verifying fixture {args.fixture_id}...", flush=True)
+    benchmark_input = {
+        "type": "sam31_benchmark",
+        "schema_version": 1,
+        "scope": args.scope,
+        "fixture_id": args.fixture_id,
+        "assets": _build_assets(
+            fixture_id=args.fixture_id,
+            fixture_root=args.fixture_root,
+        ),
+    }
+    if args.scope == "mask":
+        benchmark_input["variant_id"] = args.variant_id
+    else:
+        benchmark_input["profile_ids"] = profile_ids
+        if args.artifact_sink_file is not None:
+            benchmark_input["artifact_sink"] = _load_or_create_artifact_sink(
+                sink_file=args.artifact_sink_file,
+                api_base_url=args.sink_api_base_url,
+                source_clip=args.source_clip,
+            )
     payload = {
-        "input": {
-            "type": "sam31_benchmark",
-            "schema_version": 1,
-            "fixture_id": "cole-8.68s-260f-v1",
-            "variant_id": args.variant_id,
-            "assets": _build_assets(),
-        },
+        "input": benchmark_input,
         "policy": {"executionTimeout": 900000, "ttl": 3600000},
     }
     request_size = len(json.dumps(payload, separators=(",", ":")).encode("utf-8"))
     if request_size >= 10_000_000:
         raise RuntimeError("Benchmark request exceeds RunPod's 10 MB async request limit.")
-    print(f"Submitting {args.variant_id} ({request_size:,} request bytes)...", flush=True)
+    selection = args.variant_id if args.scope == "mask" else ",".join(profile_ids or [])
+    print(f"Submitting {args.scope}:{selection} ({request_size:,} request bytes)...", flush=True)
     base_url = f"https://api.runpod.ai/v2/{args.endpoint_id}"
     submission = _request_json(
         f"{base_url}/run",

@@ -1,4 +1,4 @@
-name: Build RunPod SAM 3.1 Speed Lab
+name: Build RunPod SAM 3.1 Parity Images
 
 on:
   workflow_dispatch:
@@ -13,6 +13,14 @@ env:
 jobs:
   build:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - role: candidate
+            dockerfile: Dockerfile.runpod.benchmark
+          - role: control
+            dockerfile: Dockerfile.runpod.benchmark.control
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -41,10 +49,10 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: Dockerfile.runpod.benchmark
+          file: ${{ matrix.dockerfile }}
           push: true
           build-args: |
-            WHODOIRUNLIKE_PROCESSOR_VERSION=${{ github.sha }}
+            WHODOIRUNLIKE_BENCHMARK_VERSION=${{ github.sha }}
           tags: |
-            ${{ env.IMAGE_NAME }}:sam31-speed-lab-${{ github.sha }}
+            ${{ env.IMAGE_NAME }}:sam31-parity-${{ matrix.role }}-${{ github.sha }}
           provenance: false

@@ -1,4 +1,4 @@
-FROM ghcr.io/akhil-ghosh/whodoirunlike-runpod-processor@sha256:52392c71b9a44d804f0ba7fcd894247988319dbe98e6160cb05d70a13894714a
+FROM ghcr.io/akhil-ghosh/whodoirunlike-runpod-processor@sha256:a137045767045edb502f1fcce14f5e113ce3c92b2a376bfa2f04e906cea7e73b
 
 ARG WHODOIRUNLIKE_BENCHMARK_VERSION=unknown
 
@@ -7,17 +7,16 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     WHODOIRUNLIKE_ENABLE_SAM31_BENCHMARK=true \
     WHODOIRUNLIKE_ENVIRONMENT=benchmark \
     WHODOIRUNLIKE_BENCHMARK_VERSION=${WHODOIRUNLIKE_BENCHMARK_VERSION} \
-    WHODOIRUNLIKE_BENCHMARK_IMAGE_ROLE=candidate \
-    WHODOIRUNLIKE_BASE_PROCESSOR_COMMIT=657d36588f3ca073554bfd40071ff747e0e750bb \
-    WHODOIRUNLIKE_BASE_PROCESSOR_IMAGE_DIGEST=sha256:52392c71b9a44d804f0ba7fcd894247988319dbe98e6160cb05d70a13894714a \
+    WHODOIRUNLIKE_BENCHMARK_IMAGE_ROLE=control \
+    WHODOIRUNLIKE_BASE_PROCESSOR_COMMIT=8b33d07cd129cb6878f4630af133bf30c291914b \
+    WHODOIRUNLIKE_BASE_PROCESSOR_IMAGE_DIGEST=sha256:a137045767045edb502f1fcce14f5e113ce3c92b2a376bfa2f04e906cea7e73b \
     WHODOIRUNLIKE_CANDIDATE_COMMIT=657d36588f3ca073554bfd40071ff747e0e750bb \
     WHODOIRUNLIKE_CANDIDATE_IMAGE_DIGEST=sha256:52392c71b9a44d804f0ba7fcd894247988319dbe98e6160cb05d70a13894714a \
     WHODOIRUNLIKE_ENFORCE_BASE_CONTRACT=true
 
 WORKDIR /app
 
-# These four benchmark modules are absent from the immutable production image.
-# No production module, dependency, model, or runtime setting is replaced.
+# The identical additive benchmark overlay is applied to the exact 8b33 control.
 COPY src/whodoirunlike/sam31_parity.py /app/src/whodoirunlike/sam31_parity.py
 COPY src/whodoirunlike/sam31_benchmark.py /app/src/whodoirunlike/sam31_benchmark.py
 COPY src/whodoirunlike/pipeline_parity.py /app/src/whodoirunlike/pipeline_parity.py

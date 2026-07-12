@@ -1,12 +1,23 @@
 from __future__ import annotations
 
 import base64
+from dataclasses import replace
 import gzip
+import json
+from pathlib import Path
+from types import MappingProxyType
 
+import cv2
 import numpy as np
 import pytest
 
 from whodoirunlike import sam31_benchmark, sam31_benchmark_serverless
+from whodoirunlike.mask_artifacts import write_masks_jsonl_from_video
+from whodoirunlike.pipeline_parity import materialize_pipeline_fixture
+from whodoirunlike.sam31_parity import (
+    CANONICAL_FRAME130_FIXTURE_ID,
+    get_parity_fixture,
+)
 
 
 def test_decode_asset_verifies_gzip_payload_after_decompression(monkeypatch) -> None:
@@ -72,32 +83,99 @@ def test_quality_comparison_reports_exact_agreement() -> None:
     assert quality["dice_mean"] == 1.0
     assert quality["target_box_centroid_rate"]["candidate"] == 1.0
     assert quality["strict_mask_agreement_gate"]["passed"] is True
+    assert quality["strict_mask_agreement_gate"]["thresholds"] == {
+        "expected_frame_count": 2,
+        "iou_mean_min": 0.985,
+        "iou_p05_min": 0.975,
+        "boundary_f1_mean_min": 0.99,
+        "centroid_error_normalized_mean_max": 0.002,
+        "temporal_iou_absolute_delta_max": 0.01,
+        "fallback_used": False,
+        "box_loss_frame_count_max": 0,
+        "identity_switch_count_max": 0,
+    }
 
 
-def test_compile_variants_are_explicit_and_cache_distinct_predictors() -> None:
-    compile_only = sam31_benchmark.VARIANTS[
-        "preseed_single_pass_cache_scaffold_compile"
-    ]
-    compiled_and_warmed = sam31_benchmark.VARIANTS[
-        "preseed_single_pass_cache_scaffold_compile_warm_up"
-    ]
+def test_mask_benchmark_exposes_only_the_public_production_entrypoint() -> None:
+    source = Path(sam31_benchmark.__file__).read_text(encoding="utf-8")
 
-    assert compile_only.compile is True
-    assert compile_only.warm_up is False
-    assert compiled_and_warmed.compile is True
-    assert compiled_and_warmed.warm_up is True
-    assert sam31_benchmark._predictor_key(compile_only, None) != (
-        sam31_benchmark._predictor_key(compiled_and_warmed, None)
+    assert sam31_benchmark.BENCHMARK_VARIANT_IDS == ("production_candidate_public_entrypoint",)
+    assert "from whodoirunlike.sam31_gpu_runner import run_sam31_gpu_mask" in source
+    assert "_collect_sam31_masks" not in source
+    assert "_load_identity_track_boxes" not in source
+    assert "_synchronize_cuda" not in source
+
+
+def test_request_validation_selects_the_canonical_frame130_fixture(monkeypatch) -> None:
+    fixture = get_parity_fixture(CANONICAL_FRAME130_FIXTURE_ID)
+    prompt = fixture.prompt.canonical_bytes()
+    tracklets = b'{"frame_index":0}\n'
+    baseline_mask = b"mask-video"
+    specs = {
+        "person_prompt_json": sam31_benchmark.AssetSpec(
+            encoding="base64",
+            sha256=sam31_benchmark._sha256(prompt),
+            max_decoded_bytes=16 * 1024,
+        ),
+        "tracklets_jsonl": sam31_benchmark.AssetSpec(
+            encoding="gzip+base64",
+            sha256=sam31_benchmark._sha256(tracklets),
+            max_decoded_bytes=1024,
+        ),
+        "baseline_runner_mask_mp4": sam31_benchmark.AssetSpec(
+            encoding="base64",
+            sha256=sam31_benchmark._sha256(baseline_mask),
+            max_decoded_bytes=1024,
+        ),
+    }
+    monkeypatch.setattr(sam31_benchmark, "ASSET_SPECS", specs)
+
+    fixture_id, variant_id, decoded = sam31_benchmark._validate_request(
+        {
+            "type": sam31_benchmark.BENCHMARK_TYPE,
+            "schema_version": sam31_benchmark.BENCHMARK_SCHEMA_VERSION,
+            "fixture_id": CANONICAL_FRAME130_FIXTURE_ID,
+            "variant_id": sam31_benchmark.BENCHMARK_VARIANT_ID,
+            "assets": {
+                "person_prompt_json": {
+                    "encoding": "base64",
+                    "sha256": specs["person_prompt_json"].sha256,
+                    "data": base64.b64encode(prompt).decode("ascii"),
+                },
+                "tracklets_jsonl": {
+                    "encoding": "gzip+base64",
+                    "sha256": specs["tracklets_jsonl"].sha256,
+                    "data": base64.b64encode(gzip.compress(tracklets)).decode("ascii"),
+                },
+                "baseline_runner_mask_mp4": {
+                    "encoding": "base64",
+                    "sha256": specs["baseline_runner_mask_mp4"].sha256,
+                    "data": base64.b64encode(baseline_mask).decode("ascii"),
+                },
+            },
+        }
     )
+
+    assert fixture_id == CANONICAL_FRAME130_FIXTURE_ID
+    assert variant_id == sam31_benchmark.BENCHMARK_VARIANT_ID
+    assert decoded == {
+        "person_prompt_json": prompt,
+        "tracklets_jsonl": tracklets,
+        "baseline_runner_mask_mp4": baseline_mask,
+    }
 
 
 def test_serverless_handler_rejects_benchmark_when_disabled(monkeypatch) -> None:
     monkeypatch.delenv("WHODOIRUNLIKE_ENABLE_SAM31_BENCHMARK", raising=False)
 
     with pytest.raises(RuntimeError, match="disabled"):
-        sam31_benchmark_serverless.handler(
-            {"input": {"type": "sam31_benchmark"}}
-        )
+        sam31_benchmark_serverless.handler({"input": {"type": "sam31_benchmark"}})
+
+
+def test_serverless_health_advertises_canonical_frame130_fixture() -> None:
+    health = sam31_benchmark_serverless.handler({"input": {"type": "health"}})
+
+    assert CANONICAL_FRAME130_FIXTURE_ID in health["fixture_ids"]
 
 
 def test_serverless_handler_has_no_production_job_fallback() -> None:
@@ -125,3 +203,136 @@ def test_serverless_handler_runs_only_dedicated_benchmark(monkeypatch) -> None:
     )
 
     assert result == {"variant_id": "preseed_single_pass"}
+
+
+def test_serverless_handler_routes_full_scope_to_pipeline_parity(monkeypatch) -> None:
+    monkeypatch.setenv("WHODOIRUNLIKE_ENABLE_SAM31_BENCHMARK", "true")
+    monkeypatch.setattr(
+        sam31_benchmark_serverless,
+        "run_full_pipeline_benchmark",
+        lambda payload: {"scope": payload["scope"]},
+    )
+
+    result = sam31_benchmark_serverless.handler(
+        {
+            "input": {
+                "type": "sam31_benchmark",
+                "scope": "full",
+            }
+        }
+    )
+
+    assert result == {"scope": "full"}
+
+
+def test_serverless_health_advertises_full_profiles_and_scopes() -> None:
+    health = sam31_benchmark_serverless.handler({"input": {"type": "health"}})
+
+    assert health["scope_ids"] == ["mask", "full"]
+    assert health["default_full_profile_ids"] == [
+        "downstream_baseline_control",
+        "downstream_candidate_control",
+        "downstream_candidate_optimized",
+    ]
+    assert "production_candidate" in health["full_profile_ids"]
+
+
+def test_serverless_fails_closed_when_exact_base_contract_changes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("WHODOIRUNLIKE_ENABLE_SAM31_BENCHMARK", "true")
+    monkeypatch.setenv("WHODOIRUNLIKE_ENFORCE_BASE_CONTRACT", "true")
+    monkeypatch.setenv("WHODOIRUNLIKE_BENCHMARK_IMAGE_ROLE", "candidate")
+    monkeypatch.setattr(
+        sam31_benchmark_serverless,
+        "verify_non_overlay_production_files",
+        lambda _role: {
+            "passed": False,
+            "mismatches": ["full_pipeline.py"],
+        },
+    )
+
+    with pytest.raises(RuntimeError, match="full_pipeline.py"):
+        sam31_benchmark_serverless.handler(
+            {
+                "input": {
+                    "type": "sam31_benchmark",
+                    "scope": "full",
+                }
+            }
+        )
+
+
+def _write_test_video(path: Path) -> None:
+    writer = cv2.VideoWriter(
+        str(path),
+        cv2.VideoWriter_fourcc(*"mp4v"),
+        10.0,
+        (64, 48),
+    )
+    assert writer.isOpened()
+    for index in range(3):
+        frame = np.zeros((48, 64, 3), dtype=np.uint8)
+        frame[10:35, 15 + index : 30 + index] = 255
+        writer.write(frame)
+    writer.release()
+
+
+def test_public_candidate_mask_stage_persists_mask_for_downstream_arms(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "source.mp4"
+    baseline = tmp_path / "baseline.mp4"
+    _write_test_video(source)
+    _write_test_video(baseline)
+    base_fixture = get_parity_fixture(CANONICAL_FRAME130_FIXTURE_ID)
+    fixture = replace(
+        base_fixture,
+        frame_count=3,
+        width=64,
+        height=48,
+        source_sha256=sam31_benchmark._file_sha256(source),
+        asset_sha256=MappingProxyType(
+            {
+                **base_fixture.asset_sha256,
+                "baseline_runner_mask_mp4": sam31_benchmark._file_sha256(baseline),
+            }
+        ),
+    )
+    monkeypatch.setattr(sam31_benchmark, "_FIXTURE", fixture)
+    run_dir = tmp_path / "run"
+    materialize_pipeline_fixture(
+        run_dir=run_dir,
+        source_path=source,
+        assets={
+            "person_prompt_json": base_fixture.prompt.canonical_bytes(),
+            "tracklets_jsonl": b'{"frame_index":0,"is_target":true}\n',
+            "baseline_runner_mask_mp4": baseline.read_bytes(),
+        },
+        profile_id="candidate",
+    )
+
+    def fake_public_runner(candidate_run_dir: Path) -> dict[str, object]:
+        mask_path = candidate_run_dir / "runner_mask.mp4"
+        shutil_source = baseline.read_bytes()
+        mask_path.write_bytes(shutil_source)
+        write_masks_jsonl_from_video(mask_path, candidate_run_dir / "masks.jsonl")
+        return {
+            "backend": "sam31_gpu",
+            "frame_count": 3,
+            "prompting": {"identity_filter": {"rejected_frames": 0}},
+            "fallback": None,
+        }
+
+    result = sam31_benchmark.run_candidate_mask_stage(
+        run_dir,
+        mask_runner=fake_public_runner,
+    )
+
+    assert result["quality_vs_production_baseline"]["strict_mask_agreement_gate"]["passed"] is True
+    assert (run_dir / "baseline_runner_mask.mp4").is_file()
+    assert (run_dir / "runner_mask.mp4").is_file()
+    assert (run_dir / "masks.jsonl").is_file()
+    assert "/" not in result["persisted_artifacts"]["runner_mask"]["name"]
+    assert str(tmp_path) not in json.dumps(result)

@@ -1,0 +1,337 @@
+name: Build Scratch RunPod Final Parity Image
+
+on:
+  workflow_dispatch:
+    inputs:
+      candidate_commit:
+        description: "Exact 40-character commit baked into the final slim candidate"
+        required: true
+        type: string
+      candidate_image_digest:
+        description: "Exact sha256:... digest of the final slim candidate image"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE_NAME: ghcr.io/akhil-ghosh/whodoirunlike-runpod-processor
+
+jobs:
+  verify-build-smoke:
+    name: Verify candidate, build parity overlay, and smoke
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out parity harness
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Validate immutable candidate inputs and derive production contract
+        id: candidate
+        env:
+          CANDIDATE_COMMIT: ${{ inputs.candidate_commit }}
+          CANDIDATE_IMAGE_DIGEST: ${{ inputs.candidate_image_digest }}
+        run: |
+          python - <<'PY'
+          import base64
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import runpy
+          import subprocess
+
+          commit = os.environ["CANDIDATE_COMMIT"]
+          digest = os.environ["CANDIDATE_IMAGE_DIGEST"]
+          if re.fullmatch(r"[0-9a-f]{40}", commit) is None:
+              raise SystemExit("candidate_commit must be exactly 40 lowercase hex characters")
+          if re.fullmatch(r"sha256:[0-9a-f]{64}", digest) is None:
+              raise SystemExit("candidate_image_digest must be an exact lowercase OCI digest")
+          try:
+              subprocess.run(
+                  ["git", "cat-file", "-e", f"{commit}^{{commit}}"],
+                  check=True,
+              )
+          except subprocess.CalledProcessError as exc:
+              raise SystemExit(
+                  "candidate_commit is not present in the checked-out repository history"
+              ) from exc
+
+          parity = runpy.run_path("src/whodoirunlike/sam31_parity.py")
+          production_files = parity["FINAL_CANDIDATE_PRODUCTION_FILES"]
+          contract = {}
+          for name in production_files:
+              data = subprocess.check_output(
+                  ["git", "show", f"{commit}:src/whodoirunlike/{name}"]
+              )
+              contract[name] = hashlib.sha256(data).hexdigest()
+
+          rejected_pattern = re.compile(r"yolo26n[-_]seg|inline_segmentation", re.I)
+          for path in (
+              "Dockerfile.runpod",
+              "requirements-runpod-processor.txt",
+              "src/whodoirunlike/full_pipeline.py",
+              "src/whodoirunlike/hosted_processor.py",
+              "src/whodoirunlike/identity_runner.py",
+              "src/whodoirunlike/inline_segmentation.py",
+          ):
+              inspected = subprocess.run(
+                  ["git", "show", f"{commit}:{path}"],
+                  check=False,
+                  capture_output=True,
+                  text=True,
+              )
+              if inspected.returncode == 0 and rejected_pattern.search(inspected.stdout):
+                  raise SystemExit(
+                      f"candidate_commit contains a rejected segmentation path in {path}"
+                  )
+
+          slim_dockerfile = subprocess.check_output(
+              ["git", "show", f"{commit}:Dockerfile.runpod-slim"],
+              text=True,
+          )
+          densepose_pin = (
+              "ADD --checksum=sha256:"
+              "b8a7382001b16e453bad95ca9dbc68ae8f2b839b304cf90eaf5c27fbdb4dae91 "
+              "https://dl.fbaipublicfiles.com/densepose/"
+              "densepose_rcnn_R_50_FPN_s1x/165712039/model_final_162be9.pkl "
+              "/opt/densepose-weights/model_final_162be9.pkl"
+          )
+          if densepose_pin not in slim_dockerfile:
+              raise SystemExit("candidate_commit does not checksum-pin the DensePose weight")
+
+          encoded_contract = base64.urlsafe_b64encode(
+              json.dumps(
+                  contract,
+                  separators=(",", ":"),
+                  sort_keys=True,
+              ).encode("utf-8")
+          ).decode("ascii")
+          image_name = os.environ["IMAGE_NAME"]
+          image_reference = f"{image_name}@{digest}"
+          output = Path(os.environ["GITHUB_OUTPUT"])
+          with output.open("a", encoding="utf-8") as stream:
+              stream.write(f"commit={commit}\n")
+              stream.write(f"digest={digest}\n")
+              stream.write(f"image_reference={image_reference}\n")
+              stream.write(f"production_contract_b64={encoded_contract}\n")
+          PY
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Free runner disk
+        run: |
+          df -h
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache
+          docker system prune --all --force --volumes
+          df -h
+
+      - name: Pull and inspect immutable final candidate
+        env:
+          CANDIDATE_COMMIT: ${{ steps.candidate.outputs.commit }}
+          CANDIDATE_IMAGE_DIGEST: ${{ steps.candidate.outputs.digest }}
+          CANDIDATE_IMAGE_REFERENCE: ${{ steps.candidate.outputs.image_reference }}
+          PRODUCTION_CONTRACT_B64: ${{ steps.candidate.outputs.production_contract_b64 }}
+        run: |
+          docker pull "${CANDIDATE_IMAGE_REFERENCE}"
+          docker run --rm -i \
+            --entrypoint python \
+            -e EXPECTED_CANDIDATE_COMMIT="${CANDIDATE_COMMIT}" \
+            -e EXPECTED_CANDIDATE_IMAGE_DIGEST="${CANDIDATE_IMAGE_DIGEST}" \
+            -e EXPECTED_PRODUCTION_CONTRACT_B64="${PRODUCTION_CONTRACT_B64}" \
+            "${CANDIDATE_IMAGE_REFERENCE}" \
+            - <<'PY'
+          import base64
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+
+          expected_commit = os.environ["EXPECTED_CANDIDATE_COMMIT"]
+          expected_digest = os.environ["EXPECTED_CANDIDATE_IMAGE_DIGEST"]
+          contract = json.loads(
+              base64.urlsafe_b64decode(
+                  os.environ["EXPECTED_PRODUCTION_CONTRACT_B64"].encode("ascii")
+              )
+          )
+          observed = {
+              name: hashlib.sha256(
+                  (Path("/app/src/whodoirunlike") / name).read_bytes()
+              ).hexdigest()
+              for name in contract
+          }
+          assert observed == contract, (observed, contract)
+          assert os.getenv("WHODOIRUNLIKE_PROCESSOR_VERSION") == expected_commit
+          assert os.getenv("WHODOIRUNLIKE_MASK_BACKEND", "").lower() == "sam31_gpu"
+          assert os.getenv("MMPOSE_DEVICE", "").lower() == "cpu"
+          assert os.getenv("RTMW_RUNTIME_BACKEND", "").lower() == "onnxruntime"
+          assert os.getenv("WHODOIRUNLIKE_SAM31_GPU_EXACT_CV2_LOADER") == "true"
+          assert os.getenv("WHODOIRUNLIKE_SAM31_GPU_EXACT_CV2_CHUNK_FRAMES") == "8"
+          assert os.getenv("WHODOIRUNLIKE_SAM31_GPU_EXACT_CV2_MAX_FRAMES") == "600"
+          assert os.getenv(
+              "WHODOIRUNLIKE_SAM31_GPU_EXACT_CV2_MAX_DESTINATION_BYTES"
+          ) == "8589934592"
+          assert os.getenv("WHODOIRUNLIKE_PROCESSOR_CONCURRENCY") == "1"
+          for name in (
+              "MMPOSE_USE_DETECTOR",
+              "DENSEPOSE_TARGET_CROP",
+              "DENSEPOSE_TARGET_CROP_ENABLED",
+              "DENSEPOSE_TARGET_CROP_PADDING_RATIO",
+              "DENSEPOSE_TARGET_CROP_PADDING_PIXELS",
+              "DENSEPOSE_INPUT_MIN_SIZE_TEST",
+              "DENSEPOSE_INPUT_MAX_SIZE_TEST",
+          ):
+              assert not os.getenv(name, "").strip(), name
+          densepose_weights = Path("/opt/densepose-weights/model_final_162be9.pkl")
+          assert os.getenv("DENSEPOSE_WEIGHTS") == str(densepose_weights)
+          assert densepose_weights.stat().st_size == 255_757_821
+          digest = hashlib.sha256()
+          with densepose_weights.open("rb") as stream:
+              for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                  digest.update(chunk)
+          assert digest.hexdigest() == (
+              "b8a7382001b16e453bad95ca9dbc68ae8f2b839b304cf90eaf5c27fbdb4dae91"
+          )
+          rejected = []
+          for root in (Path("/app"), Path("/root/.cache/ultralytics")):
+              if root.is_dir():
+                  rejected.extend(
+                      str(path)
+                      for path in root.rglob("*")
+                      if "yolo26" in path.name.lower()
+                  )
+          assert not rejected, rejected[:20]
+          assert expected_digest.startswith("sha256:")
+          PY
+
+      - name: Build and push scratch-only final parity image
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.runpod.benchmark.final-candidate
+          push: true
+          build-args: |
+            WHODOIRUNLIKE_FINAL_CANDIDATE_IMAGE=${{ steps.candidate.outputs.image_reference }}
+            WHODOIRUNLIKE_BENCHMARK_VERSION=${{ github.sha }}
+            WHODOIRUNLIKE_FINAL_CANDIDATE_COMMIT=${{ steps.candidate.outputs.commit }}
+            WHODOIRUNLIKE_FINAL_CANDIDATE_IMAGE_DIGEST=${{ steps.candidate.outputs.digest }}
+            WHODOIRUNLIKE_FINAL_PRODUCTION_SHA256_B64=${{ steps.candidate.outputs.production_contract_b64 }}
+          tags: |
+            ${{ env.IMAGE_NAME }}:sam31-final-parity-${{ github.run_id }}-${{ github.run_attempt }}
+          labels: |
+            org.opencontainers.image.revision=${{ steps.candidate.outputs.commit }}
+            org.whodoirunlike.parity.candidate-digest=${{ steps.candidate.outputs.digest }}
+            org.whodoirunlike.parity.scope=scratch-only
+          provenance: false
+
+      - name: Smoke exact parity image digest and verify provenance
+        env:
+          CANDIDATE_COMMIT: ${{ steps.candidate.outputs.commit }}
+          CANDIDATE_IMAGE_DIGEST: ${{ steps.candidate.outputs.digest }}
+          FINAL_PARITY_IMAGE: ${{ env.IMAGE_NAME }}@${{ steps.build.outputs.digest }}
+        run: |
+          docker pull "${FINAL_PARITY_IMAGE}"
+          docker run --rm -i \
+            --entrypoint python \
+            -e HF_TOKEN=smoke-test-token \
+            -e EXPECTED_CANDIDATE_COMMIT="${CANDIDATE_COMMIT}" \
+            -e EXPECTED_CANDIDATE_IMAGE_DIGEST="${CANDIDATE_IMAGE_DIGEST}" \
+            "${FINAL_PARITY_IMAGE}" \
+            - <<'PY'
+          import os
+
+          from whodoirunlike.sam31_benchmark_serverless import handler
+          from whodoirunlike.sam31_parity import FINAL_CANDIDATE_PRODUCTION_FILES
+
+          payload = handler({"input": {"type": "health"}})
+          expected_commit = os.environ["EXPECTED_CANDIDATE_COMMIT"]
+          expected_digest = os.environ["EXPECTED_CANDIDATE_IMAGE_DIGEST"]
+
+          assert payload["status"] == "ok"
+          assert payload["service"] == "sam31_speed_lab"
+          assert payload["benchmark_enabled"] is True
+          assert payload["base_image_role"] == "final_candidate"
+          assert payload["candidate_commit"] == expected_commit
+          assert payload["candidate_image_digest"] == expected_digest
+          assert payload["base_processor_commit"] == expected_commit
+          assert payload["base_processor_image_digest"] == expected_digest
+          assert payload["code_overlay_source"] == "base_image"
+          assert payload["code_overlay_commit"] == expected_commit
+          assert payload["code_overlay_reference_image_digest"] == expected_digest
+          assert payload["dependency_base_role"] == "final_candidate"
+          assert payload["dependency_base_commit"] == expected_commit
+          assert payload["dependency_base_image_digest"] == expected_digest
+          assert payload["final_candidate_identity"]["passed"] is True
+          assert payload["base_contract"]["passed"] is True
+          assert payload["base_contract"]["image_role"] == "final_candidate"
+          assert payload["base_contract"]["contract_source"] == (
+              "workflow_candidate_commit"
+          )
+          assert payload["base_contract"]["checked_file_count"] == len(
+              FINAL_CANDIDATE_PRODUCTION_FILES
+          )
+          assert payload["base_contract"]["mismatches"] == []
+          assert payload["base_contract"]["expected_sha256"] == (
+              payload["base_contract"]["observed_sha256"]
+          )
+          assert payload["scope_ids"] == ["full"]
+          assert payload["full_profile_ids"] == ["production_final_candidate"]
+          assert payload["default_full_profile_ids"] == ["production_final_candidate"]
+          assert payload["sam31_input_loader"] == {
+              "mode": "exact_cv2",
+              "enabled": True,
+              "chunk_frames": 8,
+              "max_frames": 600,
+              "max_destination_bytes": 8589934592,
+              "required_concurrency": 1,
+              "configured_concurrency": 1,
+              "concurrency_ready": True,
+          }
+          assert payload["densepose_weights"]["passed"] is True
+          assert os.getenv("WHODOIRUNLIKE_MASK_BACKEND") == "sam31_gpu"
+          assert os.getenv("MMPOSE_DEVICE") == "cpu"
+          assert os.getenv("DENSEPOSE_WEIGHTS") == (
+              "/opt/densepose-weights/model_final_162be9.pkl"
+          )
+          for name in (
+              "MMPOSE_USE_DETECTOR",
+              "DENSEPOSE_TARGET_CROP",
+              "DENSEPOSE_TARGET_CROP_ENABLED",
+              "DENSEPOSE_TARGET_CROP_PADDING_RATIO",
+              "DENSEPOSE_TARGET_CROP_PADDING_PIXELS",
+              "DENSEPOSE_INPUT_MIN_SIZE_TEST",
+              "DENSEPOSE_INPUT_MAX_SIZE_TEST",
+          ):
+              assert not os.getenv(name, "").strip(), name
+          PY
+
+      - name: Record immutable scratch image
+        env:
+          FINAL_PARITY_DIGEST: ${{ steps.build.outputs.digest }}
+          CANDIDATE_DIGEST: ${{ steps.candidate.outputs.digest }}
+          CANDIDATE_COMMIT: ${{ steps.candidate.outputs.commit }}
+        run: |
+          {
+            echo "### Scratch final parity image"
+            echo
+            echo "- Candidate commit: \`${CANDIDATE_COMMIT}\`"
+            echo "- Candidate image: \`${IMAGE_NAME}@${CANDIDATE_DIGEST}\`"
+            echo "- Parity image: \`${IMAGE_NAME}@${FINAL_PARITY_DIGEST}\`"
+            echo "- No RunPod endpoint or production resource was changed."
+          } >> "${GITHUB_STEP_SUMMARY}"

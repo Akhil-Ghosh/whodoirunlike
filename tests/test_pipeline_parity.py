@@ -61,6 +61,7 @@ def _passing_pose_measurements() -> PoseParityMeasurements:
         control_frame_count=260,
         candidate_frame_count=260,
         schema_match=True,
+        control_schema_preserved=True,
         required_fields_present=True,
         aligned_frame_count=260,
         usable_agreement_rate=0.99,
@@ -85,7 +86,7 @@ def test_pose_parity_passes_at_all_registered_boundaries() -> None:
     [
         ("control_frame_count", 259, "control_frame_count_exact"),
         ("candidate_frame_count", 259, "candidate_frame_count_exact"),
-        ("schema_match", False, "schema_match"),
+        ("control_schema_preserved", False, "control_schema_preserved"),
         ("required_fields_present", False, "required_fields_present"),
         ("aligned_frame_count", 259, "frame_indices_aligned"),
         ("usable_agreement_rate", 0.989999, "usable_agreement"),
@@ -147,11 +148,40 @@ def test_pose_row_comparison_measures_pck_and_visibility_on_common_points() -> N
     assert gate["measurements"]["pck_at_001_diagonal"] == 1.0
 
 
+def test_pose_row_comparison_allows_additive_candidate_metadata_but_rejects_type_changes() -> None:
+    control = [_pose_row(0)]
+    additive_candidate = [
+        {
+            **_pose_row(0),
+            "inference_settings": {"device": "cuda", "detector_enabled": False},
+        }
+    ]
+
+    additive_gate = compare_pose_rows(control, additive_candidate, expected_frame_count=1)
+
+    assert additive_gate["passed"] is True
+    assert additive_gate["measurements"]["schema_match"] is False
+    assert additive_gate["measurements"]["control_schema_preserved"] is True
+    assert additive_gate["schema_compatibility"]["candidate_only_path_count"] > 0
+
+    changed_type_candidate = [{**_pose_row(0), "visibility_mean": "0.9"}]
+    changed_type_gate = compare_pose_rows(
+        control,
+        changed_type_candidate,
+        expected_frame_count=1,
+    )
+
+    assert changed_type_gate["passed"] is False
+    assert changed_type_gate["measurements"]["control_schema_preserved"] is False
+    assert changed_type_gate["schema_compatibility"]["type_change_count"] == 1
+
+
 def _passing_densepose_measurements() -> DensePoseParityMeasurements:
     return DensePoseParityMeasurements(
         control_frame_count=260,
         candidate_frame_count=260,
         schema_match=True,
+        control_schema_preserved=True,
         required_fields_present=True,
         aligned_frame_count=260,
         usable_agreement_rate=0.99,
@@ -182,7 +212,7 @@ def test_densepose_parity_passes_at_all_registered_boundaries() -> None:
     [
         ("control_frame_count", 259, "control_frame_count_exact"),
         ("candidate_frame_count", 259, "candidate_frame_count_exact"),
-        ("schema_match", False, "schema_match"),
+        ("control_schema_preserved", False, "control_schema_preserved"),
         ("required_fields_present", False, "required_fields_present"),
         ("aligned_frame_count", 259, "frame_indices_aligned"),
         ("usable_agreement_rate", 0.989999, "usable_agreement"),
@@ -242,6 +272,39 @@ def test_densepose_row_comparison_measures_parts_centroids_and_coverage() -> Non
     assert gate["passed"] is True
     assert gate["measurements"]["common_usable_frame_count"] == 2
     assert gate["measurements"]["part_jaccard_mean"] == 1.0
+
+
+def test_densepose_row_comparison_allows_inference_metadata_but_rejects_type_changes() -> None:
+    control = [_densepose_row(0)]
+    additive_candidate = [
+        {
+            **_densepose_row(0),
+            "inference_input": {
+                "target_crop_enabled": True,
+                "crop_bbox": [0, 0, 960, 540],
+            },
+        }
+    ]
+
+    additive_gate = compare_densepose_rows(
+        control,
+        additive_candidate,
+        expected_frame_count=1,
+    )
+
+    assert additive_gate["passed"] is True
+    assert additive_gate["measurements"]["schema_match"] is False
+    assert additive_gate["measurements"]["control_schema_preserved"] is True
+
+    changed_type_candidate = [{**_densepose_row(0), "densepose_coverage": "0.3"}]
+    changed_type_gate = compare_densepose_rows(
+        control,
+        changed_type_candidate,
+        expected_frame_count=1,
+    )
+
+    assert changed_type_gate["passed"] is False
+    assert changed_type_gate["measurements"]["control_schema_preserved"] is False
 
 
 def _passing_fusion_measurements() -> FusionParityMeasurements:
@@ -321,6 +384,17 @@ def test_fusion_row_comparison_measures_state_confidence_and_joint_weights() -> 
 
     assert gate["passed"] is True
     assert gate["measurements"]["common_joint_weight_count"] == 2
+
+
+def test_fusion_row_comparison_keeps_exact_schema_gate() -> None:
+    control = [_fusion_row(0)]
+    candidate = [{**_fusion_row(0), "inference_settings": {"parallel": True}}]
+
+    gate = compare_fusion_rows(control, candidate, expected_frame_count=1)
+
+    assert gate["passed"] is False
+    assert gate["checks"]["schema_match"] is False
+    assert gate["schema_compatibility"]["control_preserved"] is True
 
 
 def _passing_feature_measurements() -> FeatureParityMeasurements:
@@ -505,14 +579,33 @@ def test_qc_comparison_normalizes_timestamps_paths_and_candidate_ids() -> None:
     assert gate["passed"] is True
 
 
+def test_qc_comparison_keeps_exact_schema_gate_for_unplanned_additions() -> None:
+    control = {
+        "identity": {"frame_count": 260},
+        "mask": {"mean_mask_churn": 0.2},
+        "pose": {"frame_count": 260},
+        "fused": {"frame_count": 260},
+        "uncertainty_score": 0.1,
+    }
+    candidate = {**control, "inference_settings": {"parallel": True}}
+
+    gate = compare_qc_payloads(control, candidate)
+
+    assert gate["passed"] is False
+    assert gate["checks"]["schema_match"] is False
+
+
 def _passing_artifact_measurements() -> ArtifactParityMeasurements:
     return ArtifactParityMeasurements(
         control_required_artifacts_present=True,
         candidate_required_artifacts_present=True,
         inventory_match=True,
+        control_inventory_preserved=True,
         schema_artifact_count=1,
         json_schema_match=True,
+        json_control_schema_preserved=True,
         parquet_schema_match=True,
+        parquet_control_schema_preserved=True,
         parquet_row_counts_match=True,
     )
 
@@ -537,10 +630,22 @@ def test_artifact_parity_passes_when_inventory_and_schemas_match() -> None:
             False,
             "candidate_required_artifacts_present",
         ),
-        ("inventory_match", False, "inventory_match"),
+        (
+            "control_inventory_preserved",
+            False,
+            "control_inventory_preserved",
+        ),
         ("schema_artifact_count", 0, "schema_artifact_evidence"),
-        ("json_schema_match", False, "json_schema_match"),
-        ("parquet_schema_match", False, "parquet_schema_match"),
+        (
+            "json_control_schema_preserved",
+            False,
+            "json_control_schema_preserved",
+        ),
+        (
+            "parquet_control_schema_preserved",
+            False,
+            "parquet_control_schema_preserved",
+        ),
         ("parquet_row_counts_match", False, "parquet_row_counts_match"),
     ],
 )
@@ -586,6 +691,189 @@ def test_artifact_contract_comparison_checks_jsonl_and_parquet_schemas(
     assert gate["passed"] is True
     assert gate["measurements"]["schema_artifact_count"] == 2
     assert gate["inventory"] == ["pose_landmarks.jsonl", "poses.parquet"]
+
+
+def test_artifact_contract_allows_additive_candidate_files_fields_and_columns(
+    tmp_path: Path,
+) -> None:
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    control_dir = tmp_path / "control"
+    candidate_dir = tmp_path / "candidate"
+    control_dir.mkdir()
+    candidate_dir.mkdir()
+    (control_dir / "densepose.jsonl").write_text(
+        json.dumps({"frame_index": 0, "usable": True, "coverage": 0.4}) + "\n",
+        encoding="utf-8",
+    )
+    (candidate_dir / "densepose.jsonl").write_text(
+        json.dumps(
+            {
+                "frame_index": 0,
+                "usable": True,
+                "coverage": 0.4,
+                "inference_input": {"width": 960, "height": 540},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    pq.write_table(
+        pa.Table.from_pylist([{"frame_index": 0, "usable": True}]),
+        control_dir / "densepose.parquet",
+    )
+    pq.write_table(
+        pa.Table.from_pylist([{"frame_index": 0, "usable": True, "inference_width": 960}]),
+        candidate_dir / "densepose.parquet",
+    )
+    (candidate_dir / "pose_qa_overlay.mp4").write_bytes(b"candidate-only")
+
+    gate = compare_artifact_contracts(
+        control_dir,
+        candidate_dir,
+        required_artifacts={"densepose.jsonl", "densepose.parquet"},
+    )
+
+    assert gate["passed"] is True
+    assert gate["measurements"] == {
+        "control_required_artifacts_present": True,
+        "candidate_required_artifacts_present": True,
+        "inventory_match": False,
+        "control_inventory_preserved": True,
+        "schema_artifact_count": 2,
+        "json_schema_match": False,
+        "json_control_schema_preserved": True,
+        "parquet_schema_match": False,
+        "parquet_control_schema_preserved": True,
+        "parquet_row_counts_match": True,
+    }
+    assert gate["inventory_only_in_candidate"] == ["pose_qa_overlay.mp4"]
+
+
+def test_artifact_contract_rejects_removed_control_artifact_and_type_changes(
+    tmp_path: Path,
+) -> None:
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    control_dir = tmp_path / "control"
+    candidate_dir = tmp_path / "candidate"
+    control_dir.mkdir()
+    candidate_dir.mkdir()
+    (control_dir / "densepose.jsonl").write_text(
+        json.dumps({"frame_index": 0, "usable": True, "coverage": 0.4}) + "\n",
+        encoding="utf-8",
+    )
+    (candidate_dir / "densepose.jsonl").write_text(
+        json.dumps({"frame_index": 0, "usable": True, "coverage": "0.4"}) + "\n",
+        encoding="utf-8",
+    )
+    pq.write_table(
+        pa.Table.from_pylist([{"frame_index": 0, "usable": True}]),
+        control_dir / "densepose.parquet",
+    )
+    pq.write_table(
+        pa.Table.from_pylist([{"frame_index": "0", "usable": True}]),
+        candidate_dir / "densepose.parquet",
+    )
+    (control_dir / "legacy-control-evidence.txt").write_text("required\n", encoding="utf-8")
+
+    gate = compare_artifact_contracts(
+        control_dir,
+        candidate_dir,
+        required_artifacts={"densepose.jsonl", "densepose.parquet"},
+    )
+
+    assert gate["passed"] is False
+    assert gate["checks"]["control_inventory_preserved"] is False
+    assert gate["checks"]["json_control_schema_preserved"] is False
+    assert gate["checks"]["parquet_control_schema_preserved"] is False
+    assert gate["inventory_only_in_control"] == ["legacy-control-evidence.txt"]
+
+
+def test_multi_artifact_compatibility_diagnostics_fit_full_response_cap(
+    tmp_path: Path,
+) -> None:
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    control_dir = tmp_path / "control"
+    candidate_dir = tmp_path / "candidate"
+    control_dir.mkdir()
+    candidate_dir.mkdir()
+    required_artifacts: set[str] = set()
+    candidate_additions = {
+        f"candidate_only_metadata_field_{index:02d}": index for index in range(48)
+    }
+    for index in range(12):
+        name = f"evidence_{index:02d}.json"
+        required_artifacts.add(name)
+        (control_dir / name).write_text(
+            json.dumps({"frame_index": index, "usable": True}) + "\n",
+            encoding="utf-8",
+        )
+        (candidate_dir / name).write_text(
+            json.dumps(
+                {
+                    "frame_index": index,
+                    "usable": True,
+                    **candidate_additions,
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+    for index in range(6):
+        name = f"evidence_{index:02d}.parquet"
+        required_artifacts.add(name)
+        pq.write_table(
+            pa.Table.from_pylist([{"frame_index": index, "usable": True}]),
+            control_dir / name,
+        )
+        pq.write_table(
+            pa.Table.from_pylist(
+                [
+                    {
+                        "frame_index": index,
+                        "usable": True,
+                        **candidate_additions,
+                    }
+                ]
+            ),
+            candidate_dir / name,
+        )
+
+    gate = compare_artifact_contracts(
+        control_dir,
+        candidate_dir,
+        required_artifacts=required_artifacts,
+    )
+    encoded = json.dumps(
+        {"comparisons": {"artifacts": gate}},
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+
+    assert gate["passed"] is True
+    assert len(encoded) < min(
+        pipeline_parity.FULL_BENCHMARK_RESPONSE_MAX_BYTES,
+        64 * 1024,
+    )
+    assert (
+        max(
+            len(details.get("candidate_only_paths", []))
+            for details in gate["schema_compatibility"]["json"].values()
+        )
+        == pipeline_parity._SCHEMA_DIAGNOSTIC_MAX_PATHS
+    )
+    assert (
+        max(
+            len(details.get("candidate_only_fields", []))
+            for details in gate["schema_compatibility"]["parquet"].values()
+        )
+        == pipeline_parity._SCHEMA_DIAGNOSTIC_MAX_PATHS
+    )
 
 
 def _passing_video_measurements() -> VideoParityMeasurements:

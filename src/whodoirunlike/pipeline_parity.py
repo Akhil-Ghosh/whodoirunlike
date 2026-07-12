@@ -47,6 +47,7 @@ class PoseParityMeasurements:
     control_frame_count: int
     candidate_frame_count: int
     schema_match: bool
+    control_schema_preserved: bool
     required_fields_present: bool
     aligned_frame_count: int
     usable_agreement_rate: float | None
@@ -63,6 +64,7 @@ class DensePoseParityMeasurements:
     control_frame_count: int
     candidate_frame_count: int
     schema_match: bool
+    control_schema_preserved: bool
     required_fields_present: bool
     aligned_frame_count: int
     usable_agreement_rate: float | None
@@ -131,9 +133,12 @@ class ArtifactParityMeasurements:
     control_required_artifacts_present: bool
     candidate_required_artifacts_present: bool
     inventory_match: bool
+    control_inventory_preserved: bool
     schema_artifact_count: int
     json_schema_match: bool
+    json_control_schema_preserved: bool
     parquet_schema_match: bool
+    parquet_control_schema_preserved: bool
     parquet_row_counts_match: bool
 
 
@@ -1798,7 +1803,7 @@ def evaluate_pose_parity(
     checks = {
         "control_frame_count_exact": measurements.control_frame_count == expected_frame_count,
         "candidate_frame_count_exact": measurements.candidate_frame_count == expected_frame_count,
-        "schema_match": measurements.schema_match,
+        "control_schema_preserved": measurements.control_schema_preserved,
         "required_fields_present": measurements.required_fields_present,
         "frame_indices_aligned": measurements.aligned_frame_count == expected_frame_count,
         "usable_agreement": measurements.usable_agreement_rate is not None
@@ -1840,7 +1845,7 @@ def evaluate_densepose_parity(
     checks = {
         "control_frame_count_exact": measurements.control_frame_count == expected_frame_count,
         "candidate_frame_count_exact": measurements.candidate_frame_count == expected_frame_count,
-        "schema_match": measurements.schema_match,
+        "control_schema_preserved": measurements.control_schema_preserved,
         "required_fields_present": measurements.required_fields_present,
         "frame_indices_aligned": measurements.aligned_frame_count == expected_frame_count,
         "usable_agreement": measurements.usable_agreement_rate is not None
@@ -1993,10 +1998,10 @@ def evaluate_artifact_parity(
     checks = {
         "control_required_artifacts_present": measurements.control_required_artifacts_present,
         "candidate_required_artifacts_present": (measurements.candidate_required_artifacts_present),
-        "inventory_match": measurements.inventory_match,
+        "control_inventory_preserved": measurements.control_inventory_preserved,
         "schema_artifact_evidence": measurements.schema_artifact_count > 0,
-        "json_schema_match": measurements.json_schema_match,
-        "parquet_schema_match": measurements.parquet_schema_match,
+        "json_control_schema_preserved": measurements.json_control_schema_preserved,
+        "parquet_control_schema_preserved": measurements.parquet_control_schema_preserved,
         "parquet_row_counts_match": measurements.parquet_row_counts_match,
     }
     return {
@@ -2040,6 +2045,73 @@ def evaluate_video_parity(
 
 _POSE_ROW_REQUIRED_FIELDS = frozenset({"frame_index", "usable", "visibility_mean", "landmarks"})
 _POSE_LANDMARK_REQUIRED_FIELDS = frozenset({"index", "name", "x", "y", "visibility"})
+_SCHEMA_DIAGNOSTIC_MAX_PATHS = 16
+
+
+def _schema_type(value: Any) -> str:
+    if isinstance(value, dict):
+        return "object"
+    if isinstance(value, list):
+        return "array"
+    if isinstance(value, bool):
+        return "boolean"
+    if isinstance(value, (int, float)):
+        return "number"
+    if value is None:
+        return "null"
+    if isinstance(value, str):
+        return "string"
+    return type(value).__name__
+
+
+def _json_pointer_token(value: Any) -> str:
+    return str(value).replace("~", "~0").replace("/", "~1")
+
+
+def _value_schema_paths(value: Any) -> dict[str, frozenset[str]]:
+    observed: dict[str, set[str]] = {}
+
+    def visit(child: Any, path: str) -> None:
+        observed.setdefault(path, set()).add(_schema_type(child))
+        if isinstance(child, dict):
+            for key, item in child.items():
+                visit(item, f"{path}/{_json_pointer_token(key)}")
+        elif isinstance(child, list):
+            for item in child:
+                visit(item, f"{path}/*")
+
+    visit(value, "$")
+    return {path: frozenset(types) for path, types in observed.items()}
+
+
+def _schema_compatibility(control: Any, candidate: Any) -> dict[str, Any]:
+    control_schema = _value_schema_paths(control)
+    candidate_schema = _value_schema_paths(candidate)
+    missing_paths = sorted(set(control_schema) - set(candidate_schema))
+    candidate_only_paths = sorted(set(candidate_schema) - set(control_schema))
+    type_change_paths = sorted(
+        path
+        for path in set(control_schema) & set(candidate_schema)
+        if control_schema[path] != candidate_schema[path]
+    )
+    return {
+        "exact_match": control_schema == candidate_schema,
+        "control_preserved": not missing_paths and not type_change_paths,
+        "control_path_count": len(control_schema),
+        "candidate_path_count": len(candidate_schema),
+        "missing_control_path_count": len(missing_paths),
+        "missing_control_paths": missing_paths[:_SCHEMA_DIAGNOSTIC_MAX_PATHS],
+        "type_change_count": len(type_change_paths),
+        "type_changes": {
+            path: {
+                "control": sorted(control_schema[path]),
+                "candidate": sorted(candidate_schema[path]),
+            }
+            for path in type_change_paths[:_SCHEMA_DIAGNOSTIC_MAX_PATHS]
+        },
+        "candidate_only_path_count": len(candidate_only_paths),
+        "candidate_only_paths": candidate_only_paths[:_SCHEMA_DIAGNOSTIC_MAX_PATHS],
+    }
 
 
 def _row_and_item_schema(
@@ -2093,6 +2165,7 @@ def compare_pose_rows(
 ) -> dict[str, Any]:
     control_schema = _row_and_item_schema(control_rows, item_field="landmarks")
     candidate_schema = _row_and_item_schema(candidate_rows, item_field="landmarks")
+    schema_compatibility = _schema_compatibility(control_rows, candidate_rows)
     required_fields_present = (
         _POSE_ROW_REQUIRED_FIELDS.issubset(control_schema[0])
         and _POSE_ROW_REQUIRED_FIELDS.issubset(candidate_schema[0])
@@ -2133,7 +2206,8 @@ def compare_pose_rows(
     measurements = PoseParityMeasurements(
         control_frame_count=len(control_rows),
         candidate_frame_count=len(candidate_rows),
-        schema_match=control_schema == candidate_schema,
+        schema_match=bool(schema_compatibility["exact_match"]),
+        control_schema_preserved=bool(schema_compatibility["control_preserved"]),
         required_fields_present=required_fields_present,
         aligned_frame_count=len(aligned_indices),
         usable_agreement_rate=(float(statistics.fmean(usable_matches)) if usable_matches else None),
@@ -2150,7 +2224,9 @@ def compare_pose_rows(
         ),
         visibility_mae=(float(statistics.fmean(visibility_errors)) if visibility_errors else None),
     )
-    return evaluate_pose_parity(measurements, expected_frame_count=expected_frame_count)
+    result = evaluate_pose_parity(measurements, expected_frame_count=expected_frame_count)
+    result["schema_compatibility"] = schema_compatibility
+    return result
 
 
 _DENSEPOSE_REQUIRED_FIELDS = frozenset(
@@ -2206,6 +2282,7 @@ def compare_densepose_rows(
 ) -> dict[str, Any]:
     control_schema = _row_schema(control_rows)
     candidate_schema = _row_schema(candidate_rows)
+    schema_compatibility = _schema_compatibility(control_rows, candidate_rows)
     control_by_frame = _rows_by_frame(control_rows)
     candidate_by_frame = _rows_by_frame(candidate_rows)
     aligned_indices = sorted(set(control_by_frame) & set(candidate_by_frame))
@@ -2263,7 +2340,8 @@ def compare_densepose_rows(
     measurements = DensePoseParityMeasurements(
         control_frame_count=len(control_rows),
         candidate_frame_count=len(candidate_rows),
-        schema_match=control_schema == candidate_schema,
+        schema_match=bool(schema_compatibility["exact_match"]),
+        control_schema_preserved=bool(schema_compatibility["control_preserved"]),
         required_fields_present=(
             _DENSEPOSE_REQUIRED_FIELDS.issubset(control_schema)
             and _DENSEPOSE_REQUIRED_FIELDS.issubset(candidate_schema)
@@ -2288,10 +2366,12 @@ def compare_densepose_rows(
             float(statistics.fmean(mask_overlap_errors)) if mask_overlap_errors else None
         ),
     )
-    return evaluate_densepose_parity(
+    result = evaluate_densepose_parity(
         measurements,
         expected_frame_count=expected_frame_count,
     )
+    result["schema_compatibility"] = schema_compatibility
+    return result
 
 
 _FUSION_REQUIRED_FIELDS = frozenset(
@@ -2320,6 +2400,7 @@ def compare_fusion_rows(
 ) -> dict[str, Any]:
     control_schema = _row_and_item_schema(control_rows, item_field="joint_weights")
     candidate_schema = _row_and_item_schema(candidate_rows, item_field="joint_weights")
+    schema_compatibility = _schema_compatibility(control_rows, candidate_rows)
     control_by_frame = _rows_by_frame(control_rows)
     candidate_by_frame = _rows_by_frame(candidate_rows)
     aligned_indices = sorted(set(control_by_frame) & set(candidate_by_frame))
@@ -2357,7 +2438,7 @@ def compare_fusion_rows(
     measurements = FusionParityMeasurements(
         control_frame_count=len(control_rows),
         candidate_frame_count=len(candidate_rows),
-        schema_match=control_schema == candidate_schema,
+        schema_match=bool(schema_compatibility["exact_match"]),
         required_fields_present=(
             _FUSION_REQUIRED_FIELDS.issubset(control_schema[0])
             and _FUSION_REQUIRED_FIELDS.issubset(candidate_schema[0])
@@ -2390,10 +2471,12 @@ def compare_fusion_rows(
             else None
         ),
     )
-    return evaluate_fusion_parity(
+    result = evaluate_fusion_parity(
         measurements,
         expected_frame_count=expected_frame_count,
     )
+    result["schema_compatibility"] = schema_compatibility
+    return result
 
 
 def compare_feature_artifacts(
@@ -2665,38 +2748,61 @@ def _artifact_inventory(run_dir: Path) -> set[str]:
     return {path.name for path in Path(run_dir).iterdir() if path.is_file()}
 
 
-def _value_schema(value: Any) -> Any:
-    if isinstance(value, dict):
-        return {
-            str(key): _value_schema(child)
-            for key, child in sorted(value.items(), key=lambda item: str(item[0]))
-        }
-    if isinstance(value, list):
-        item_schemas = {
-            json.dumps(_value_schema(item), separators=(",", ":"), sort_keys=True) for item in value
-        }
-        return {"list_items": sorted(item_schemas)}
-    if isinstance(value, bool):
-        return "boolean"
-    if isinstance(value, (int, float)):
-        return "number"
-    if value is None:
-        return "null"
-    return type(value).__name__
-
-
-def _json_artifact_schema(path: Path) -> str:
+def _json_artifact_value(path: Path) -> Any:
     if path.suffix == ".jsonl":
-        values = [
+        return [
             json.loads(line)
             for line in path.read_text(encoding="utf-8").splitlines()
             if line.strip()
         ]
-        schema = {"jsonl_rows": _value_schema(values)}
-    else:
-        schema = _value_schema(json.loads(path.read_text(encoding="utf-8")))
-    encoded = json.dumps(schema, separators=(",", ":"), sort_keys=True).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _parquet_schema_compatibility(control_schema: Any, candidate_schema: Any) -> dict[str, Any]:
+    control_fields = list(control_schema)
+    candidate_fields = list(candidate_schema)
+    candidate_by_name = {field.name: field for field in candidate_fields}
+    candidate_positions = {field.name: index for index, field in enumerate(candidate_fields)}
+    missing_fields = [field.name for field in control_fields if field.name not in candidate_by_name]
+    type_change_fields = [
+        field.name
+        for field in control_fields
+        if field.name in candidate_by_name
+        and (
+            not field.type.equals(candidate_by_name[field.name].type)
+            or field.nullable != candidate_by_name[field.name].nullable
+        )
+    ]
+    retained_positions = [
+        candidate_positions[field.name]
+        for field in control_fields
+        if field.name in candidate_positions
+    ]
+    order_preserved = retained_positions == sorted(retained_positions)
+    control_names = {field.name for field in control_fields}
+    candidate_only_fields = [
+        field.name for field in candidate_fields if field.name not in control_names
+    ]
+    exact_match = control_schema.equals(candidate_schema, check_metadata=False)
+    return {
+        "exact_match": exact_match,
+        "control_preserved": not missing_fields and not type_change_fields and order_preserved,
+        "control_field_count": len(control_fields),
+        "candidate_field_count": len(candidate_fields),
+        "missing_control_field_count": len(missing_fields),
+        "missing_control_fields": missing_fields[:_SCHEMA_DIAGNOSTIC_MAX_PATHS],
+        "type_change_count": len(type_change_fields),
+        "type_changes": {
+            name: {
+                "control": str(control_schema.field(name)),
+                "candidate": str(candidate_schema.field(name)),
+            }
+            for name in type_change_fields[:_SCHEMA_DIAGNOSTIC_MAX_PATHS]
+        },
+        "control_field_order_preserved": order_preserved,
+        "candidate_only_field_count": len(candidate_only_fields),
+        "candidate_only_fields": candidate_only_fields[:_SCHEMA_DIAGNOSTIC_MAX_PATHS],
+    }
 
 
 def compare_artifact_contracts(
@@ -2709,33 +2815,60 @@ def compare_artifact_contracts(
 
     control_inventory = _artifact_inventory(control_dir)
     candidate_inventory = _artifact_inventory(candidate_dir)
-    common_inventory = control_inventory & candidate_inventory
     json_names = sorted(
-        name for name in common_inventory if Path(name).suffix in {".json", ".jsonl"}
+        name for name in control_inventory if Path(name).suffix in {".json", ".jsonl"}
     )
-    parquet_names = sorted(name for name in common_inventory if Path(name).suffix == ".parquet")
+    parquet_names = sorted(name for name in control_inventory if Path(name).suffix == ".parquet")
     json_schema_match = True
+    json_control_schema_preserved = True
+    json_schema_compatibility: dict[str, dict[str, Any]] = {}
     for name in json_names:
         try:
-            if _json_artifact_schema(control_dir / name) != _json_artifact_schema(
-                candidate_dir / name
-            ):
-                json_schema_match = False
+            compatibility = _schema_compatibility(
+                _json_artifact_value(control_dir / name),
+                _json_artifact_value(candidate_dir / name),
+            )
+            json_schema_compatibility[name] = compatibility
+            json_schema_match = json_schema_match and bool(compatibility["exact_match"])
+            json_control_schema_preserved = json_control_schema_preserved and bool(
+                compatibility["control_preserved"]
+            )
         except (OSError, TypeError, ValueError, json.JSONDecodeError):
             json_schema_match = False
+            json_control_schema_preserved = False
+            json_schema_compatibility[name] = {
+                "exact_match": False,
+                "control_preserved": False,
+                "reason": "invalid_or_missing_json_artifact",
+            }
 
     parquet_schema_match = True
+    parquet_control_schema_preserved = True
     parquet_row_counts_match = True
+    parquet_schema_compatibility: dict[str, dict[str, Any]] = {}
     for name in parquet_names:
         try:
             control_table = pq.read_table(control_dir / name)
             candidate_table = pq.read_table(candidate_dir / name)
         except Exception:
             parquet_schema_match = False
+            parquet_control_schema_preserved = False
             parquet_row_counts_match = False
+            parquet_schema_compatibility[name] = {
+                "exact_match": False,
+                "control_preserved": False,
+                "reason": "invalid_or_missing_parquet_artifact",
+            }
             continue
-        if not control_table.schema.equals(candidate_table.schema, check_metadata=False):
-            parquet_schema_match = False
+        compatibility = _parquet_schema_compatibility(
+            control_table.schema,
+            candidate_table.schema,
+        )
+        parquet_schema_compatibility[name] = compatibility
+        parquet_schema_match = parquet_schema_match and bool(compatibility["exact_match"])
+        parquet_control_schema_preserved = parquet_control_schema_preserved and bool(
+            compatibility["control_preserved"]
+        )
         if control_table.num_rows != candidate_table.num_rows:
             parquet_row_counts_match = False
 
@@ -2743,15 +2876,22 @@ def compare_artifact_contracts(
         control_required_artifacts_present=set(required_artifacts).issubset(control_inventory),
         candidate_required_artifacts_present=set(required_artifacts).issubset(candidate_inventory),
         inventory_match=control_inventory == candidate_inventory,
+        control_inventory_preserved=control_inventory.issubset(candidate_inventory),
         schema_artifact_count=len(json_names) + len(parquet_names),
         json_schema_match=json_schema_match,
+        json_control_schema_preserved=json_control_schema_preserved,
         parquet_schema_match=parquet_schema_match,
+        parquet_control_schema_preserved=parquet_control_schema_preserved,
         parquet_row_counts_match=parquet_row_counts_match,
     )
     result = evaluate_artifact_parity(measurements)
     result["inventory"] = sorted(control_inventory & candidate_inventory)
     result["inventory_only_in_control"] = sorted(control_inventory - candidate_inventory)
     result["inventory_only_in_candidate"] = sorted(candidate_inventory - control_inventory)
+    result["schema_compatibility"] = {
+        "json": json_schema_compatibility,
+        "parquet": parquet_schema_compatibility,
+    }
     return result
 
 
